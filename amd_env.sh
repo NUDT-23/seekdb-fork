@@ -8,7 +8,7 @@ export RUSTUP_UPDATE_ROOT=https://static.rust-lang.org/rustup
 
 # 0) source
 cd /workspace
-if [ ! -d /workspace/seekdb/.git ]; then
+if [ ! -f /workspace/seekdb/BUILD.bazel ]; then
   git clone --depth 1 https://github.com/oceanbase/seekdb.git /workspace/seekdb
 fi
 cd /workspace/seekdb
