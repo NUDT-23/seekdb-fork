@@ -70,6 +70,14 @@ def texts_of(body):
 
     if not isinstance(body, dict):
         return [to_str(body)]
+    # dashscope style: {"input": {"query": ..., "documents": [...]}}
+    inp = body.get("input")
+    if isinstance(inp, dict):
+        docs = inp.get("documents")
+        if isinstance(docs, list):
+            return [to_str(x) for x in docs]
+        if "query" in inp:
+            return [to_str(inp["query"])]
     for key in ("input", "documents", "texts", "prompt", "query"):
         v = body.get(key)
         if isinstance(v, list):
@@ -127,7 +135,9 @@ def handle(kind, body):
         results = sorted(scores, key=lambda x: -x["relevance_score"])
         if isinstance(body, dict) and body.get("raw_scores") is True:
             return {"results": results}
-        return {"results": results, "id": "mock-rerank-1", "model": model,
+        # dashscope wraps the results in "output"; also expose top-level for other providers
+        return {"output": {"results": results}, "results": results,
+                "id": "mock-rerank-1", "model": model,
                 "usage": {"total_tokens": sum(len(t) for t in texts)}}
 
     if kind == "ollama_generate":
