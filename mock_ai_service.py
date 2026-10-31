@@ -41,6 +41,9 @@ def detect_kind(path, body):
     if isinstance(body, dict):
         if "messages" in body:
             return "chat"
+        inp = body.get("input")
+        if isinstance(inp, dict) and ("documents" in inp or "query" in inp):
+            return "rerank"
         if "documents" in body:
             return "rerank"
         if "input" in body:
