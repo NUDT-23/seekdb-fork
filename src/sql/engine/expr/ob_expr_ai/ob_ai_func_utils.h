@@ -334,6 +334,9 @@ public:
                                            const int64_t dimension, float *&vector);
   static int decode_float_embedding_array(const ObIJsonBase &embedding_jbase, ObIAllocator &allocator,
                                           share::ObJsonReaderHelper &json_reader, const int64_t dimension, float *&vector);
+  // check that an embedding returned by a service is a well formed array of
+  // numbers. when expected_dimension > 0 the length of the vector must match it.
+  static int validate_embedding_vector(ObIJsonBase *embedding, const int64_t expected_dimension);
   static int get_ai_func_info(ObIAllocator &allocator, const ObString &model_id,
                               share::schema::ObSchemaGetterGuard &guard, ObAIFuncExprInfo *&info);
   static int get_ai_func_info(ObIAllocator &allocator, const ObString &model_id, ObAIFuncExprInfo *&info);
