@@ -7,13 +7,16 @@ set -x
 export RUSTUP_DIST_SERVER=https://static.rust-lang.org
 export RUSTUP_UPDATE_ROOT=https://static.rust-lang.org/rustup
 REF="${BUILD_REF:-feat/ai-enhancement}"
+# github.com is heavily throttled from some clouds, a gitee mirror of the fork can
+# be used instead:  SRC_REPO=https://gitee.com/<user>/seekdb-fork.git bash build.sh
+SRC_REPO="${SRC_REPO:-https://github.com/NUDT-23/seekdb-fork.git}"
 
 echo "############ STEP 0: source ############"
 cd /workspace || exit 1
 if [ ! -f /workspace/seekdb/BUILD.bazel ]; then
   rm -rf /workspace/seekdb
   for i in 1 2 3 4 5; do
-    git clone --depth 1 -b "$REF" https://github.com/NUDT-23/seekdb-fork.git /workspace/seekdb && break
+    git clone --depth 1 -b "$REF" "$SRC_REPO" /workspace/seekdb && break
     echo "CLONE_RETRY $i"
     rm -rf /workspace/seekdb
     sleep 5
