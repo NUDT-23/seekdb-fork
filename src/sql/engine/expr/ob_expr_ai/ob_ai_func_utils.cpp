@@ -595,8 +595,7 @@ int ObDashscopeUtils::ObDashscopeComplete::parse_output(ObIAllocator &allocator,
     ObJsonArray *choices_array = nullptr;
     ObJsonObject *choice_obj = nullptr;
     ObJsonObject *message_obj = nullptr;
-    ObJsonString *content_str = nullptr;
-    ObString response_str;
+    ObJsonNode *content_node = nullptr;
     if (OB_ISNULL(output_obj = static_cast<ObJsonObject *>(http_response->get_value("output")))) {
       ret = OB_INVALID_DATA;
     } else if (OB_ISNULL(choices_array = static_cast<ObJsonArray *>(output_obj->get_value("choices")))) {
@@ -605,10 +604,13 @@ int ObDashscopeUtils::ObDashscopeComplete::parse_output(ObIAllocator &allocator,
       ret = OB_INVALID_DATA;
     } else if (OB_ISNULL(message_obj = static_cast<ObJsonObject *>(choice_obj->get_value("message")))) {
       ret = OB_INVALID_DATA;
-    } else if (OB_ISNULL(content_str = static_cast<ObJsonString *>(message_obj->get_value("content")))) {
+    } else if (OB_ISNULL(content_node = message_obj->get_value("content"))
+               || content_node->json_type() != ObJsonNodeType::J_STRING
+               || content_node->get_data_length() <= 0) {
+      // the answer of a chat completion must be a non empty string
       ret = OB_INVALID_DATA;
     } else {
-      result = content_str;
+      result = content_node;
     }
   }
   return ret;
@@ -1748,8 +1750,16 @@ int ObAIFuncPromptObjectUtils::replace_all_str_args_in_template(ObIAllocator &al
       } else if (ObJsonNodeType::J_STRING == arg_node->json_type()) {
         arg_text = static_cast<ObJsonString *>(arg_node)->get_str();
       } else if (ObJsonNodeType::J_OBJECT == arg_node->json_type()
+                 && is_valid_prompt_object(static_cast<ObJsonObject *>(arg_node))) {
+        // a prompt nested inside another prompt is rendered first, so that the
+        // outer template is left with plain text
+        if (OB_FAIL(replace_all_str_args_in_template(allocator,
+                                                    static_cast<ObJsonObject *>(arg_node),
+                                                    arg_text))) {
+        }
+      } else if (ObJsonNodeType::J_OBJECT == arg_node->json_type()
                  || ObJsonNodeType::J_ARRAY == arg_node->json_type()) {
-        // nested prompt or json argument, substitute its json text
+        // json argument, substitute its json text
         if (OB_FAIL(ObAIFuncJsonUtils::print_json_to_str(allocator, arg_node, arg_text))) {
         }
       } else {
