@@ -52,13 +52,31 @@ private:
   
   static int eval_ai_rerank_with_doc_key(const ObExpr &expr, ObEvalCtx &ctx, common::ObIAllocator &allocator,
                                          common::ObString &model_id, common::ObString &query, common::ObJsonArray *document_array,
-                                         common::ObString &doc_key, const common::ObAIFuncExprInfo &info, const share::ObAiModelEndpointInfo &endpoint_info, ObDatum &res);
+                                         common::ObString &doc_key, const common::ObAIFuncExprInfo &info, const share::ObAiModelEndpointInfo &endpoint_info,
+                                         common::ObArray<common::ObString> &header_array, ObDatum &res);
   static int get_doc_array_from_documents_array_with_key(ObIAllocator &allocator, ObJsonArray *document_object_array, ObString &doc_key, ObJsonArray *&doc_array);
   static int sort_document_array_by_model_result(common::ObIAllocator &allocator, common::ObJsonArray *document_array, common::ObJsonArray *model_result_array, common::ObJsonArray *&sorted_document_array);
   static int construct_config_json(common::ObIAllocator &allocator, int64_t top_k, int64_t return_doc, common::ObJsonObject *&config_json);
   static int construct_batch_document_array(common::ObIAllocator &allocator, common::ObJsonArray *document_array, int64_t start_idx, int64_t end_idx, common::ObJsonArray *&batch_document_array);
   static int batch_result_add_base(common::ObIAllocator &allocator, common::ObJsonArray *array, int64_t start_idx);
   static int compact_json_array_by_key(common::ObIAllocator &allocator, common::ObJsonArray *array1, common::ObJsonArray *array2, common::ObString &score_key, common::ObJsonArray *&compact_array);
+  // read the original position and the score of a rerank result item
+  static int get_rerank_index(common::ObJsonObject *result_obj, int64_t &index);
+  static int get_rerank_score(common::ObJsonObject *result_obj, double &score);
+  // send the documents to the service batch by batch and merge the answers into
+  // one array, the index of an item is its position in document_array
+  static int collect_rerank_results(common::ObIAllocator &allocator,
+                                    const common::ObAIFuncExprInfo &info,
+                                    const share::ObAiModelEndpointInfo &endpoint_info,
+                                    common::ObArray<common::ObString> &header_array,
+                                    common::ObString &query,
+                                    common::ObJsonArray *document_array,
+                                    common::ObJsonArray *&results);
+  // sort the result items by score in descending order, items with the same score
+  // keep their original order
+  static int sort_rerank_results(common::ObIAllocator &allocator,
+                                 common::ObJsonArray *results,
+                                 common::ObJsonArray *&sorted_results);
   static constexpr int MODEL_IDX = 0;
   static constexpr int QUERY_IDX = 1;
   static constexpr int DOCUMENTS_IDX = 2;
