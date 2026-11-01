@@ -190,6 +190,7 @@ int ObExprAIRerank::eval_ai_rerank_with_doc_key(const ObExpr &expr, ObEvalCtx &c
                                                 ObArray<ObString> &header_array, ObDatum &res)
 {
   INIT_SUCC(ret);
+  UNUSED(model_id);
   ObJsonArray *doc_array = nullptr;
   ObJsonArray *result_array = nullptr;
   ObJsonArray *sorted_document_array = nullptr;
