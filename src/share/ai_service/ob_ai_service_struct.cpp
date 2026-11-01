@@ -37,8 +37,17 @@ const char *VALID_PROVIDERS[] = {
   "SILICONFLOW",
   "COHERE",
   "HUNYUAN-OPENAI",
-  "OPENAI"
+  "OPENAI",
+  "OLLAMA"
 };
+
+// Ollama serves model requests locally or inside a private network and does not
+// authenticate them, so an endpoint of this provider is allowed to omit
+// access_key (the header builder only emits the content type for it).
+bool ObAiModelEndpointInfo::is_access_key_optional(const ObString &provider)
+{
+  return provider.case_compare("OLLAMA") == 0;
+}
 
 #define EXTRACT_JSON_ELEM_STR(json_key, member) \
   EXTRACT_JSON_ELEM_STR_WITH_PROCESS(json_key, member, "void")
@@ -115,7 +124,7 @@ int ObAiModelEndpointInfo::check_valid() const
   } else if (!url_.prefix_match_ci("http://") && !url_.prefix_match_ci("https://")) {
     ret = OB_AI_FUNC_PARAM_VALUE_INVALID;
     LOG_USER_ERROR(OB_AI_FUNC_PARAM_VALUE_INVALID, strlen("url"), "url");
-  } else if (access_key_.empty()) {
+  } else if (access_key_.empty() && !is_access_key_optional(provider_)) {
     ret = OB_AI_FUNC_PARAM_EMPTY;
     LOG_USER_ERROR(OB_AI_FUNC_PARAM_EMPTY, strlen("access_key"), "access_key");
     LOG_WARN("access_key is empty", K(ret), K(*this));
@@ -224,7 +233,10 @@ EndpointType::TYPE EndpointType::str_to_endpoint_type(const ObString &type_str)
 int ObAiModelEndpointInfo::get_unencrypted_access_key(common::ObIAllocator &allocator, ObString &unencrypted_access_key) const
 {
   int ret = OB_SUCCESS;
-  if (OB_FAIL(decrypt_access_key_(allocator, access_key_, unencrypted_access_key))) {
+  unencrypted_access_key.reset();
+  if (access_key_.empty()) {
+    // endpoints without authentication (e.g. a local ollama) have no key at all
+  } else if (OB_FAIL(decrypt_access_key_(allocator, access_key_, unencrypted_access_key))) {
   }
   return ret;
 }
