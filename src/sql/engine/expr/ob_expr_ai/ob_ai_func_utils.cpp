@@ -248,7 +248,7 @@ int ObOpenAIUtils::ObOpenAIEmbed::parse_output(common::ObIAllocator &allocator,
         ObJsonNode *index_node = nullptr;
         if (OB_ISNULL(item) || item->json_type() != ObJsonNodeType::J_OBJECT) {
           has_index = false;
-        } else if (OB_ISNULL(index_node = item->get_value("index"))
+        } else if (OB_ISNULL(index_node = static_cast<ObJsonObject *>(item)->get_value("index"))
                    || index_node->json_type() != ObJsonNodeType::J_INT) {
           has_index = false;
         }
@@ -259,7 +259,7 @@ int ObOpenAIUtils::ObOpenAIEmbed::parse_output(common::ObIAllocator &allocator,
         ObJsonNode *embedding = nullptr;
         if (OB_ISNULL(item) || item->json_type() != ObJsonNodeType::J_OBJECT) {
           ret = OB_INVALID_DATA;
-        } else if (OB_ISNULL(embedding = item->get_value("embedding"))) {
+        } else if (OB_ISNULL(embedding = static_cast<ObJsonObject *>(item)->get_value("embedding"))) {
           ret = OB_INVALID_DATA;
         } else if (embedding->json_type() != ObJsonNodeType::J_ARRAY
                    && embedding->json_type() != ObJsonNodeType::J_STRING) {
@@ -282,7 +282,17 @@ int ObOpenAIUtils::ObOpenAIEmbed::parse_output(common::ObIAllocator &allocator,
         } else {
           MEMSET(ordered, 0, count * sizeof(ObJsonNode *));
           for (int64_t i = 0; OB_SUCC(ret) && i < count; i++) {
-            ObJsonNode *index_node = data_array->get_value(i)->get_value("index");
+            ObJsonNode *item = data_array->get_value(i);
+            ObJsonNode *index_node = nullptr;
+            if (OB_ISNULL(item) || item->json_type() != ObJsonNodeType::J_OBJECT) {
+              ret = OB_INVALID_DATA;
+              continue;
+            }
+            index_node = static_cast<ObJsonObject *>(item)->get_value("index");
+            if (OB_ISNULL(index_node)) {
+              ret = OB_INVALID_DATA;
+              continue;
+            }
             int64_t index = static_cast<ObJsonInt *>(index_node)->value();
             if (index < 0 || index >= count || OB_NOT_NULL(ordered[index])) {
               // duplicated or out of range index, the response can not be mapped back
