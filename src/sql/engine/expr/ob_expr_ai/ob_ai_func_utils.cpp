@@ -396,21 +396,36 @@ int ObOllamaUtils::ObOllamaComplete::parse_output(common::ObIAllocator &allocato
   if (OB_ISNULL(http_response)) {
     ret = OB_INVALID_ARGUMENT;
   } else {
-    ObIJsonBase *j_tree = http_response;
-    common::ObString path_text("$.response");
-    ObJsonPath j_path(path_text, &allocator);
-    ObJsonSeekResult hit;
-    if (OB_FAIL(j_path.parse_path())) {
-    } else if (OB_FAIL(j_tree->seek(j_path, j_path.path_node_cnt(), false, false, hit))) {
-    } else if (hit.size() == 0 || OB_ISNULL(hit[0])) {
+    // the native protocol answers {"response": "..."}, deployments that put a
+    // compatible layer in front of the model may answer with a chat message
+    ObJsonNode *answer_node = http_response->get_value("response");
+    if (OB_ISNULL(answer_node)) {
+      ObJsonNode *message_node = http_response->get_value("message");
+      if (OB_NOT_NULL(message_node) && message_node->json_type() == ObJsonNodeType::J_OBJECT) {
+        answer_node = static_cast<ObJsonObject *>(message_node)->get_value("content");
+      }
+    }
+    if (OB_ISNULL(answer_node)) {
+      ObJsonNode *choices_node = http_response->get_value("choices");
+      if (OB_NOT_NULL(choices_node) && choices_node->json_type() == ObJsonNodeType::J_ARRAY) {
+        ObJsonNode *choice_node = static_cast<ObJsonArray *>(choices_node)->get_value(0);
+        if (OB_NOT_NULL(choice_node) && choice_node->json_type() == ObJsonNodeType::J_OBJECT) {
+          ObJsonNode *msg_node = static_cast<ObJsonObject *>(choice_node)->get_value("message");
+          if (OB_NOT_NULL(msg_node) && msg_node->json_type() == ObJsonNodeType::J_OBJECT) {
+            answer_node = static_cast<ObJsonObject *>(msg_node)->get_value("content");
+          }
+        }
+      }
+    }
+    if (OB_ISNULL(answer_node)) {
       ret = OB_INVALID_DATA;
-    } else if (hit[0]->json_type() != ObJsonNodeType::J_STRING) {
+    } else if (answer_node->json_type() != ObJsonNodeType::J_STRING) {
       ret = OB_INVALID_DATA;
-    } else if (hit[0]->get_data_length() <= 0) {
+    } else if (answer_node->get_data_length() <= 0) {
       // an empty answer is reported as a malformed response
       ret = OB_INVALID_DATA;
     } else {
-      result = hit[0];
+      result = answer_node;
     }
   }
   return ret;
@@ -482,7 +497,30 @@ int ObOllamaUtils::ObOllamaEmbed::parse_output(common::ObIAllocator &allocator,
         result = static_cast<ObIJsonBase *>(result_array);
       }
     } else {
-      ret = OB_INVALID_DATA;
+      // deployments that put an openai compatible layer in front of the model
+      // answer with {"data": [{"embedding": [...]}, ...]}
+      ObJsonNode *data_node = http_response->get_value("data");
+      ObJsonArray *result_array = nullptr;
+      if (OB_ISNULL(data_node) || data_node->json_type() != ObJsonNodeType::J_ARRAY
+          || static_cast<ObJsonArray *>(data_node)->element_count() <= 0) {
+        ret = OB_INVALID_DATA;
+      } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_array(allocator, result_array))) {
+      } else {
+        ObJsonArray *data_array = static_cast<ObJsonArray *>(data_node);
+        for (int64_t i = 0; OB_SUCC(ret) && i < data_array->element_count(); i++) {
+          ObJsonNode *item = data_array->get_value(i);
+          ObJsonNode *vector = nullptr;
+          if (OB_ISNULL(item) || item->json_type() != ObJsonNodeType::J_OBJECT) {
+            ret = OB_INVALID_DATA;
+          } else if (OB_ISNULL(vector = static_cast<ObJsonObject *>(item)->get_value("embedding"))) {
+            ret = OB_INVALID_DATA;
+          } else if (OB_FAIL(result_array->append(vector))) {
+          }
+        }
+        if (OB_SUCC(ret)) {
+          result = static_cast<ObIJsonBase *>(result_array);
+        }
+      }
     }
   }
   return ret;
