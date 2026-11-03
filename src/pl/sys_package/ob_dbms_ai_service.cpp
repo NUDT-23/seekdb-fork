@@ -23,6 +23,7 @@
 #include "share/ai_service/ob_ai_service_struct.h"
 #include "sql/engine/expr/ob_expr_lob_utils.h"
 #include "share/ob_rpc_struct.h"
+#include "lib/worker.h"
 #include "src/pl/ob_pl.h"
 #include "sql/privilege_check/ob_ai_model_priv_util.h"
 
@@ -32,6 +33,23 @@ namespace oceanbase
 {
 namespace pl
 {
+
+
+namespace {
+
+// AI 模型的 DDL 交给根服务执行，遇到并发的 schema 变更时需要在队列里等待。
+// 这类语句不应该被默认 10s 的会话超时打断（否则会以 -4012 失败），这里统一
+// 把截止时间放宽到 60s。
+void extend_ai_ddl_timeout()
+{
+  const int64_t now = ObTimeUtility::current_time();
+  const int64_t deadline = now + 60LL * 1000 * 1000;
+  if (THIS_WORKER.get_timeout_ts() < deadline) {
+    THIS_WORKER.set_timeout_ts(deadline);
+  }
+}
+
+}  // namespace
 
 int ObDBMSAiService::check_ai_model_privilege_(ObPLExecCtx &ctx, ObPrivSet required_priv)
 {
@@ -90,6 +108,7 @@ int ObDBMSAiService::check_ai_model_privilege_(ObPLExecCtx &ctx, ObPrivSet requi
 int ObDBMSAiService::create_ai_model_endpoint(ObPLExecCtx &ctx, sql::ParamStore &params, common::ObObj &result)
 {
   int ret = OB_SUCCESS;
+  extend_ai_ddl_timeout();
   ObString endpoint_name;
   query::ObIAiEndpointAdmin *endpoint_admin = ctx.ai_endpoint_admin_;
   ctx.set_is_sensitive(true);
@@ -129,6 +148,7 @@ int ObDBMSAiService::create_ai_model_endpoint(ObPLExecCtx &ctx, sql::ParamStore 
 int ObDBMSAiService::alter_ai_model_endpoint(ObPLExecCtx &ctx, sql::ParamStore &params, common::ObObj &result)
 {
   int ret = OB_SUCCESS;
+  extend_ai_ddl_timeout();
   ObString endpoint_name;
   query::ObIAiEndpointAdmin *endpoint_admin = ctx.ai_endpoint_admin_;
 
@@ -166,6 +186,7 @@ int ObDBMSAiService::alter_ai_model_endpoint(ObPLExecCtx &ctx, sql::ParamStore &
 int ObDBMSAiService::drop_ai_model_endpoint(ObPLExecCtx &ctx, sql::ParamStore &params, common::ObObj &result)
 {
   int ret = OB_SUCCESS;
+  extend_ai_ddl_timeout();
   ObString endpoint_name;
   query::ObIAiEndpointAdmin *endpoint_admin = ctx.ai_endpoint_admin_;
 
@@ -228,6 +249,7 @@ int ObDBMSAiService::get_json_base_(
 int ObDBMSAiService::create_ai_model(ObPLExecCtx &ctx, sql::ParamStore &params, common::ObObj &result)
 {
   int ret = OB_SUCCESS;
+  extend_ai_ddl_timeout();
   ObString model_name;
   
   ObSchemaGetterGuard schema_guard;
@@ -288,6 +310,7 @@ int ObDBMSAiService::create_ai_model(ObPLExecCtx &ctx, sql::ParamStore &params, 
 int ObDBMSAiService::drop_ai_model(ObPLExecCtx &ctx, sql::ParamStore &params, common::ObObj &result)
 {
   int ret = OB_SUCCESS;
+  extend_ai_ddl_timeout();
   ObString model_name;
   
   ObSchemaGetterGuard schema_guard;

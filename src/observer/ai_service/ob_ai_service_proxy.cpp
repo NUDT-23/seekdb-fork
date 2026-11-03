@@ -209,6 +209,29 @@ int ObAiServiceProxy::build_ai_endpoint_(ObArenaAllocator &allocator, ObMySQLRes
   EXTRACT_VARCHAR_FIELD_MYSQL_WITH_DEFAULT_VALUE(result, "request_transform_fn", request_transform_fn, true, false, ""/*wont be used*/);
   EXTRACT_VARCHAR_FIELD_MYSQL_WITH_DEFAULT_VALUE(result, "response_transform_fn", response_transform_fn, true, false, ""/*wont be used*/);
 
+  // 内表里的空值可能是 SQL NULL（例如 ALTER 只改 provider 时，access_key 列会被
+  // 写成 NULL），而运行时的解密/加签逻辑不接受 NULL，这里统一归一化成空串。
+  if (OB_SUCC(ret)) {
+    if (OB_ISNULL(access_key.ptr())) {
+      access_key.assign_ptr("", 0);
+    }
+    if (OB_ISNULL(provider.ptr())) {
+      provider.assign_ptr("", 0);
+    }
+    if (OB_ISNULL(request_model_name.ptr())) {
+      request_model_name.assign_ptr("", 0);
+    }
+    if (OB_ISNULL(arguments.ptr())) {
+      arguments.assign_ptr("", 0);
+    }
+    if (OB_ISNULL(request_transform_fn.ptr())) {
+      request_transform_fn.assign_ptr("", 0);
+    }
+    if (OB_ISNULL(response_transform_fn.ptr())) {
+      response_transform_fn.assign_ptr("", 0);
+    }
+  }
+
   if (OB_FAIL(ret)) {
   } else if (OB_FAIL(deep_copy_ob_string(allocator, scope, endpoint.scope_))) {
   } else if (OB_FAIL(deep_copy_ob_string(allocator, name, endpoint.name_))) {
