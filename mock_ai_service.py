@@ -130,11 +130,20 @@ def handle(kind, body):
         }
 
     if kind == "rerank":
-        # score by text length so ordering is deterministic but non-trivial
+        # score by the overlap between the query and the document, like a real
+        # reranker does: a document that contains the query term ranks first
+        query = ""
+        if isinstance(body, dict):
+            q = body.get("query")
+            if isinstance(q, str):
+                query = q.lower()
+            inp = body.get("input")
+            if isinstance(inp, dict) and isinstance(inp.get("query"), str):
+                query = inp["query"].lower()
         scores = []
         for i, t in enumerate(texts):
-            scores.append({"index": i, "relevance_score": round(min(1.0, 0.10 + len(t) / 200.0), 6),
-                           "document": t})
+            hit = bool(query) and query in t.lower()
+            scores.append({"index": i, "relevance_score": 0.95 if hit else 0.10, "document": t})
         results = sorted(scores, key=lambda x: -x["relevance_score"])
         if isinstance(body, dict) and body.get("raw_scores") is True:
             return {"results": results}
