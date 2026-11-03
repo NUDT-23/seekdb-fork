@@ -16,7 +16,7 @@ TEST = "/workspace/seekdb/tools/deploy/mysql_test/test_suite/ai_function/t/ai_fu
 DB = "ai_fx"
 PORT = sys.argv[1] if len(sys.argv) > 1 else "2881"
 TIMEOUT = sys.argv[2] if len(sys.argv) > 2 else "10000000"
-MYSQL = ["mysql", "-h127.0.0.1", "-P" + PORT, "-uroot", "--force", "--batch", "--raw"]
+MYSQL = ["mysql", "-h127.0.0.1", "-P" + PORT, "-uroot", "--force", "--batch", "--raw", "-v"]
 
 
 def statements(path):
