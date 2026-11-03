@@ -1,0 +1,15 @@
+select '--- ollama 不改 provider ---' as mark;
+call DBMS_AI_SERVICE.CREATE_AI_MODEL('om2','{"type":"completion","model_name":"qwen2.5"}');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL_ENDPOINT('ome2','{"ai_model_name":"om2","scope":"all","url":"http://0.0.0.0:8000/api/generate","access_key":"","provider":"ollama"}');
+select length(ai_complete('om2','hello')) as before_alter;
+select '--- alter 之后 ---' as mark;
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('ome2','{"provider":"Ollama"}');
+select length(ai_complete('om2','hello')) as after_alter;
+select '--- openai 同样 access_key 为空 ---' as mark;
+call DBMS_AI_SERVICE.CREATE_AI_MODEL('om3','{"type":"completion","model_name":"m"}');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL_ENDPOINT('ome3','{"ai_model_name":"om3","scope":"all","url":"http://0.0.0.0:8000/v1/chat/completions","access_key":"","provider":"openai"}');
+select length(ai_complete('om3','hello')) as openai_empty_key;
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('ome2');
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('ome3');
+call DBMS_AI_SERVICE.DROP_AI_MODEL('om2');
+call DBMS_AI_SERVICE.DROP_AI_MODEL('om3');
