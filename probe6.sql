@@ -1,0 +1,12 @@
+call DBMS_AI_SERVICE.CREATE_AI_MODEL('om6','{"type":"completion","model_name":"qwen2.5"}');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL_ENDPOINT('ome6','{"ai_model_name":"om6","scope":"all","url":"http://0.0.0.0:8000/api/generate","access_key":"","provider":"ollama"}');
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('ome6','{"provider":"Ollama"}');
+select 'case1: alter 只给 provider' as mark;
+select length(ai_complete('om6','hello')) as case1;
+select access_key is null as key_is_null from oceanbase.DBA_OB_AI_MODEL_ENDPOINTS where endpoint_name='ome6';
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('ome6','{"provider":"Ollama","access_key":""}');
+select 'case2: alter 带 access_key 空串' as mark;
+select length(ai_complete('om6','hello')) as case2;
+select access_key is null as key_is_null from oceanbase.DBA_OB_AI_MODEL_ENDPOINTS where endpoint_name='ome6';
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('ome6');
+call DBMS_AI_SERVICE.DROP_AI_MODEL('om6');
