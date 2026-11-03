@@ -180,6 +180,11 @@ int ObAiModelEndpointInfo::merge_delta_endpoint(common::ObArenaAllocator &alloca
   }
 
   if (OB_SUCC(ret)) {
+    if (access_key_.empty() && OB_ISNULL(access_key_.ptr())) {
+      // keep an empty (but not NULL) access key, providers without
+      // authentication store an empty string
+      access_key_.assign_ptr("", 0);
+    }
     if (has_api_key && !access_key_.empty() && OB_FAIL(encrypt_access_key_(allocator, access_key_, access_key_))) {
       LOG_WARN("failed to encrypt access key", K(ret));
     } else if (OB_FAIL(check_valid())) {
