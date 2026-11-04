@@ -35,7 +35,9 @@ ObFTDocWordScanIterator::ObFTDocWordScanIterator()
     scan_param_(),
     doc_word_iter_(nullptr),
     docid_type_(ObDocIDType::INVALID),
-    is_inited_(false)
+    is_inited_(false),
+    key_objs_(nullptr),
+    key_range_inited_(false)
 {
 }
 
@@ -74,6 +76,8 @@ void ObFTDocWordScanIterator::reset()
   // remains part of table_param_ after reset and is reused by the next scan,
   // so allocator_ must live until table_param_ is destroyed.
   scan_allocator_.reset();
+  key_objs_ = nullptr;
+  key_range_inited_ = false;
   is_inited_ = false;
 }
 
@@ -84,7 +88,9 @@ int ObFTDocWordScanIterator::reuse()
     ret = OB_ERR_UNDEFINED;
   } else if (OB_FAIL(::oceanbase::share::server_service<::oceanbase::storage::ObAccessService>()->reuse_scan_iter(false/*switch param*/, doc_word_iter_))) {
   } else {
-    scan_param_.key_ranges_.reuse();
+    // Keep scan_param_.key_ranges_ untouched: refresh_key_range() updates the
+    // document id inside the very same range object, so the range does not have
+    // to be rebuilt (and pushed again) for every document.
     scan_param_.mbr_filters_.reuse();
     scan_allocator_.reset_remain_one_page();
   }
@@ -119,9 +125,53 @@ int ObFTDocWordScanIterator::do_scan(const uint64_t table_id, const ObDatum &doc
   } else if (need_rescan) {
     reuse();
   }
-  if (FAILEDx(build_key_range(table_id, doc_id_datum, scan_param_.key_ranges_))) {
+  if (FAILEDx(refresh_key_range(table_id, doc_id_datum))) {
   } else if (need_rescan && OB_FAIL(do_table_rescan())) {
   } else if (!need_rescan && OB_FAIL(do_table_scan())) {
+  }
+  return ret;
+}
+
+// Build the DOC_WORD key range of a document once and then only rewrite the
+// document id inside it. do_scan() runs once per scanned document, so the
+// allocation of the key objects plus the array push used to happen 20000 times
+// for a 20000 row scan of a single MATCH predicate.
+int ObFTDocWordScanIterator::refresh_key_range(const uint64_t table_id,
+                                               const ObDatum &doc_id_datum)
+{
+  int ret = OB_SUCCESS;
+  static const int64_t ROWKEY_COLUMN_COUNT = 2;
+  if (OB_UNLIKELY(OB_INVALID_ID == table_id)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (!key_range_inited_) {
+    if (OB_ISNULL(key_objs_ = OB_NEW_ARRAY(common::ObObj, &allocator_, ROWKEY_COLUMN_COUNT * 2))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else {
+      key_objs_[1] = common::ObObj::make_min_obj();
+      key_objs_[3] = common::ObObj::make_max_obj();
+      common::ObNewRange range;
+      range.table_id_ = table_id;
+      range.start_key_ = ObRowkey(key_objs_, ROWKEY_COLUMN_COUNT);
+      range.end_key_ = ObRowkey(key_objs_ + ROWKEY_COLUMN_COUNT, ROWKEY_COLUMN_COUNT);
+      range.border_flag_.set_inclusive_start();
+      range.border_flag_.set_inclusive_end();
+      if (OB_FAIL(scan_param_.key_ranges_.push_back(range))) {
+      } else {
+        key_range_inited_ = true;
+      }
+    }
+  }
+
+  if (OB_SUCC(ret)) {
+    if (ObDocIDType::HIDDEN_INC_PK == docid_type_) {
+      key_objs_[0].set_uint64(doc_id_datum.get_uint64());
+      key_objs_[2].set_uint64(doc_id_datum.get_uint64());
+    } else if (ObDocIDType::TABLET_SEQUENCE == docid_type_) {
+      key_objs_[0].set_varbinary(doc_id_datum.get_string());
+      key_objs_[2].set_varbinary(doc_id_datum.get_string());
+    } else {
+      ret = OB_ERR_UNEXPECTED;
+    }
   }
   return ret;
 }
@@ -225,40 +275,6 @@ int ObFTDocWordScanIterator::build_table_param(
       }
     } else {
       docid_type_ = ObDocIDType::TABLET_SEQUENCE;
-    }
-  }
-  return ret;
-}
-
-int ObFTDocWordScanIterator::build_key_range(const uint64_t table_id,
-                                             const ObDatum &doc_id_datum,
-                                             common::ObIArray<ObNewRange> &rowkey_range)
-{
-  int ret = OB_SUCCESS;
-  static int64_t ROWKEY_COLUMN_COUNT = 2;
-  common::ObNewRange range;
-  common::ObObj *objs = nullptr;
-  if (OB_UNLIKELY(OB_INVALID_ID == table_id)) {
-    ret = OB_INVALID_ARGUMENT;
-  } else if (OB_ISNULL(objs = OB_NEW_ARRAY(common::ObObj, &allocator_, ROWKEY_COLUMN_COUNT * 2))) {
-    ret = OB_ALLOCATE_MEMORY_FAILED;
-  } else {
-    if (docid_type_ == ObDocIDType::HIDDEN_INC_PK) {
-      objs[0].set_uint64(doc_id_datum.get_uint64());
-      objs[2].set_uint64(doc_id_datum.get_uint64());
-    } else if (docid_type_ == ObDocIDType::TABLET_SEQUENCE) {
-      objs[0].set_varbinary(doc_id_datum.get_string());
-      objs[2].set_varbinary(doc_id_datum.get_string());
-    }
-    objs[1] = common::ObObj::make_min_obj();
-    objs[3] = common::ObObj::make_max_obj();
-
-    range.table_id_ = table_id;
-    range.start_key_ = ObRowkey(objs, ROWKEY_COLUMN_COUNT);
-    range.end_key_ = ObRowkey(objs + ROWKEY_COLUMN_COUNT, ROWKEY_COLUMN_COUNT);
-    range.border_flag_.set_inclusive_start();
-    range.border_flag_.set_inclusive_end();
-    if (OB_FAIL(rowkey_range.push_back(range))) {
     }
   }
   return ret;

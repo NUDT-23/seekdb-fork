@@ -56,9 +56,11 @@ private:
       const uint64_t table_id,
       share::schema::ObTableParam &table_param,
       common::ObIArray<uint64_t> &column_ids);
-  int build_key_range(const uint64_t table_id,
-                      const ObDatum &row_mapping_id,
-                      common::ObIArray<ObNewRange> &rowkey_range);
+  // Build the range of the DOC_WORD table once, then only refresh the document
+  // id inside it. The scan is executed once per document, so rebuilding the
+  // key range (two time more rows plus one array push) for every document is
+  // pure overhead on the query hot path.
+  int refresh_key_range(const uint64_t table_id, const ObDatum &row_mapping_id);
   int do_table_scan();
   int do_table_rescan();
   int reuse();
@@ -71,6 +73,9 @@ private:
   common::ObNewRowIterator *doc_word_iter_;
   ObDocIDType docid_type_;
   bool is_inited_;
+  // scratch key range reused by every document of the scan
+  common::ObObj *key_objs_;
+  bool key_range_inited_;
 
   DISALLOW_COPY_AND_ASSIGN(ObFTDocWordScanIterator);
 };
