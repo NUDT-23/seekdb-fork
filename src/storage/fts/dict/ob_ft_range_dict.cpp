@@ -381,25 +381,109 @@ int ObFTRangeDict::match_with_hit(const ObString &single_word,
 int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict *&dict) const
 {
   int ret = OB_SUCCESS;
-  bool found = false;
-  for (int i = 0; OB_SUCC(ret) && !found && i < range_dicts_.size(); ++i) {
-    if (ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                          range_dicts_[i].start_.get_word(),
-                          single_word)
-            <= 0
-        && ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                             range_dicts_[i].end_.get_word(),
-                             single_word)
-               >= 0) {
-      dict = range_dicts_[i].dict_;
-      found = true;
-    }
-  }
-  if (!found) {
-    // not found, dis match
+  const int64_t range_cnt = range_dicts_.size();
+  dict = nullptr;
+  if (OB_UNLIKELY(single_word.empty() || 0 >= range_cnt)) {
     ret = OB_ENTRY_NOT_EXIST;
+  } else if (is_first_byte_index_valid_) {
+    // Fast path: the first byte tells which range the word may belong to, so a
+    // single range check is enough. This used to be a linear scan over all
+    // ranges with two full collation comparisons per range, which dominated the
+    // per character cost of the ik tokenizer once the dictionary was split into
+    // several ranges.
+    const int16_t idx = first_byte_range_[static_cast<unsigned char>(single_word.ptr()[0])];
+    if (idx >= 0 && idx < range_cnt) {
+      const ObFTRange &range = range_dicts_.at(idx);
+      if (ft_bin_cmp(range.start_.get_word(), single_word) <= 0
+          && ft_bin_cmp(range.end_.get_word(), single_word) >= 0) {
+        dict = range.dict_;
+      }
+    }
+    if (OB_ISNULL(dict)) {
+      // Either the first byte is not covered by any range, or the candidate
+      // range does not contain the whole first character. Fall through to the
+      // exact search so the result is always identical to the linear scan.
+      ret = find_first_char_range_exact(single_word, dict);
+    }
+  } else {
+    ret = find_first_char_range_exact(single_word, dict);
   }
   return ret;
+}
+
+int ObFTRangeDict::find_first_char_range_exact(const ObString &single_word, ObIFTDict *&dict) const
+{
+  int ret = OB_SUCCESS;
+  const int64_t range_cnt = range_dicts_.size();
+  dict = nullptr;
+  if (OB_UNLIKELY(single_word.empty() || 0 >= range_cnt)) {
+    ret = OB_ENTRY_NOT_EXIST;
+  } else {
+    // Ranges are built from a sorted dictionary iterator, so they are ordered
+    // and disjoint: binary search the last range whose start is <= the word.
+    int64_t lo = 0;
+    int64_t hi = range_cnt - 1;
+    int64_t candidate = -1;
+    while (lo <= hi) {
+      const int64_t mid = lo + ((hi - lo) >> 1);
+      if (ft_bin_cmp(range_dicts_.at(mid).start_.get_word(), single_word) <= 0) {
+        candidate = mid;
+        lo = mid + 1;
+      } else {
+        hi = mid - 1;
+      }
+    }
+    if (candidate >= 0
+        && ft_bin_cmp(range_dicts_.at(candidate).end_.get_word(), single_word) >= 0) {
+      dict = range_dicts_.at(candidate).dict_;
+    } else {
+      ret = OB_ENTRY_NOT_EXIST;
+    }
+  }
+  return ret;
+}
+
+// Byte wise comparison, which is exactly what the UTF8MB4_BIN collation used by
+// the built-in dictionary does, without going through the collation framework.
+int ObFTRangeDict::ft_bin_cmp(const ObString &left, const ObString &right)
+{
+  const int64_t left_len = left.length();
+  const int64_t right_len = right.length();
+  const int64_t cmp_len = left_len < right_len ? left_len : right_len;
+  int cmp = 0;
+  if (cmp_len > 0) {
+    cmp = memcmp(left.ptr(), right.ptr(), static_cast<size_t>(cmp_len));
+  }
+  if (0 == cmp) {
+    cmp = (left_len < right_len) ? -1 : (left_len > right_len ? 1 : 0);
+  }
+  return cmp < 0 ? -1 : (cmp > 0 ? 1 : 0);
+}
+
+void ObFTRangeDict::build_first_byte_index()
+{
+  const int64_t range_cnt = range_dicts_.size();
+  for (int64_t i = 0; i < static_cast<int64_t>(sizeof(first_byte_range_) / sizeof(first_byte_range_[0])); ++i) {
+    first_byte_range_[i] = -1;
+  }
+  is_first_byte_index_valid_ = false;
+  if (range_cnt > 0 && range_cnt < 32000) {
+    for (int64_t i = 0; i < range_cnt; ++i) {
+      const ObString start = range_dicts_.at(i).start_.get_word();
+      const ObString end = range_dicts_.at(i).end_.get_word();
+      if (OB_UNLIKELY(start.empty() || end.empty())) {
+        continue;
+      }
+      const int64_t first_byte = static_cast<unsigned char>(start.ptr()[0]);
+      const int64_t last_byte = static_cast<unsigned char>(end.ptr()[0]);
+      for (int64_t b = first_byte; b <= last_byte; ++b) {
+        if (-1 == first_byte_range_[b]) {
+          first_byte_range_[b] = static_cast<int16_t>(i);
+        }
+      }
+    }
+    is_first_byte_index_valid_ = true;
+  }
 }
 
 int ObFTRangeDict::build_dict_from_cache(const ObFTCacheRangeContainer &range_container)
@@ -421,6 +505,9 @@ int ObFTRangeDict::build_dict_from_cache(const ObFTCacheRangeContainer &range_co
       if (OB_FAIL(range_dicts_.push_back(range))) {
       }
     }
+  }
+  if (OB_SUCC(ret)) {
+    build_first_byte_index();
   }
   return ret;
 }

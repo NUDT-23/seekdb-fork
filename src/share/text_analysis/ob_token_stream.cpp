@@ -24,6 +24,22 @@ namespace oceanbase
 namespace share
 {
 
+// ObCharset::tolower always returns a materialized copy of the input token, one
+// allocation included, no matter whether the token holds any upper case
+// character. A pure ASCII token without 'A'..'Z' is already lower case, so the
+// conversion can be skipped and the token can keep pointing into the document.
+static bool may_need_casedown(const ObString &token)
+{
+  bool need = false;
+  const char *ptr = token.ptr();
+  const int64_t len = token.length();
+  for (int64_t i = 0; !need && i < len; ++i) {
+    const unsigned char ch = static_cast<unsigned char>(ptr[i]);
+    need = (ch >= 0x80) || (ch >= 'A' && ch <= 'Z');
+  }
+  return need;
+}
+
 ObTextTokenizer::ObTextTokenizer()
   : ObITokenStream(),
     input_doc_(nullptr),
@@ -295,8 +311,14 @@ int ObBasicEnglishNormalizer::get_next(ObDatum &next_token, int64_t &token_freq)
     } else {
       ObString norm_alnum_token(norm_token_len, norm_token_ptr);
       ObString norm_lower_token;
-      if (OB_FAIL(ObCharset::tolower(cs_, norm_alnum_token, norm_lower_token, norm_allocator_))) {
-      } else {
+      if (!may_need_casedown(norm_alnum_token)) {
+        // Pure ASCII token without any upper case character: tolower would only
+        // copy the token into norm_allocator_. Skip the allocation and keep the
+        // slice of the document instead, the bytes are already the result.
+        norm_lower_token = norm_alnum_token;
+      } else if (OB_FAIL(ObCharset::tolower(cs_, norm_alnum_token, norm_lower_token, norm_allocator_))) {
+      }
+      if (OB_SUCC(ret)) {
         next_token.set_string(norm_lower_token);
       }
     }

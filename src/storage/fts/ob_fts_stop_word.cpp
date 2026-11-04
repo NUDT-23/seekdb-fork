@@ -74,24 +74,40 @@ void ObStopWordChecker::destroy()
 int ObStopWordChecker::check_stopword(const ObFTWord &word, bool &is_stopword)
 {
   int ret = OB_SUCCESS;
-  
-  
-  common::ObArenaAllocator allocator(lib::ObMemAttr("ChkStopWord"));
   if (OB_UNLIKELY(!inited_)) {
     ret = OB_NOT_INIT;
   } else if (OB_UNLIKELY(word.empty())) {
     ret = OB_INVALID_ARGUMENT;
   } else {
-    common::ObString cmp_str;
-    // do nothing set out with in if type is the same.
-    if (OB_FAIL(common::ObCharset::charset_convert(
-                                       allocator,
-                                       word.get_word().get_string(),
-                                       word.get_collation_type(),
-                                       stopword_type_.get_collation_type(),
-                                       cmp_str))) {
+    // The stop word set is built with the collation of stopword_type_, so the
+    // probe word must carry the same meta. When the charset of the two
+    // collations is identical the converted bytes are exactly the original
+    // bytes, so the conversion can be skipped entirely: only the collation tag
+    // of the probe word has to be replaced. This avoids one allocator setup,
+    // one allocation and one memcpy per token on the hot path.
+    ObFTWord converted;
+    if (word.get_collation_type() == stopword_type_.get_collation_type()) {
+      converted = word;
+    } else if (common::ObCharset::charset_type_by_coll(word.get_collation_type())
+               == common::ObCharset::charset_type_by_coll(stopword_type_.get_collation_type())) {
+      converted = ObFTWord(word.get_word().get_string().length(),
+                           word.get_word().get_string().ptr(),
+                           stopword_type_);
     } else {
-      ObFTWord converted(cmp_str.length(), cmp_str.ptr(), stopword_type_);
+      common::ObArenaAllocator allocator(lib::ObMemAttr("ChkStopWord"));
+      common::ObString cmp_str;
+      if (OB_FAIL(common::ObCharset::charset_convert(
+                                     allocator,
+                                     word.get_word().get_string(),
+                                     word.get_collation_type(),
+                                     stopword_type_.get_collation_type(),
+                                     cmp_str))) {
+      } else {
+        converted = ObFTWord(cmp_str.length(), cmp_str.ptr(), stopword_type_);
+      }
+    }
+
+    if (OB_SUCC(ret)) {
       ret = stopword_set_.exist_refactored(converted);
       if (OB_HASH_NOT_EXIST == ret) {
         is_stopword = false;
@@ -163,7 +179,7 @@ int ObAddWord::casedown_word(const ObFTWord &src, ObFTWord &dst)
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(src.empty())) {
     ret = OB_INVALID_ARGUMENT;
-  } else if (flag_.casedown()) {
+  } else if (flag_.casedown() && may_need_casedown(src.get_word().get_string())) {
     ObString dst_str;
     if (OB_FAIL(ObCharset::tolower(
                     word_meta_.get_collation_type(),
@@ -178,6 +194,34 @@ int ObAddWord::casedown_word(const ObFTWord &src, ObFTWord &dst)
     dst = src;
   }
   return ret;
+}
+
+// ObCharset::tolower always materializes a converted copy of the token (one
+// allocation plus one full utf8 decode/encode pass), even when there is nothing
+// to convert. That happens for every token of a Chinese document, where CJK
+// ideographs never carry case information. Doing a cheap byte level pre-check
+// and skipping the conversion when it can not change anything is therefore a
+// pure win and keeps the semantics identical.
+bool ObAddWord::may_need_casedown(const ObString &word)
+{
+  bool need = false;
+  const char *ptr = word.ptr();
+  const int64_t len = word.length();
+  for (int64_t i = 0; !need && i < len;) {
+    const unsigned char ch = static_cast<unsigned char>(ptr[i]);
+    if (ch < 0x80) {
+      // ASCII: only 'A'..'Z' is affected by tolower.
+      need = (ch >= 'A' && ch <= 'Z');
+      ++i;
+    } else if (ch >= 0xE4 && ch <= 0xE9) {
+      // U+4000..U+9FFF: CJK ideographs (and CJK ext A), no case mapping at all.
+      i += 3;
+    } else {
+      // Any other multibyte character may have a case mapping, be conservative.
+      need = true;
+    }
+  }
+  return need;
 }
 
 int ObAddWord::check_stopword(const ObFTWord &ft_word, bool &is_stopword)
@@ -204,14 +248,16 @@ int ObAddWord::groupby_word(const ObFTWord &word, const int64_t word_freq)
   } else if (!flag_.groupby_word()) {
     if (OB_FAIL(word_map_.set_refactored(word, 1/*word count*/))) {
     }
-  } else if (OB_FAIL(word_map_.get_refactored(word, word_count)) && OB_HASH_NOT_EXIST != ret) {
   } else {
-    if (OB_HASH_NOT_EXIST == ret) {
-      word_count = 1;
-    } else {
-      word_count += word_freq;
-    }
-    if (OB_FAIL(word_map_.set_refactored(word, word_count, 1/*overwrite*/))) {
+    // Fast path: try the insert only variant first, so a token that shows up
+    // for the first time costs a single hash lookup instead of the
+    // get + set pair used by the read-modify-write path below.
+    if (OB_FAIL(word_map_.set_refactored(word, 1/*word count*/))) {
+      if (OB_HASH_EXIST != ret) {
+      } else if (OB_FAIL(word_map_.get_refactored(word, word_count))) {
+      } else if (FALSE_IT(word_count += word_freq)) {
+      } else if (OB_FAIL(word_map_.set_refactored(word, word_count, 1/*overwrite*/))) {
+      }
     }
   }
   return ret;

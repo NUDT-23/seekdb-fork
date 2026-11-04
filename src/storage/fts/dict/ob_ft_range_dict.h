@@ -98,10 +98,16 @@ private:
   }
 
   int find_first_char_range(const ObString &single_word, ObIFTDict *&dict) const;
+  int find_first_char_range_exact(const ObString &single_word, ObIFTDict *&dict) const;
+  static int ft_bin_cmp(const ObString &left, const ObString &right);
+  void build_first_byte_index();
 
 private:
   static constexpr int DEFAULT_KEY_PER_RANGE = 50000; // by estimated
   bool is_inited_;
+  bool is_first_byte_index_valid_ = false;
+  // first byte of a word -> index of the range that may contain it
+  int16_t first_byte_range_[256];
   ObFTDictDesc desc_;
   ObArenaAllocator range_alloc_;
   ObVector<ObFTRange, ObArenaAllocator> range_dicts_;

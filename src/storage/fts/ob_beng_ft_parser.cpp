@@ -49,6 +49,16 @@ int ObBEngFTParser::get_next_token(
     }
   } else if (OB_ISNULL(token.ptr_) || OB_UNLIKELY(0 >= token.len_ || 0 >= token_freq)) {
     ret = OB_INVALID_ARGUMENT;
+  } else if (reinterpret_cast<uintptr_t>(token.ptr_) >= reinterpret_cast<uintptr_t>(doc_.ptr_)
+             && reinterpret_cast<uintptr_t>(token.ptr_) + static_cast<uint64_t>(token.len_)
+                    <= reinterpret_cast<uintptr_t>(doc_.ptr_) + static_cast<uint64_t>(doc_.len_)) {
+    // The token is a slice of the document, whose memory outlives the whole
+    // token iteration, so no copy is needed. The analyzer only materializes a
+    // new buffer for tokens that actually had to be converted.
+    word = token.ptr_;
+    word_len = token.len_;
+    char_len = token.len_;
+    word_freq = token_freq;
   } else if (OB_ISNULL(buf = static_cast<char *>(allocator_.alloc(token.len_)))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
   } else {
