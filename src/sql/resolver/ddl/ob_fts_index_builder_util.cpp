@@ -1037,14 +1037,6 @@ int ObFtsIndexBuilderUtil::decide_parallelism(
     int64_t &decided_parallelism)
 {
   int ret = OB_SUCCESS;
-  // The full text index build is a pure CPU bound job: it reads the documents,
-  // runs the tokenizer for every row and writes one row per token. A DDL that
-  // does not ask for a DOP explicitly used to run it with DOP 1, which leaves
-  // the machine idle while one thread does all the tokenization and the whole
-  // build of the DOC_WORD table. Give the full text index types a small default
-  // DOP instead, so the shared scan of the data tablet and the tokenization are
-  // spread over several workers. An explicitly requested DOP is still honored.
-  static constexpr int64_t FTS_DEFAULT_DDL_DOP = 4;
   if (OB_UNLIKELY(original_parallelism <= 0)) {
     ret = OB_INVALID_ARGUMENT;
   } else {
@@ -1055,11 +1047,7 @@ int ObFtsIndexBuilderUtil::decide_parallelism(
       case share::schema::ObIndexType::INDEX_TYPE_DOC_ID_ROWKEY_LOCAL:
       case share::schema::ObIndexType::INDEX_TYPE_FTS_INDEX_LOCAL:
       case share::schema::ObIndexType::INDEX_TYPE_FTS_DOC_WORD_LOCAL:
-        if (1 == original_parallelism) {
-          decided_parallelism = FTS_DEFAULT_DDL_DOP;
-        } else {
-          decided_parallelism = MAX(original_parallelism / 3, 1L);
-        }
+        decided_parallelism = MAX(original_parallelism / 3, 1L);
         break;
       case share::schema::ObIndexType::INDEX_TYPE_NORMAL_MULTIVALUE_LOCAL:
       case share::schema::ObIndexType::INDEX_TYPE_UNIQUE_MULTIVALUE_LOCAL:
