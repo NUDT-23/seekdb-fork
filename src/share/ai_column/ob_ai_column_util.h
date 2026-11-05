@@ -19,6 +19,7 @@
 
 #include "lib/hash/ob_hashmap.h"
 #include "lib/lock/ob_spin_rwlock.h"
+#include "lib/string/ob_sql_string.h"
 #include "lib/string/ob_string.h"
 
 namespace oceanbase
@@ -129,6 +130,8 @@ private:
   typedef common::ObHashMap<uint64_t, ItemList *> TableItemMap;
   TableItemMap table_items_;
   common::SpinRWLock lock_;
+  typedef common::SpinRLockGuard RLockGuard;
+  typedef common::SpinWLockGuard WLockGuard;
 };
 
 // Generates a fresh request id (48-char hex string) for one (row, statement)

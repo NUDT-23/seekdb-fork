@@ -212,25 +212,23 @@ int ObAIColumnResolver::parse_options(ObIAllocator &alloc, ParseNode *options_no
     ret = OB_ERR_PARSER_SYNTAX;
     LOG_WARN("invalid ai column options node", K(ret));
   } else {
-    // T_OPTION_LIST wraps the T_LINK_NODE chain built by the grammar
-    ParseNode *list_node = (options_node->num_child_ > 0) ? options_node->children_[0] : nullptr;
-    while (OB_SUCC(ret) && nullptr != list_node) {
-      ParseNode *pair_node = nullptr;
-      if (T_LINK_NODE == list_node->type_ && 2 == list_node->num_child_) {
-        pair_node = list_node->children_[1];
-        list_node = list_node->children_[0];
-      } else {
-        pair_node = list_node;
-        list_node = nullptr;
-      }
-      if (OB_ISNULL(pair_node) || T_LINK_NODE != pair_node->type_ || 2 != pair_node->num_child_
-          || OB_ISNULL(pair_node->children_[0]) || OB_ISNULL(pair_node->children_[1])) {
-        ret = OB_ERR_PARSER_SYNTAX;
-        LOG_WARN("invalid ai column option pair", K(ret));
-      } else {
-        const ObString opt_name(pair_node->children_[0]->str_len_,
-                                pair_node->children_[0]->str_value_);
-        ParseNode *value_node = pair_node->children_[1];
+    // the grammar merges the option chain into a flat T_OPTION_LIST whose
+    // children alternate name, value, name, value ... (same layout as
+    // T_VEC_INDEX_PARAMS)
+    if (0 != options_node->num_child_ % 2) {
+      ret = OB_ERR_PARSER_SYNTAX;
+      LOG_WARN("invalid ai column option list", K(ret));
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i + 1 < options_node->num_child_; i += 2) {
+      {
+        ParseNode *name_node = options_node->children_[i];
+        ParseNode *value_node = options_node->children_[i + 1];
+        if (OB_ISNULL(name_node) || OB_ISNULL(value_node)) {
+          ret = OB_ERR_PARSER_SYNTAX;
+          LOG_WARN("invalid ai column option pair", K(ret));
+          break;
+        }
+        const ObString opt_name(name_node->str_len_, name_node->str_value_);
         if (0 == opt_name.case_compare("sync_mode")) {
           if (OB_ISNULL(value_node) || 0 == value_node->str_len_) {
             ret = OB_ERR_PARSER_SYNTAX;

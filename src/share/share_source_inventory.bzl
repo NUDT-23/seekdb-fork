@@ -448,6 +448,7 @@ SHARE_UNITY_GROUPS = [
             "src/share/ai_service/ob_ai_service_struct.cpp",
             "src/share/schema/ob_ai_model_mgr.cpp",
             "src/share/ai_column/ob_ai_column_util.cpp",
+            "src/share/ai_column/ob_ai_column_ddl_util.cpp",
             "src/share/schema/ob_ai_model_sql_service.cpp",
             "src/share/schema/ob_objpriv_mysql_schema_struct.cpp",
             "src/share/schema/ob_schema_getter_guard_objpriv_mysql.cpp",

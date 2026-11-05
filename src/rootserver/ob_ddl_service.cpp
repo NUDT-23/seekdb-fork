@@ -8624,6 +8624,9 @@ int ObDDLService::alter_table_column(const ObTableSchema &origin_table_schema,
     if(OB_FAIL(ret)) {
     } else if (OB_FAIL(blocksstable::check_skip_index_valid(new_table_schema))) {
     } else if (OB_FAIL(new_table_schema.check_row_length())) {
+    } else if (OB_FAIL(write_ai_column_rows_for_added_columns_(alter_table_schema,
+                                                               new_table_schema,
+                                                               trans))) {
     } else if (!is_origin_table_has_lob_column) {
       if (OB_FAIL(create_aux_lob_table_if_need(
           new_table_schema, schema_guard, ddl_operator, trans,

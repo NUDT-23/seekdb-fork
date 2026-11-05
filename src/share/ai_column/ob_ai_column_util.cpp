@@ -20,6 +20,7 @@
 
 #include "lib/allocator/ob_arena_allocator.h"
 #include "lib/mysqlclient/ob_mysql_proxy.h"
+#include "lib/atomic/ob_atomic.h"
 #include "lib/mysqlclient/ob_mysql_result.h"
 #include "lib/profile/ob_trace_id.h"
 #include "lib/random/ob_random.h"
@@ -68,7 +69,7 @@ int ObAiColumnCache::init()
 void ObAiColumnCache::destroy()
 {
   if (inited_) {
-    common::SpinRWLock::WLockGuard guard(lock_);
+    common::SpinWLockGuard guard(lock_);
     TableItemMap::iterator iter = table_items_.begin();
     for (; iter != table_items_.end(); ++iter) {
       ItemList *list = iter->second;
@@ -97,7 +98,7 @@ int ObAiColumnCache::get_table_items(const uint64_t table_id, const int64_t sche
   found = false;
   bool need_load = true;
   {
-    common::SpinRWLock::RLockGuard guard(lock_);
+    common::SpinRLockGuard guard(lock_);
     TableItemMap::const_iterator iter = table_items_.get(table_id);
     if (table_items_.end() != iter) {
       need_load = false;
@@ -111,7 +112,7 @@ int ObAiColumnCache::get_table_items(const uint64_t table_id, const int64_t sche
     if (OB_FAIL(load_table_items(table_id, schema_version))) {
       if (OB_ENTRY_NOT_EXIST == ret) {
         // no AI columns for this table; cache the empty entry of this version
-        common::SpinRWLock::WLockGuard guard(lock_);
+        common::SpinWLockGuard guard(lock_);
         ItemList *empty_list = static_cast<ItemList *>(
             cache_alloc_->alloc(sizeof(ItemList)));
         if (OB_ISNULL(empty_list)) {
@@ -137,7 +138,7 @@ int ObAiColumnCache::get_table_items(const uint64_t table_id, const int64_t sche
     }
   }
   if (OB_SUCC(ret)) {
-    common::SpinRWLock::RLockGuard guard(lock_);
+    common::SpinRLockGuard guard(lock_);
     TableItemMap::const_iterator iter = table_items_.get(table_id);
     if (table_items_.end() != iter) {
       const ItemList &list = *iter->second;
@@ -159,7 +160,7 @@ int ObAiColumnCache::get_table_items(const uint64_t table_id, const int64_t sche
 
 void ObAiColumnCache::drop_table_items(const uint64_t table_id)
 {
-  common::SpinRWLock::WLockGuard guard(lock_);
+  common::SpinWLockGuard guard(lock_);
   TableItemMap::iterator iter = table_items_.get(table_id);
   if (table_items_.end() != iter) {
     iter->second->~ObArray<ObAIColumnItem>();
@@ -194,7 +195,7 @@ int ObAiColumnCache::load_table_items(const uint64_t table_id, const int64_t sch
   }
   if (OB_SUCC(ret) && !table_exists) {
     // the table is gone; refresh the cache entry to empty
-    common::SpinRWLock::WLockGuard guard(lock_);
+    common::SpinWLockGuard guard(lock_);
     TableItemMap::iterator iter = table_items_.get(table_id);
     if (table_items_.end() != iter) {
       iter->second->~ObArray<ObAIColumnItem>();
@@ -357,7 +358,7 @@ int ObAiColumnCache::load_table_items(const uint64_t table_id, const int64_t sch
         }
       }
       if (OB_SUCC(ret)) {
-        common::SpinRWLock::WLockGuard guard(lock_);
+        common::SpinWLockGuard guard(lock_);
         TableItemMap::iterator iter = table_items_.get(table_id);
         if (table_items_.end() != iter) {
           iter->second->~ObArray<ObAIColumnItem>();
@@ -385,6 +386,8 @@ int ObAiColumnCache::deep_copy_item(common::ObIAllocator &alloc,
   dst = src;
   dst.dep_column_ids_.reset();
   dst.rowkey_column_names_.reset();
+  dst.dep_column_ids_.set_allocator(&alloc);
+  dst.rowkey_column_names_.set_allocator(&alloc);
   if (OB_FAIL(common::ob_write_string(alloc, src.column_name_, dst.column_name_))) {
     LOG_WARN("copy column name failed", K(ret));
   } else if (OB_FAIL(common::ob_write_string(alloc, src.model_name_, dst.model_name_))) {
