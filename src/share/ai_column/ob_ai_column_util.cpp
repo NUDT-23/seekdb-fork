@@ -96,6 +96,14 @@ int ObAiColumnCache::get_table_items(const uint64_t table_id, const int64_t sche
 {
   int ret = OB_SUCCESS;
   found = false;
+  if (OB_UNLIKELY(!inited_)) {
+    // every consumer entry point goes through here; lazy init keeps the
+    // bootstrap order irrelevant
+    if (OB_FAIL(init())) {
+      LOG_WARN("lazy init ai column cache failed", K(ret));
+      return ret;
+    }
+  }
   bool need_load = true;
   {
     common::SpinRLockGuard guard(lock_);
