@@ -46,7 +46,8 @@ public:
         cache_stop_(allocator),
         dict_main_(nullptr),
         dict_quan_(nullptr),
-        dict_stop_(nullptr)
+        dict_stop_(nullptr),
+        dicts_shared_(false)
   {
   }
 
@@ -106,6 +107,9 @@ private:
   ObIFTDict *dict_main_;
   ObIFTDict *dict_quan_;
   ObIFTDict *dict_stop_;
+  // true when the dictionaries come from the process wide pool and must not be
+  // destroyed by this parser
+  bool dicts_shared_;
 
   DISABLE_COPY_ASSIGN(ObIKFTParser);
 };

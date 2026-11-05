@@ -19,6 +19,7 @@
 #include "src/storage/fts/ob_ik_ft_parser.h"
 
 #include "lib/charset/ob_charset.h"
+#include "lib/lock/ob_mutex.h"
 #include "lib/ob_errno.h"
 #include "lib/oblog/ob_log_module.h"
 #include "lib/utility/ob_macro_utils.h"
@@ -40,6 +41,88 @@ namespace oceanbase
 {
 namespace storage
 {
+
+namespace
+{
+// The built in ik dictionaries never change, but every ObIKFTParser used to
+// load them again: three KV cache lookups, one ObFTCacheRangeContainer with one
+// handle per dictionary range, one ObFTRangeDict plus one ObFTCacheDict per
+// range. A parser instance is created for every segment() call, that is for
+// every document and every column of an index build, so that fixed cost is paid
+// millions of times even though the result is always the same.
+// The dictionaries are read only after init(), so build them once per process
+// and hand the same instance to every parser.
+class ObIKSharedDictPool
+{
+public:
+  static ObIKSharedDictPool &instance()
+  {
+    static ObIKSharedDictPool pool;
+    return pool;
+  }
+
+  int acquire(ObFTDictHub *hub, const ObFTDictDesc &desc, ObIFTDict *&dict)
+  {
+    int ret = OB_SUCCESS;
+    dict = nullptr;
+    const int64_t idx = static_cast<int64_t>(desc.type_);
+    if (OB_ISNULL(hub)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_UNLIKELY(idx <= 0 || idx >= MAX_DICT_ITEM)) {
+      ret = OB_INVALID_ARGUMENT;
+    } else {
+      // always hold the lock: it is uncontended after the first build and the
+      // reader must observe a fully initialized dictionary
+      lib::ObMutexGuard guard(mutex_);
+      if (OB_NOT_NULL(items_[idx].dict_)) {
+        dict = items_[idx].dict_;
+      } else if (OB_ISNULL(items_[idx].container_ =
+                             OB_NEWx(ObFTCacheRangeContainer, &alloc_, alloc_))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else if (OB_FAIL(load_cache(hub, desc, *items_[idx].container_))) {
+      } else if (OB_ISNULL(items_[idx].dict_ =
+                             OB_NEWx(ObFTRangeDict, &alloc_, alloc_,
+                                     items_[idx].container_, desc))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else if (OB_FAIL(items_[idx].dict_->init())) {
+      } else {
+        dict = items_[idx].dict_;
+      }
+      if (OB_FAIL(ret)) {
+        items_[idx].dict_ = nullptr;
+      }
+    }
+    return ret;
+  }
+
+private:
+  static const int64_t MAX_DICT_ITEM = 8;
+  struct Item
+  {
+    Item() : dict_(nullptr), container_(nullptr) {}
+    ObFTRangeDict *dict_;
+    ObFTCacheRangeContainer *container_;
+  };
+
+  ObIKSharedDictPool() : mutex_(), alloc_(lib::ObMemAttr("IKShrDict")) {}
+  static int load_cache(ObFTDictHub *hub,
+                        const ObFTDictDesc &desc,
+                        ObFTCacheRangeContainer &container)
+  {
+    int ret = OB_SUCCESS;
+    if (OB_FAIL(hub->load_cache(desc, container))) {
+      if (OB_ENTRY_NOT_EXIST == ret) {
+        ret = hub->build_cache(desc, container);
+      }
+    }
+    return ret;
+  }
+
+  lib::ObMutex mutex_;
+  common::ObArenaAllocator alloc_;
+  Item items_[MAX_DICT_ITEM];
+};
+} // namespace
 int ObIKFTParser::init(const ObFTParserParam &param)
 {
   int ret = OB_SUCCESS;
@@ -254,19 +337,19 @@ int ObIKFTParser::init_dict(const ObFTParserParam &param)
                                   ObCollationType::CS_TYPE_UTF8MB4_BIN);
 
   if (should_read_newest_table()) {
-    // clear dict cache, always false now
-  } else {
     if (OB_FAIL(init_single_dict(main_dict_desc, cache_main_))) {
     } else if (OB_FAIL(init_single_dict(quan_dict_desc, cache_quan_))) {
     } else if (OB_FAIL(init_single_dict(stopword_dict_desc, cache_stop_))) {
+    } else if (OB_FAIL(build_dict_from_cache(main_dict_desc, cache_main_, dict_main_))) {
+    } else if (OB_FAIL(build_dict_from_cache(quan_dict_desc, cache_quan_, dict_quan_))) {
+    } else if (OB_FAIL(build_dict_from_cache(stopword_dict_desc, cache_stop_, dict_stop_))) {
     }
-  }
-
-  if (OB_FAIL(ret)) {
-    // already logged.
-  } else if (OB_FAIL(build_dict_from_cache(main_dict_desc, cache_main_, dict_main_))) {
-  } else if (OB_FAIL(build_dict_from_cache(quan_dict_desc, cache_quan_, dict_quan_))) {
-  } else if (OB_FAIL(build_dict_from_cache(stopword_dict_desc, cache_stop_, dict_stop_))) {
+  } else if (OB_FAIL(ObIKSharedDictPool::instance().acquire(hub_, main_dict_desc, dict_main_))) {
+  } else if (OB_FAIL(ObIKSharedDictPool::instance().acquire(hub_, quan_dict_desc, dict_quan_))) {
+  } else if (OB_FAIL(ObIKSharedDictPool::instance().acquire(hub_, stopword_dict_desc, dict_stop_))) {
+  } else {
+    // the dictionaries are owned by the process wide pool
+    dicts_shared_ = true;
   }
 
   return ret;
@@ -366,17 +449,28 @@ void ObIKFTParser::reset()
   cache_quan_.reset();
   cache_stop_.reset();
 
-  if (!OB_ISNULL(dict_main_)) {
-    dict_main_->~ObIFTDict();
-    allocator_.free(dict_main_);
-  }
-  if (!OB_ISNULL(dict_quan_)) {
-    dict_quan_->~ObIFTDict();
-    allocator_.free(dict_quan_);
-  }
-  if (!OB_ISNULL(dict_stop_)) {
-    dict_stop_->~ObIFTDict();
-    allocator_.free(dict_stop_);
+  if (dicts_shared_) {
+    // owned by ObIKSharedDictPool, keep them alive for the next parser
+    dict_main_ = nullptr;
+    dict_quan_ = nullptr;
+    dict_stop_ = nullptr;
+    dicts_shared_ = false;
+  } else {
+    if (!OB_ISNULL(dict_main_)) {
+      dict_main_->~ObIFTDict();
+      allocator_.free(dict_main_);
+      dict_main_ = nullptr;
+    }
+    if (!OB_ISNULL(dict_quan_)) {
+      dict_quan_->~ObIFTDict();
+      allocator_.free(dict_quan_);
+      dict_quan_ = nullptr;
+    }
+    if (!OB_ISNULL(dict_stop_)) {
+      dict_stop_->~ObIFTDict();
+      allocator_.free(dict_stop_);
+      dict_stop_ = nullptr;
+    }
   }
 
   is_inited_ = false;
