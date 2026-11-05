@@ -276,6 +276,10 @@ int assign(const ObColumnSchemaV2 &src_schema);
     return get_column_name_str().prefix_match(OB_HYBRID_VEC_EMBEDDED_VECTOR_COLUMN_NAME_PREFIX) &&
            ObSchemaUtils::is_vec_hnsw_vector_column(column_flags_);
   }
+  inline bool is_ai_column() const { return column_flags_ & AI_COLUMN_FLAG; }
+  inline bool is_ai_state_column() const { return column_flags_ & AI_STATE_COLUMN_FLAG; }
+  inline bool is_ai_request_column() const { return column_flags_ & AI_REQUEST_COLUMN_FLAG; }
+  inline bool is_ai_result_spec_column() const { return column_flags_ & AI_RESULT_SPEC_COLUMN_FLAG; }
 
   inline bool is_vec_spiv_dim_column() const { return ObSchemaUtils::is_vec_spiv_dim_column(column_flags_); }
   inline bool is_vec_spiv_value_column() const { return ObSchemaUtils::is_vec_spiv_value_column(column_flags_); }

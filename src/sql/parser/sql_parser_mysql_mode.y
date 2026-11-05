@@ -338,6 +338,7 @@ END_P SET_VAR DELIMITER
         RUN RECYCLEBIN REPLICATION ROTATE ROW_NUMBER RUDUNDANT RECURSIVE RANDOM REDO_TRANSPORT_OPTIONS
         RANK READ_ONLY RECOVERY REJECT ROLE
         READ_CSV READ_JSON READ_NDJSON READ_PARQUET
+        RETRY
 
         SAMPLE SAVEPOINT SCALARS SCHEMA_NAME SCN SCOPE SCORE SECOND SECURITY SEED
         SEMISTRUCT_ENCODING_TYPE SERIAL SERIALIZABLE SESSION SESSION_USER SET_TP SHARE SHARED SHUTDOWN SIGNED
@@ -346,7 +347,8 @@ END_P SET_VAR DELIMITER
         SQL_THREAD SQL_TSI_DAY SQL_TSI_HOUR SQL_TSI_MINUTE SQL_TSI_MONTH SQL_TSI_QUARTER SQL_TSI_SECOND SQL_TSI_WEEK SQL_TSI_YEAR SRID _ST_ASMVT
         STANDBY STAT START STARTS STATS_AUTO_RECALC STATS_PERSISTENT STATS_SAMPLE_PAGES STATUS STATEMENTS STATISTICS
         STD STDDEV STDDEV_POP STDDEV_SAMP STOPWORD_TABLE STRONG STRATEGY SYNCHRONIZATION SYNCHRONOUS STOP
-        STORAGE STORE STORING STRING
+        STORAGE STORE STORING STRING SYNC_MODE
+        MAX_RETRIES
         SUBCLASS_ORIGIN SUBDATE SUBJECT SUBPARTITION SUBPARTITIONS SUBSTR SUBSTRING SUCCESSFUL SUM
         SUPER SUSPEND SWAPS SWITCH SWITCHES SWITCHOVER SYSTEM SYSTEM_USER SYSDATE SESSION_ALIAS
         SIZE SKEWONLY SEQUENCE STATEMENT_ID SKIP_HEADER PARSE_HEADER IGNORE_LAST_EMPTY_COLUMN SKIP_BLANK_LINES STATEMENT SUM_OPNSIZE SPARSEVECTOR
@@ -503,6 +505,7 @@ END_P SET_VAR DELIMITER
 %type <node> opt_value_on_empty_or_error_or_mismatch opt_on_mismatch
 %type <node> file_read_expr file_read_param_list file_read_param file_read_param_value
 %type <node> copy_stmt copy_source opt_copy_options copy_option_list copy_option copy_param_value
+%type <node> ai_column_attribute ai_column_expr opt_ai_column_options ai_column_option_list ai_column_option
 %type <node> table_values_clause table_values_clause_with_order_by_and_limit values_row_list row_value
 %type <node> geometry_collection
 %type <node> merge_insert_types opt_empty_table_list user_host_or_current_user
@@ -6242,6 +6245,80 @@ not NULLX
 | INVISIBLE
 {
   malloc_terminal_node($$, result->malloc_pool_, T_INVISIBLE);
+}
+| ai_column_attribute
+{
+  $$ = $1;
+}
+;
+
+ai_column_attribute:
+AI COLUMN '(' ai_column_expr ')' opt_ai_column_options
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_CONSTR_AI_COLUMN, 2, $4, $6);
+  $$->sql_str_off_ = @1.first_column;
+}
+;
+
+ai_column_expr:
+NAME_OB '(' STRING_VALUE ',' expr ')'
+{
+  if (OB_ISNULL($1) || OB_ISNULL($1->str_value_)
+      || (0 != strcasecmp("ai_complete", $1->str_value_)
+          && 0 != strcasecmp("ai_embed", $1->str_value_))) {
+    yyerror(&@1, result, "only AI_COMPLETE or AI_EMBED is supported in AI COLUMN");
+    YYERROR;
+  } else if (0 == strcasecmp("ai_complete", $1->str_value_)) {
+    dup_expr_string($5, result, @5.first_column, @5.last_column);
+    malloc_non_terminal_node($$, result->malloc_pool_, T_CONSTR_AI_COLUMN_EXPR, 3, $3, $5, NULL);
+    $$->value_ = 1; /* ai_complete */
+  } else {
+    dup_expr_string($5, result, @5.first_column, @5.last_column);
+    malloc_non_terminal_node($$, result->malloc_pool_, T_CONSTR_AI_COLUMN_EXPR, 3, $3, $5, NULL);
+    $$->value_ = 2; /* ai_embed */
+  }
+}
+| NAME_OB '(' STRING_VALUE ',' expr ',' INTNUM ')'
+{
+  if (OB_ISNULL($1) || OB_ISNULL($1->str_value_)
+      || 0 != strcasecmp("ai_embed", $1->str_value_)) {
+    yyerror(&@1, result, "only AI_EMBED accepts a dimension argument");
+    YYERROR;
+  } else {
+    dup_expr_string($5, result, @5.first_column, @5.last_column);
+    malloc_non_terminal_node($$, result->malloc_pool_, T_CONSTR_AI_COLUMN_EXPR, 3, $3, $5, $7);
+    $$->value_ = 2; /* ai_embed */
+  }
+}
+;
+
+opt_ai_column_options:
+/* EMPTY */
+{
+  $$ = NULL;
+}
+| WITH '(' ai_column_option_list ')'
+{
+  merge_nodes($$, result, T_OPTION_LIST, $3);
+}
+;
+
+ai_column_option_list:
+ai_column_option
+{
+  $$ = $1;
+}
+| ai_column_option_list ',' ai_column_option
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3);
+}
+;
+
+ai_column_option:
+relation_name COMP_EQ expr
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3);
+  dup_expr_string($$, result, @1.first_column, @3.last_column);
 }
 ;
 
@@ -12654,6 +12731,15 @@ SHOW opt_extended_or_full TABLES opt_from_or_in_database_clause opt_show_conditi
   $$->value_ = $2[0];
   malloc_non_terminal_node($$, result->malloc_pool_, T_SHOW_COLUMNS, 4, $$, $5, $6, $7);
 }
+| SHOW AI COLUMNS opt_show_condition
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_SHOW_AI_COLUMNS, 3, NULL, NULL, $3);
+}
+| SHOW AI COLUMNS from_or_in relation_factor opt_from_or_in_database_clause opt_show_condition
+{
+  (void)$4;
+  malloc_non_terminal_node($$, result->malloc_pool_, T_SHOW_AI_COLUMNS, 3, $5, $6, $7);
+}
 | SHOW TABLE STATUS opt_from_or_in_database_clause opt_show_condition
 { malloc_non_terminal_node($$, result->malloc_pool_, T_SHOW_TABLE_STATUS, 2, $4, $5); }
 | SHOW PROCEDURE STATUS opt_from_or_in_database_clause opt_show_condition
@@ -15201,6 +15287,10 @@ ADD COLUMN column_definition
 | FORCE
 {
   malloc_terminal_node($$, result->malloc_pool_, T_ALTER_TABLE_FORCE);
+}
+| RETRY AI COLUMN column_definition_ref opt_show_condition
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_ALTER_AI_RETRY_COLUMN, 2, $4, $5);
 }
 | alter_with_opt_hint COLUMN column_definition_ref alter_column_behavior
 {
@@ -18179,6 +18269,7 @@ ACCOUNT
 |       LOG_DISK_SIZE
 |       MAX_NGRAM_SIZE
 |       MAX_QUERIES_PER_HOUR
+|       MAX_RETRIES
 |       MAX_ROWS
 |       MAX_SIZE
 |       MAX_TOKEN_SIZE
@@ -18333,6 +18424,7 @@ ACCOUNT
 |       RESPECT
 |       RESTART
 |       RESTORE
+|       RETRY
 |       RESUME
 |       RETURNED_SQLSTATE
 |       RETURNING
@@ -18423,6 +18515,7 @@ ACCOUNT
 |       STOP
 |       STOPWORD_TABLE
 |       STORAGE
+|       SYNC_MODE
 |       STORE
 |       STORING
 |       STRATEGY
