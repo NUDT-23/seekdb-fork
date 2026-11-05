@@ -19,6 +19,7 @@
 
 #include "sql/resolver/ddl/ob_ddl_resolver.h"
 #include "sql/resolver/ddl/ob_alter_table_stmt.h"
+#include "lib/string/ob_sql_string.h"
 
 namespace oceanbase
 {
@@ -50,6 +51,8 @@ public:
   virtual ~ObAlterTableResolver();
   virtual int resolve(const ParseNode &parse_tree);
   int resolve_action_list(const ParseNode &node);
+  // ALTER TABLE ... RETRY AI COLUMN col [WHERE cond]
+  int resolve_ai_retry_action(const ParseNode &action_node, const ParseNode &action_list);
   int resolve_column_options(const ParseNode &node,
                              bool &is_modify_column_visibility,
                              bool &is_drop_column,
@@ -204,6 +207,14 @@ private:
                                 const share::schema::ObTableSchema &orign_table_schema,
                                 ObAlterTableStmt &alter_table_stmt);
   int check_semistruct_encoding_type(const ObTableSchema &origin_schema, const ObTableSchema &alter_schema);
+  // locate the hidden state column "__ai_state_<ai_col_name>" of one AI column
+  int find_ai_state_column(const common::ObString &ai_col_name, common::ObString &state_col_name);
+  // rewrite the RETRY condition parse node (STATUS pseudo column) and serialize
+  // it back to SQL text carried on the alter table arg
+  int resolve_ai_retry_condition(const ParseNode &cond_node, const common::ObString &state_col_name,
+                                 obcall::ObAlterTableArg &arg);
+  int print_ai_retry_condition(const ParseNode &node, const common::ObString &state_col_name,
+                               common::ObSqlString &out);
 
   const share::schema::ObTableSchema *table_schema_;
   const share::schema::ObTableSchema *index_schema_;

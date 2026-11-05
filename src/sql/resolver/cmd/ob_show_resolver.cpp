@@ -150,7 +150,8 @@ int ObShowResolver::resolve(const ParseNode &parse_tree)
             && OB_UNLIKELY(parse_tree.type_ != T_SHOW_ENGINE)
             && OB_UNLIKELY(parse_tree.type_ != T_SHOW_OPEN_TABLES)
             && OB_UNLIKELY(parse_tree.type_ != T_SHOW_CREATE_USER)
-            && OB_UNLIKELY(parse_tree.type_ != T_SHOW_CHECK_TABLE)) {
+            && OB_UNLIKELY(parse_tree.type_ != T_SHOW_CHECK_TABLE)
+            && OB_UNLIKELY(parse_tree.type_ != T_SHOW_AI_COLUMNS)) {
     ret = OB_ERR_UNEXPECTED;
   } else {
     real_id = 1;
@@ -414,6 +415,43 @@ int ObShowResolver::resolve(const ParseNode &parse_tree)
                   GEN_SQL_STEP_2(ObShowSqlSet::SHOW_COLUMNS, OB_SYS_DATABASE_NAME,OB_ALL_VIRTUAL_TABLE_COLUMN_TNAME, show_table_id);
                 }
               }
+            }
+          }
+        }();
+        break;
+      }
+      case T_SHOW_AI_COLUMNS: {
+        [&] {
+          // SHOW AI COLUMNS [FROM tbl [FROM db]] [LIKE 'pattern' | WHERE expr]
+          if (OB_UNLIKELY(parse_tree.num_child_ != 3 || NULL == parse_tree.children_)) {
+            ret = OB_ERR_UNEXPECTED;
+          } else {
+            ObString show_db_name;
+            uint64_t show_db_id = OB_INVALID_ID;
+            ObString show_table_name;
+            uint64_t show_table_id = OB_INVALID_ID;
+            bool is_view = false;
+            show_resv_ctx.condition_node_ = parse_tree.children_[2];
+            show_resv_ctx.stmt_type_ = stmt::T_SHOW_AI_COLUMNS;
+            if (NULL == parse_tree.children_[0]) {
+              // every AI column of every database
+              GEN_SQL_STEP_1(ObShowSqlSet::SHOW_AI_COLUMNS);
+              GEN_SQL_STEP_2(ObShowSqlSet::SHOW_AI_COLUMNS,
+                             OB_SYS_DATABASE_NAME, OB_ALL_AI_COLUMN_TNAME,
+                             OB_SYS_DATABASE_NAME, OB_ALL_TABLE_TNAME,
+                             OB_SYS_DATABASE_NAME, OB_ALL_DATABASE_TNAME);
+            } else if (OB_FAIL(resolve_show_from_table(parse_tree.children_[0],
+                                                       parse_tree.children_[1],
+                                                       database_name.empty(), T_SHOW_AI_COLUMNS,
+                                                       real_id, show_db_name, show_db_id,
+                                                       show_table_name, show_table_id, is_view))) {
+            } else {
+              GEN_SQL_STEP_1(ObShowSqlSet::SHOW_AI_COLUMNS_BY_TABLE);
+              GEN_SQL_STEP_2(ObShowSqlSet::SHOW_AI_COLUMNS_BY_TABLE,
+                             OB_SYS_DATABASE_NAME, OB_ALL_AI_COLUMN_TNAME,
+                             OB_SYS_DATABASE_NAME, OB_ALL_TABLE_TNAME,
+                             OB_SYS_DATABASE_NAME, OB_ALL_DATABASE_TNAME,
+                             show_table_id);
             }
           }
         }();
@@ -1806,6 +1844,7 @@ int ObShowResolver::resolve_like_or_where_clause(ObShowResolverContext &ctx)
                  && parse_tree->type_ != T_SHOW_COLLATION
                  && parse_tree->type_ != T_SHOW_TRACE
                  && parse_tree->type_ != T_SHOW_COLUMNS
+                 && parse_tree->type_ != T_SHOW_AI_COLUMNS
                  && parse_tree->type_ != T_SHOW_TABLE_STATUS
                  && parse_tree->type_ != T_SHOW_INDEXES
                  && parse_tree->type_ != T_SHOW_PARAMETERS
@@ -2364,6 +2403,29 @@ DEFINE_SHOW_CLAUSE_SET(SHOW_VARIABLES,
                        "SELECT /*+parallel(1)*/ variable_name AS `Variable_name`, value AS `Value` FROM %s.%s ORDER BY variable_name ASC",
                        R"(SELECT /*+parallel(1)*/ "VARIABLE_NAME" AS "VARIABLE_NAME", "VALUE" AS "VALUE" FROM %s.%s ORDER BY VARIABLE_NAME ASC)",
                        "Variable_name");
+DEFINE_SHOW_CLAUSE_SET(SHOW_AI_COLUMNS,
+                       NULL,
+                       "SELECT d.database_name AS database_name, t.table_name AS table_name, a.column_name AS column_name, \
+                        a.func_type AS func_type, a.model_name AS model_name, a.sync_mode AS sync_mode, \
+                        a.max_retries AS max_retries, a.def_version AS def_version, \
+                        a.state_column_id AS state_column_id, a.request_column_id AS request_column_id, \
+                        a.result_spec_column_id AS result_spec_column_id, a.normalized_expr AS normalized_expr \
+                        FROM %s.%s a JOIN %s.%s t ON t.table_id = a.table_id \
+                        JOIN %s.%s d ON d.database_id = t.database_id",
+                       NULL,
+                       "column_name");
+DEFINE_SHOW_CLAUSE_SET(SHOW_AI_COLUMNS_BY_TABLE,
+                       NULL,
+                       "SELECT d.database_name AS database_name, t.table_name AS table_name, a.column_name AS column_name, \
+                        a.func_type AS func_type, a.model_name AS model_name, a.sync_mode AS sync_mode, \
+                        a.max_retries AS max_retries, a.def_version AS def_version, \
+                        a.state_column_id AS state_column_id, a.request_column_id AS request_column_id, \
+                        a.result_spec_column_id AS result_spec_column_id, a.normalized_expr AS normalized_expr \
+                        FROM %s.%s a JOIN %s.%s t ON t.table_id = a.table_id \
+                        JOIN %s.%s d ON d.database_id = t.database_id \
+                        WHERE a.table_id = %ld",
+                       NULL,
+                       "column_name");
 DEFINE_SHOW_CLAUSE_SET(SHOW_GLOBAL_VARIABLES,
                        NULL,
                        "SELECT /*+parallel(1)*/ variable_name AS `Variable_name`, value AS `Value` FROM %s.%s ORDER BY variable_name ASC",

@@ -42,6 +42,15 @@
 
 #include "sql/printer/ob_select_stmt_printer.h"
 #include "share/ob_structured_event_logger.h"
+#include "share/ai_column/ob_ai_column_util.h"
+#include "share/inner_table/ob_inner_table_schema.h"
+#include "share/ob_dml_sql_splicer.h"
+#include "share/schema/ob_database_schema.h"
+#include "share/schema/ob_schema_getter_guard.h"
+#include "sql/session/ob_inner_sql_connection.h"
+#include "common/mysqlclient/ob_mysql_result.h"
+#include "lib/hash_func/murmur_hash.h"
+#include "lib/string/ob_sql_string.h"
 namespace oceanbase
 {
 using namespace common;
@@ -751,6 +760,315 @@ int ObAlterTableExecutor::alter_table_exchange_partition_rpc(obcall::ObExchangeP
   return ret;
 }
 
+// append one SQL string literal (single quoted, internal quotes doubled)
+static int append_ai_retry_sql_literal(ObSqlString &out, const ObString &val)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(out.append("'"))) {
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < val.length(); ++i) {
+      const char c = val.ptr()[i];
+      if ('\'' == c) {
+        if (OB_FAIL(out.append("''"))) {
+        }
+      } else if (OB_FAIL(out.append_fmt("%c", c))) {
+      }
+    }
+    if (OB_SUCC(ret) && OB_FAIL(out.append("'"))) {
+    }
+  }
+  return ret;
+}
+
+// ALTER TABLE ... RETRY AI COLUMN: re-run the AI request of the rows matched
+// by the (optional) retry condition.  The statements below run on the caller's
+// session through a nested session so that they join the user transaction.
+// The rowkey predicate format and the task table statements must stay in sync
+// with ObAIColumnDMLHelper.
+static int execute_ai_column_retry(ObExecContext &ctx, obcall::ObAlterTableArg &arg)
+{
+  int ret = OB_SUCCESS;
+  ObSQLSessionInfo *my_session = ctx.get_my_session();
+  ObSchemaGetterGuard *guard = NULL;
+  // ObAlterTableArg::table_id_ is not filled by the resolver; the resolved
+  // table id lives in the alter table schema
+  const uint64_t table_id = arg.alter_table_schema_.get_table_id();
+  if (OB_ISNULL(my_session)) {
+    ret = OB_ERR_UNEXPECTED;
+    SQL_ENG_LOG(WARN, "session is null for ai column retry", K(ret));
+  } else if (OB_NOT_NULL(ctx.get_sql_ctx()) && OB_NOT_NULL(ctx.get_sql_ctx()->schema_guard_)) {
+    guard = ctx.get_sql_ctx()->schema_guard_;
+  } else {
+    guard = &my_session->get_schema_guard();
+  }
+  const ObTableSchema *table_schema = NULL;
+  const ObDatabaseSchema *db_schema = NULL;
+  int64_t schema_version = 0;
+  ObString db_name;
+  ObString table_name;
+  ObArenaAllocator alloc(ObModIds::OB_SQL_EXECUTOR);
+  ObArray<ObAIColumnItem> items;
+  bool found = false;
+  if (OB_FAIL(ret)) {
+  } else if (OB_ISNULL(guard)) {
+    ret = OB_ERR_UNEXPECTED;
+    SQL_ENG_LOG(WARN, "no schema guard for ai column retry", K(ret));
+  } else if (OB_FAIL(guard->get_schema_version(schema_version))) {
+    SQL_ENG_LOG(WARN, "get schema version failed", K(ret), K(table_id));
+  } else if (OB_FAIL(guard->get_table_schema(table_id, table_schema))) {
+    SQL_ENG_LOG(WARN, "get table schema failed", K(ret), K(table_id));
+  } else if (OB_ISNULL(table_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+    SQL_ENG_LOG(WARN, "table schema is null", K(ret), K(table_id));
+  } else if (OB_FAIL(guard->get_database_schema(table_schema->get_database_id(), db_schema))) {
+    SQL_ENG_LOG(WARN, "get database schema failed", K(ret), K(table_id));
+  } else if (OB_ISNULL(db_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+    SQL_ENG_LOG(WARN, "database schema is null", K(ret), K(table_id));
+  } else if (OB_FAIL(ObAiColumnCache::get_instance().init())) {
+    SQL_ENG_LOG(WARN, "init ai column cache failed", K(ret));
+  } else if (OB_FAIL(ObAiColumnCache::get_instance().get_table_items(
+                 table_id, schema_version, alloc, items, found))) {
+    SQL_ENG_LOG(WARN, "load ai column items failed", K(ret), K(table_id));
+  } else if (OB_FAIL(ob_write_string(alloc, db_schema->get_database_name_str(), db_name, true))) {
+    SQL_ENG_LOG(WARN, "write db name failed", K(ret));
+  } else if (OB_FAIL(ob_write_string(alloc, table_schema->get_table_name_str(), table_name, true))) {
+    SQL_ENG_LOG(WARN, "write table name failed", K(ret));
+  }
+  const ObAIColumnItem *item = NULL;
+  if (OB_SUCC(ret)) {
+    if (!found) {
+      ret = OB_ERR_UNEXPECTED;
+      SQL_ENG_LOG(WARN, "table has no ai column for retry", K(ret), K(table_id));
+    } else {
+      for (int64_t i = 0; OB_SUCC(ret) && NULL == item && i < items.count(); ++i) {
+        if (items.at(i).column_name_.case_compare_equal(arg.ai_retry_column_name_)) {
+          item = &items.at(i);
+        }
+      }
+      if (OB_SUCC(ret) && OB_ISNULL(item)) {
+        ret = OB_ERR_UNEXPECTED;
+        SQL_ENG_LOG(WARN, "ai column item not found for retry", K(ret),
+                    K(arg.ai_retry_column_name_), K(table_id));
+      }
+    }
+  }
+  // ordered rowkey columns with their types (deep copied, NUL terminated)
+  ObArray<ObString> rk_names;
+  ObArray<bool> rk_is_int;
+  if (OB_SUCC(ret)) {
+    for (int64_t i = 0; OB_SUCC(ret) && i < table_schema->get_rowkey_info().get_size(); ++i) {
+      uint64_t cid = OB_INVALID_ID;
+      const ObColumnSchemaV2 *col_schema = NULL;
+      ObString name_copy;
+      if (OB_FAIL(table_schema->get_rowkey_info().get_column_id(i, cid))) {
+        SQL_ENG_LOG(WARN, "get rowkey column id failed", K(ret), K(i));
+      } else if (OB_ISNULL(col_schema = table_schema->get_column_schema(cid))) {
+        ret = OB_ERR_UNEXPECTED;
+        SQL_ENG_LOG(WARN, "rowkey column schema not found", K(ret), K(cid));
+      } else if (OB_FAIL(ob_write_string(alloc, col_schema->get_column_name_str(), name_copy, true))) {
+        SQL_ENG_LOG(WARN, "write rowkey name failed", K(ret));
+      } else if (OB_FAIL(rk_names.push_back(name_copy))) {
+        SQL_ENG_LOG(WARN, "push back rowkey name failed", K(ret));
+      } else if (OB_FAIL(rk_is_int.push_back(ob_is_integer_type(col_schema->get_data_type())))) {
+        SQL_ENG_LOG(WARN, "push back rowkey type failed", K(ret));
+      }
+    }
+    if (OB_SUCC(ret) && rk_names.empty()) {
+      // the AI linkage only maintains tables with a primary key
+      ret = OB_ERR_UNEXPECTED;
+      SQL_ENG_LOG(WARN, "table without primary key cannot be retried", K(ret), K(table_id));
+    }
+  }
+  // select the rowkeys of the rows selected by the retry condition
+  ObSqlString select_sql;
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(select_sql.append("select "))) {
+    } else {
+      for (int64_t i = 0; OB_SUCC(ret) && i < rk_names.count(); ++i) {
+        if (i > 0 && OB_FAIL(select_sql.append(", "))) {
+        } else if (OB_FAIL(select_sql.append_fmt("`%.*s`",
+                                                 rk_names.at(i).length(), rk_names.at(i).ptr()))) {
+          SQL_ENG_LOG(WARN, "append rowkey select item failed", K(ret));
+        }
+      }
+    }
+    if (OB_SUCC(ret)) {
+      if (db_name.empty()) {
+        // fall back to the unqualified table name when db resolution fails
+        if (OB_FAIL(select_sql.append_fmt(" from `%.*s`", table_name.length(), table_name.ptr()))) {
+        }
+      } else if (OB_FAIL(select_sql.append_fmt(" from `%.*s`.`%.*s`",
+                                               db_name.length(), db_name.ptr(),
+                                               table_name.length(), table_name.ptr()))) {
+      }
+      if (OB_SUCC(ret) && !arg.ai_retry_where_cond_.empty()
+          && OB_FAIL(select_sql.append_fmt(" where %.*s",
+                                           arg.ai_retry_where_cond_.length(),
+                                           arg.ai_retry_where_cond_.ptr()))) {
+      }
+    }
+  }
+  // the task table is qualified because the user session's current database is
+  // the user database
+  char task_table_name[128] = {0};
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(databuff_printf(task_table_name, sizeof(task_table_name), "`%s`.`%s`",
+                                "oceanbase", OB_ALL_AI_COLUMN_TASK_TNAME))) {
+      SQL_ENG_LOG(WARN, "build task table name failed", K(ret));
+    }
+  }
+  common::sqlclient::ObISQLConnectionGuard conn_guard;
+  ObIInnerSQLConnection *conn = NULL;
+  ObSQLSessionInfo::StmtSavedValue saved_session;
+  ObIInnerSQLConnection::SavedValue saved_conn;
+  bool in_nested_session = false;
+  ObArray<ObString> preds;  // deep copied rowkey predicates, NUL terminated
+  // mark the statements spawned below as engine maintenance SQL (same pattern
+  // as ObAIColumnDMLHelper): they are allowed to assign the AI columns
+  // directly and must not re-enter the AI DML linkage
+  const bool save_is_fk_cascading = ctx.get_das_ctx().is_fk_cascading_;
+  const bool save_in_ignore_cascading = ctx.get_das_ctx().in_ignore_cascading_;
+  ctx.get_das_ctx().is_fk_cascading_ = true;
+  ctx.get_das_ctx().in_ignore_cascading_ = false;
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(query::ObInnerSQLConnectionAccess::create_connection_with_external_session(
+            my_session, conn_guard))) {
+      SQL_ENG_LOG(WARN, "create inner connection with external session failed", K(ret));
+    } else if (OB_ISNULL(conn = sql::as_inner_sql_connection(conn_guard.get_ptr()))) {
+      ret = OB_ERR_UNEXPECTED;
+      SQL_ENG_LOG(WARN, "inner connection is null", K(ret));
+    } else if (OB_FAIL(conn->begin_nested_session(saved_session, saved_conn,
+                                                  true /*skip_cur_stmt_tables*/))) {
+      SQL_ENG_LOG(WARN, "begin nested session for ai column retry failed", K(ret));
+    } else {
+      in_nested_session = true;
+    }
+  }
+  if (OB_SUCC(ret)) {
+    SMART_VAR(ObISQLClient::ReadResult, res) {
+      common::sqlclient::ObMySQLResult *result = NULL;
+      int tmp_ret = OB_SUCCESS;
+      if (OB_FAIL(conn->execute_read(select_sql.ptr(), res))) {
+        SQL_ENG_LOG(WARN, "execute ai retry select failed", K(ret), K(select_sql.ptr()));
+      } else if (OB_ISNULL(result = res.get_result())) {
+        ret = OB_ERR_UNEXPECTED;
+        SQL_ENG_LOG(WARN, "ai retry select result is null", K(ret));
+      } else {
+        while (OB_SUCC(ret) && OB_SUCCESS == (tmp_ret = result->next())) {
+          ObSqlString pred;
+          for (int64_t i = 0; OB_SUCC(ret) && i < rk_names.count(); ++i) {
+            const ObString &rk_name = rk_names.at(i);
+            if (i > 0 && OB_FAIL(pred.append(" and "))) {
+            } else if (OB_FAIL(pred.append_fmt("`%.*s` = ", rk_name.length(), rk_name.ptr()))) {
+              SQL_ENG_LOG(WARN, "append rowkey predicate failed", K(ret));
+            } else if (rk_is_int.at(i)) {
+              int64_t v = 0;
+              EXTRACT_INT_FIELD_MYSQL(*result, rk_name.ptr(), v, int64_t);
+              if (OB_SUCC(ret) && OB_FAIL(pred.append_fmt("%ld", v))) {
+                SQL_ENG_LOG(WARN, "append int rowkey value failed", K(ret));
+              }
+            } else {
+              ObString v;
+              EXTRACT_VARCHAR_FIELD_MYSQL(*result, rk_name.ptr(), v);
+              if (OB_SUCC(ret) && OB_FAIL(append_ai_retry_sql_literal(pred, v))) {
+                SQL_ENG_LOG(WARN, "append varchar rowkey value failed", K(ret));
+              }
+            }
+          }
+          ObString pred_copy;
+          if (OB_SUCC(ret)
+              && OB_FAIL(ob_write_string(alloc,
+                                         ObString(static_cast<int32_t>(pred.length()), pred.ptr()),
+                                         pred_copy, true))) {
+            SQL_ENG_LOG(WARN, "copy rowkey predicate failed", K(ret));
+          } else if (OB_SUCC(ret) && OB_FAIL(preds.push_back(pred_copy))) {
+            SQL_ENG_LOG(WARN, "push back rowkey predicate failed", K(ret));
+          }
+        }
+        if (OB_SUCCESS == ret && OB_ITER_END != tmp_ret && OB_SUCCESS != tmp_ret) {
+          ret = tmp_ret;
+          SQL_ENG_LOG(WARN, "iterate ai retry select failed", K(ret));
+        }
+      }
+    }
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < preds.count(); ++i) {
+    const ObString &pred = preds.at(i);
+    const uint64_t pred_hash = murmurhash64A(pred.ptr(), static_cast<int32_t>(pred.length()), 0);
+    char rid_buf[64];
+    ObSqlString upd_sql;
+    ObSqlString del_sql;
+    ObDMLSqlSplicer splicer;
+    ObSqlString ins_sql;
+    int64_t affected_rows = 0;
+    if (OB_FAIL(gen_ai_request_id(rid_buf, sizeof(rid_buf)))) {
+      SQL_ENG_LOG(WARN, "gen ai request id failed", K(ret));
+    } else if (OB_FAIL(upd_sql.assign_fmt(
+                   "update `%.*s`.`%.*s` set `%.*s` = '%s', `%.*s` = '%s', `%.*s` = NULL,"
+                   " `%.*s` = '' where %.*s",
+                   db_name.length(), db_name.ptr(), table_name.length(), table_name.ptr(),
+                   item->state_column_name_.length(), item->state_column_name_.ptr(),
+                   OB_AI_STATE_PENDING,
+                   item->request_column_name_.length(), item->request_column_name_.ptr(),
+                   rid_buf,
+                   item->result_column_name_.length(), item->result_column_name_.ptr(),
+                   item->result_spec_column_name_.length(), item->result_spec_column_name_.ptr(),
+                   pred.length(), pred.ptr()))) {
+      SQL_ENG_LOG(WARN, "build ai retry update sql failed", K(ret));
+    } else if (OB_FAIL(conn->execute_write(upd_sql.ptr(), affected_rows))) {
+      SQL_ENG_LOG(WARN, "execute ai retry update failed", K(ret), K(upd_sql.ptr()));
+    } else if (OB_FAIL(del_sql.assign_fmt(
+                   "delete from %s where table_id = %lu and rowkey_hash = %lu and column_id = %lu",
+                   task_table_name, table_id, pred_hash, item->column_id_))) {
+      SQL_ENG_LOG(WARN, "build ai retry task delete sql failed", K(ret));
+    } else if (OB_FAIL(conn->execute_write(del_sql.ptr(), affected_rows))) {
+      SQL_ENG_LOG(WARN, "execute ai retry task delete failed", K(ret), K(del_sql.ptr()));
+    } else if (OB_FAIL(splicer.add_pk_column("table_id", item->table_id_))) {
+      SQL_ENG_LOG(WARN, "add table_id failed", K(ret));
+    } else if (OB_FAIL(splicer.add_pk_column("rowkey_hash", pred_hash))) {
+      SQL_ENG_LOG(WARN, "add rowkey_hash failed", K(ret));
+    } else if (OB_FAIL(splicer.add_pk_column("column_id", item->column_id_))) {
+      SQL_ENG_LOG(WARN, "add column_id failed", K(ret));
+    } else if (OB_FAIL(splicer.add_column("rowkey_predicate",
+                                          ObHexEscapeSqlStr(pred, false/*skip_escape*/,
+                                                            true/*do_single_quote_escape*/)))) {
+      SQL_ENG_LOG(WARN, "add rowkey_predicate failed", K(ret));
+    } else if (OB_FAIL(splicer.add_column("request_id", rid_buf))) {
+      SQL_ENG_LOG(WARN, "add request_id failed", K(ret));
+    } else if (OB_FAIL(splicer.add_column("state",
+                                          static_cast<int64_t>(OB_AI_TASK_STATE_PENDING)))) {
+      SQL_ENG_LOG(WARN, "add state failed", K(ret));
+    } else if (OB_FAIL(splicer.add_column("retry_count", static_cast<int64_t>(0)))) {
+      SQL_ENG_LOG(WARN, "add retry_count failed", K(ret));
+    } else if (OB_FAIL(splicer.add_column("max_retries", item->max_retries_))) {
+      SQL_ENG_LOG(WARN, "add max_retries failed", K(ret));
+    } else if (OB_FAIL(splicer.add_column("def_version", item->def_version_))) {
+      SQL_ENG_LOG(WARN, "add def_version failed", K(ret));
+    } else if (OB_FAIL(splicer.add_function_call("eligible_ts", "now(6)"))) {
+      SQL_ENG_LOG(WARN, "add eligible_ts failed", K(ret));
+    } else if (OB_FAIL(splicer.splice_insert_sql(task_table_name, ins_sql))) {
+      SQL_ENG_LOG(WARN, "splice ai retry task insert sql failed", K(ret));
+    } else if (OB_FAIL(conn->execute_write(ins_sql.ptr(), affected_rows))) {
+      SQL_ENG_LOG(WARN, "execute ai retry task insert failed", K(ret), K(ins_sql.ptr()));
+    } else {
+      SQL_ENG_LOG(TRACE, "ai column retry row processed", K(pred), K(rid_buf));
+    }
+  }
+  if (in_nested_session) {
+    int tmp_ret = conn->end_nested_session(saved_session, saved_conn);
+    if (OB_SUCCESS != tmp_ret) {
+      SQL_ENG_LOG(WARN, "end nested session for ai column retry failed", K(tmp_ret));
+      if (OB_SUCCESS == ret) {
+        ret = tmp_ret;
+      }
+    }
+  }
+  ctx.get_das_ctx().is_fk_cascading_ = save_is_fk_cascading;
+  ctx.get_das_ctx().in_ignore_cascading_ = save_in_ignore_cascading;
+  return ret;
+}
+
 int ObAlterTableExecutor::execute(ObExecContext &ctx, ObAlterTableStmt &stmt)
 {
   int ret = OB_SUCCESS;
@@ -762,6 +1080,12 @@ int ObAlterTableExecutor::execute(ObExecContext &ctx, ObAlterTableStmt &stmt)
   OV (OB_NOT_NULL(task_exec_ctx = GET_SQL_EXECUTOR_CTX(ctx)), OB_NOT_INIT);
   if (OB_FAIL(ret)) {
     // do nothing
+  } else if (!alter_table_arg.ai_retry_column_name_.empty()) {
+    // ALTER TABLE ... RETRY AI COLUMN: run the row maintenance inline and skip
+    // the schema change RPC entirely.
+    if (OB_FAIL(execute_ai_column_retry(ctx, alter_table_arg))) {
+      SQL_ENG_LOG(WARN, "execute ai column retry failed", K(ret));
+    }
   } else if (stmt.is_alter_triggers()) {
     if (stmt.get_tg_arg().trigger_infos_.count() > 0) {
       stmt.get_tg_arg().ddl_stmt_str_ = first_stmt;

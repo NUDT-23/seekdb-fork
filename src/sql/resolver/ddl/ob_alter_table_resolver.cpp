@@ -25,6 +25,8 @@
 #include "sql/session/ob_local_session_var.h"
 #include "query/command/ob_root_command_service.h"
 #include "query/vector/ob_vector_index_util.h"
+#include "share/ai_column/ob_ai_column_util.h"
+#include "lib/string/ob_sql_string.h"
 
 namespace oceanbase
 {
@@ -425,7 +427,15 @@ int ObAlterTableResolver::resolve_action_list(const ParseNode &node)
         }
         //deal with add column, alter column, drop column, change column, modify column
         case T_ALTER_COLUMN_OPTION: {
-            alter_table_stmt->set_alter_table_column();
+            // the RETRY AI COLUMN action is an alter_column_option alternative,
+            // so it arrives wrapped in this T_ALTER_COLUMN_OPTION node
+            ParseNode *inner_action = (1 == action_node->num_child_ && OB_NOT_NULL(action_node->children_))
+                                      ? action_node->children_[0] : NULL;
+            if (OB_NOT_NULL(inner_action) && T_ALTER_AI_RETRY_COLUMN == inner_action->type_) {
+              if (OB_FAIL(resolve_ai_retry_action(*inner_action, node))) {
+              }
+            } else {
+              alter_table_stmt->set_alter_table_column();
             bool temp_is_modify_column_visibility = false;
             bool is_mysql_drop_column = false;
             has_alter_column_option = true;
@@ -451,6 +461,7 @@ int ObAlterTableResolver::resolve_action_list(const ParseNode &node)
                 has_drop_column = tmp_has_drop_column;
               }
               ++alter_column_times;
+            }
             }
             break;
           }
@@ -585,6 +596,13 @@ int ObAlterTableResolver::resolve_action_list(const ParseNode &node)
         case T_MODIFY_ALL_TRIGGERS: {
             alter_table_stmt->set_is_alter_triggers(true);
             if (OB_FAIL(resolve_modify_all_trigger(*action_node))) {
+            }
+            break;
+        }
+        case T_ALTER_AI_RETRY_COLUMN: {
+            // ALTER TABLE ... RETRY AI COLUMN col [WHERE cond]: the executor
+            // runs the retry inline, no schema change is involved here.
+            if (OB_FAIL(resolve_ai_retry_action(*action_node, node))) {
             }
             break;
         }
@@ -745,6 +763,317 @@ int ObAlterTableResolver::resolve_action_list(const ParseNode &node)
       }
     }
     } // end for heap_vars_2.
+  }
+  return ret;
+}
+
+// append one SQL string literal (single quoted, internal quotes doubled)
+static int append_ai_retry_sql_str(common::ObSqlString &out, const common::ObString &val)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(out.append("'"))) {
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < val.length(); ++i) {
+      const char c = val.ptr()[i];
+      if ('\'' == c) {
+        if (OB_FAIL(out.append("''"))) {
+        }
+      } else if (OB_FAIL(out.append_fmt("%c", c))) {
+      }
+    }
+    if (OB_SUCC(ret) && OB_FAIL(out.append("'"))) {
+    }
+  }
+  return ret;
+}
+
+int ObAlterTableResolver::resolve_ai_retry_action(const ParseNode &action_node, const ParseNode &action_list)
+{
+  int ret = OB_SUCCESS;
+  ObAlterTableStmt *alter_table_stmt = get_alter_table_stmt();
+  if (OB_ISNULL(table_schema_)) {
+    ret = OB_ERR_UNEXPECTED;
+    SQL_RESV_LOG(WARN, "table schema should not be null", K(ret));
+  } else if (OB_ISNULL(alter_table_stmt)) {
+    ret = OB_ERR_UNEXPECTED;
+    SQL_RESV_LOG(WARN, "alter table stmt should not be null", K(ret));
+  } else if (action_list.num_child_ > 1) {
+    // RETRY addresses exactly one AI column and cannot be mixed with any
+    // other ALTER action
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "combining AI COLUMN RETRY with another ALTER action");
+  } else if (OB_UNLIKELY(action_node.num_child_ != 2) || OB_ISNULL(action_node.children_)) {
+    ret = OB_ERR_UNEXPECTED;
+    SQL_RESV_LOG(WARN, "invalid retry ai column parse tree", K(ret));
+  } else {
+    const ParseNode *col_ref = action_node.children_[0];
+    if (OB_ISNULL(col_ref) || OB_UNLIKELY(col_ref->num_child_ != 3) || OB_ISNULL(col_ref->children_)
+        || OB_ISNULL(col_ref->children_[2])) {
+      ret = OB_ERR_UNEXPECTED;
+      SQL_RESV_LOG(WARN, "invalid retry ai column ref", K(ret));
+    } else {
+      const ObString col_name(col_ref->children_[2]->str_len_, col_ref->children_[2]->str_value_);
+      const ObColumnSchemaV2 *col_schema = NULL;
+      ObString state_col_name;
+      if (col_name.empty()) {
+        ret = OB_ERR_UNEXPECTED;
+        SQL_RESV_LOG(WARN, "empty retry ai column name", K(ret));
+      } else if (OB_ISNULL(col_schema = table_schema_->get_column_schema(col_name))) {
+        ret = OB_ERR_BAD_FIELD_ERROR;
+        LOG_USER_ERROR(OB_ERR_BAD_FIELD_ERROR, col_name.length(), col_name.ptr(),
+                       table_schema_->get_table_name_str().length(),
+                       table_schema_->get_table_name_str().ptr());
+      } else if (!col_schema->is_ai_column()) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "retrying a column that is not an AI column");
+      } else if (OB_FAIL(find_ai_state_column(col_name, state_col_name))) {
+        SQL_RESV_LOG(WARN, "find ai state column failed", K(ret), K(col_name));
+      } else if (OB_FAIL(ob_write_string(*allocator_, col_name,
+                                         alter_table_stmt->get_alter_table_arg().ai_retry_column_name_))) {
+        SQL_RESV_LOG(WARN, "write retry ai column name failed", K(ret));
+      } else {
+        // children_[1]: T_WHERE_CLAUSE node or NULL
+        const ParseNode *where_node = action_node.children_[1];
+        if (OB_ISNULL(where_node)) {
+          // no WHERE: retry every row of the table
+        } else if (T_WHERE_CLAUSE != where_node->type_
+                   || OB_UNLIKELY(where_node->num_child_ != 1)
+                   || OB_ISNULL(where_node->children_)
+                   || OB_ISNULL(where_node->children_[0])) {
+          ret = OB_ERR_UNEXPECTED;
+          SQL_RESV_LOG(WARN, "invalid retry ai column condition node", K(ret));
+        } else if (OB_FAIL(resolve_ai_retry_condition(*where_node->children_[0], state_col_name,
+                                                      alter_table_stmt->get_alter_table_arg()))) {
+          SQL_RESV_LOG(WARN, "resolve retry ai column condition failed", K(ret));
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObAlterTableResolver::find_ai_state_column(const ObString &ai_col_name, ObString &state_col_name)
+{
+  int ret = OB_SUCCESS;
+  static const char *prefix = "__ai_state_";
+  char buf[OB_MAX_COLUMN_NAME_LENGTH];
+  if (OB_FAIL(share::build_ai_hidden_column_name(prefix, strlen(prefix), ai_col_name, buf, sizeof(buf)))) {
+    SQL_RESV_LOG(WARN, "build ai state column name failed", K(ret), K(ai_col_name));
+  } else {
+    const ObString expect_name(static_cast<int32_t>(strlen(buf)), buf);
+    const ObColumnSchemaV2 *state_schema = table_schema_->get_column_schema(expect_name);
+    if (OB_ISNULL(state_schema) || !state_schema->is_ai_state_column()) {
+      ret = OB_ERR_UNEXPECTED;
+      SQL_RESV_LOG(WARN, "ai state column not found", K(ret), K(ai_col_name), K(expect_name));
+    } else {
+      state_col_name = expect_name;
+    }
+  }
+  return ret;
+}
+
+int ObAlterTableResolver::resolve_ai_retry_condition(const ParseNode &cond_node,
+                                                     const ObString &state_col_name,
+                                                     obcall::ObAlterTableArg &arg)
+{
+  int ret = OB_SUCCESS;
+  ObSqlString cond_sql;
+  if (OB_FAIL(print_ai_retry_condition(cond_node, state_col_name, cond_sql))) {
+    SQL_RESV_LOG(WARN, "print retry ai column condition failed", K(ret));
+  } else if (OB_FAIL(ob_write_string(*allocator_,
+                                     ObString(static_cast<int32_t>(cond_sql.length()), cond_sql.ptr()),
+                                     arg.ai_retry_where_cond_))) {
+    SQL_RESV_LOG(WARN, "write retry ai column condition failed", K(ret));
+  } else {
+    SQL_RESV_LOG(INFO, "ai column retry condition built", K(ret), "cond", cond_sql.ptr());
+  }
+  return ret;
+}
+
+// Serialize a RETRY condition parse node back to SQL text.  Unquoted STATUS
+// references are rewritten to the AI column's hidden state column so the
+// executor can evaluate the predicate over the state values.
+int ObAlterTableResolver::print_ai_retry_condition(const ParseNode &node, const ObString &state_col_name,
+                                                   ObSqlString &out)
+{
+  int ret = OB_SUCCESS;
+  switch (node.type_) {
+    case T_COLUMN_REF: {
+      if (OB_UNLIKELY(node.num_child_ != 3) || OB_ISNULL(node.children_)
+          || OB_ISNULL(node.children_[2])) {
+        ret = OB_ERR_UNEXPECTED;
+        SQL_RESV_LOG(WARN, "invalid column ref node", K(ret));
+      } else {
+        const ParseNode *name_node = node.children_[2];
+        ObString col_name(name_node->str_len_, name_node->str_value_);
+        if (name_node->is_input_quoted_ != 1 && col_name.case_compare_equal("status")) {
+          // unquoted STATUS is the retry-only pseudo column: rewrite it to the
+          // state column; a backticked `status` stays the business column
+          col_name = state_col_name;
+        }
+        if (OB_FAIL(out.append_fmt("`%.*s`", col_name.length(), col_name.ptr()))) {
+          SQL_RESV_LOG(WARN, "append column name failed", K(ret));
+        }
+      }
+      break;
+    }
+    case T_IDENT: {
+      const ObString name(node.str_len_, node.str_value_);
+      if (node.is_input_quoted_ == 1) {
+        if (OB_FAIL(out.append_fmt("`%.*s`", name.length(), name.ptr()))) {
+          SQL_RESV_LOG(WARN, "append ident failed", K(ret));
+        }
+      } else if (OB_FAIL(out.append_fmt("%.*s", name.length(), name.ptr()))) {
+        SQL_RESV_LOG(WARN, "append ident failed", K(ret));
+      }
+      break;
+    }
+    case T_VARCHAR:
+    case T_CHAR: {
+      const ObString val(node.str_len_, node.str_value_);
+      if (OB_FAIL(append_ai_retry_sql_str(out, val))) {
+        SQL_RESV_LOG(WARN, "append string literal failed", K(ret));
+      }
+      break;
+    }
+    case T_INT: {
+      if (OB_FAIL(out.append_fmt("%ld", node.value_))) {
+        SQL_RESV_LOG(WARN, "append int literal failed", K(ret));
+      }
+      break;
+    }
+    case T_NUMBER: {
+      const ObString val(node.str_len_, node.str_value_);
+      if (val.empty() || OB_FAIL(out.append_fmt("%.*s", val.length(), val.ptr()))) {
+        ret = ret == OB_SUCCESS ? OB_ERR_UNEXPECTED : ret;
+        SQL_RESV_LOG(WARN, "append number literal failed", K(ret));
+      }
+      break;
+    }
+    case T_NULL:
+    case T_DEFAULT_NULL: {
+      if (OB_FAIL(out.append("null"))) {
+        SQL_RESV_LOG(WARN, "append null literal failed", K(ret));
+      }
+      break;
+    }
+    case T_OP_EQ:
+    case T_OP_NE:
+    case T_OP_LT:
+    case T_OP_LE:
+    case T_OP_GT:
+    case T_OP_GE:
+    case T_OP_AND:
+    case T_OP_OR:
+    case T_OP_LIKE:
+    case T_OP_NOT_LIKE:
+    case T_OP_IS:
+    case T_OP_IS_NOT: {
+      const char *op_str = NULL;
+      switch (node.type_) {
+        case T_OP_EQ: op_str = "="; break;
+        case T_OP_NE: op_str = "<>"; break;
+        case T_OP_LT: op_str = "<"; break;
+        case T_OP_LE: op_str = "<="; break;
+        case T_OP_GT: op_str = ">"; break;
+        case T_OP_GE: op_str = ">="; break;
+        case T_OP_AND: op_str = "and"; break;
+        case T_OP_OR: op_str = "or"; break;
+        case T_OP_LIKE: op_str = "like"; break;
+        case T_OP_NOT_LIKE: op_str = "not like"; break;
+        case T_OP_IS: op_str = "is"; break;
+        case T_OP_IS_NOT: op_str = "is not"; break;
+        default: op_str = NULL; break;
+      }
+      if (OB_UNLIKELY(node.num_child_ != 2) || OB_ISNULL(node.children_)
+          || OB_ISNULL(node.children_[0]) || OB_ISNULL(node.children_[1])) {
+        ret = OB_ERR_UNEXPECTED;
+        SQL_RESV_LOG(WARN, "invalid binary condition node", K(ret), K(node.type_));
+      } else if (OB_FAIL(out.append("("))) {
+      } else if (OB_FAIL(print_ai_retry_condition(*node.children_[0], state_col_name, out))) {
+      } else if (OB_FAIL(out.append_fmt(") %s (", op_str))) {
+      } else if (OB_FAIL(print_ai_retry_condition(*node.children_[1], state_col_name, out))) {
+      } else if (OB_FAIL(out.append(")"))) {
+        SQL_RESV_LOG(WARN, "append binary condition failed", K(ret));
+      }
+      break;
+    }
+    case T_OP_NOT: {
+      if (OB_UNLIKELY(node.num_child_ != 1) || OB_ISNULL(node.children_)
+          || OB_ISNULL(node.children_[0])) {
+        ret = OB_ERR_UNEXPECTED;
+        SQL_RESV_LOG(WARN, "invalid not condition node", K(ret));
+      } else if (OB_FAIL(out.append("not ("))) {
+      } else if (OB_FAIL(print_ai_retry_condition(*node.children_[0], state_col_name, out))) {
+      } else if (OB_FAIL(out.append(")"))) {
+        SQL_RESV_LOG(WARN, "append not condition failed", K(ret));
+      }
+      break;
+    }
+    case T_OP_IN:
+    case T_OP_NOT_IN: {
+      if (OB_UNLIKELY(node.num_child_ != 2) || OB_ISNULL(node.children_)
+          || OB_ISNULL(node.children_[0]) || OB_ISNULL(node.children_[1])) {
+        ret = OB_ERR_UNEXPECTED;
+        SQL_RESV_LOG(WARN, "invalid in condition node", K(ret));
+      } else if (OB_FAIL(out.append("("))) {
+      } else if (OB_FAIL(print_ai_retry_condition(*node.children_[0], state_col_name, out))) {
+      } else if (T_OP_IN == node.type_ ? OB_FAIL(out.append(") in ("))
+                                       : OB_FAIL(out.append(") not in ("))) {
+      } else if (OB_FAIL(print_ai_retry_condition(*node.children_[1], state_col_name, out))) {
+      } else if (OB_FAIL(out.append(")"))) {
+        SQL_RESV_LOG(WARN, "append in condition failed", K(ret));
+      }
+      break;
+    }
+    case T_EXPR_LIST:
+    case T_LINK_NODE: {
+      for (int64_t i = 0; OB_SUCC(ret) && i < node.num_child_; ++i) {
+        if (OB_ISNULL(node.children_) || OB_ISNULL(node.children_[i])) {
+          ret = OB_ERR_UNEXPECTED;
+          SQL_RESV_LOG(WARN, "invalid list condition node", K(ret));
+        } else if (i > 0 && OB_FAIL(out.append(", "))) {
+        } else if (OB_FAIL(print_ai_retry_condition(*node.children_[i], state_col_name, out))) {
+          SQL_RESV_LOG(WARN, "append list item failed", K(ret));
+        }
+      }
+      break;
+    }
+    case T_FUN_SYS: {
+      // layout: children_[0] = T_IDENT function name, children_[1] = arg list
+      if (OB_UNLIKELY(node.num_child_ != 2) || OB_ISNULL(node.children_)
+          || OB_ISNULL(node.children_[0]) || OB_ISNULL(node.children_[1])) {
+        ret = OB_ERR_UNEXPECTED;
+        SQL_RESV_LOG(WARN, "invalid function node", K(ret));
+      } else {
+        const ParseNode &name_node = *node.children_[0];
+        const ParseNode &args_node = *node.children_[1];
+        const ObString func_name(name_node.str_len_, name_node.str_value_);
+        if (func_name.empty() || OB_FAIL(out.append_fmt("%.*s(", func_name.length(), func_name.ptr()))) {
+          ret = ret == OB_SUCCESS ? OB_ERR_UNEXPECTED : ret;
+          SQL_RESV_LOG(WARN, "append function name failed", K(ret));
+        } else {
+          for (int64_t i = 0; OB_SUCC(ret) && i < args_node.num_child_; ++i) {
+            if (OB_ISNULL(args_node.children_) || OB_ISNULL(args_node.children_[i])) {
+              ret = OB_ERR_UNEXPECTED;
+              SQL_RESV_LOG(WARN, "invalid function arg node", K(ret));
+            } else if (i > 0 && OB_FAIL(out.append(", "))) {
+            } else if (OB_FAIL(print_ai_retry_condition(*args_node.children_[i], state_col_name, out))) {
+              SQL_RESV_LOG(WARN, "append function arg failed", K(ret));
+            }
+          }
+          if (OB_SUCC(ret) && OB_FAIL(out.append(")"))) {
+          }
+        }
+      }
+      break;
+    }
+    default: {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "unsupported condition in AI COLUMN RETRY");
+      SQL_RESV_LOG(WARN, "unsupported condition node in ai column retry", K(ret), K(node.type_));
+      break;
+    }
   }
   return ret;
 }
