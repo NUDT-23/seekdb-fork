@@ -73,12 +73,13 @@ static int json_escape_string(ObIAllocator &alloc, const ObString &src, ObString
 
 int ObAIColumnResolver::resolve_ai_column_attribute(
     ObIAllocator &alloc,
-    ObSQLStmt &stmt,
+    ObStmt &stmt,
     ObSchemaChecker *schema_checker,
     ObColumnSchemaV2 &column,
     ParseNode &ai_attr_node,
     const ParseNode *type_node,
-    ObTableSchema &table_schema)
+    ObTableSchema &table_schema,
+    ObIArray<ObColumnSchemaV2> *pending_create_cols)
 {
   int ret = OB_SUCCESS;
   if (OB_ISNULL(schema_checker) || OB_ISNULL(schema_checker->get_schema_guard())) {
@@ -197,7 +198,7 @@ int ObAIColumnResolver::resolve_ai_column_attribute(
       } else {
         const bool on_create_path = (stmt::T_CREATE_TABLE == stmt.get_stmt_type());
         if (OB_FAIL(create_hidden_columns(alloc, stmt, column, table_schema, def_json,
-                                          on_create_path))) {
+                                          on_create_path, pending_create_cols))) {
           LOG_WARN("create ai hidden columns failed", K(ret));
         }
       }
@@ -511,11 +512,12 @@ int ObAIColumnResolver::build_def_json(ObIAllocator &alloc, int64_t func_type,
 }
 
 int ObAIColumnResolver::create_hidden_columns(ObIAllocator &alloc,
-                                              ObSQLStmt &stmt,
+                                              ObStmt &stmt,
                                               ObColumnSchemaV2 &column,
                                               ObTableSchema &table_schema,
                                               const ObString &def_json,
-                                              bool on_create_path)
+                                              bool on_create_path,
+                                              ObIArray<ObColumnSchemaV2> *pending_create_cols)
 {
   UNUSED(alloc);
   int ret = OB_SUCCESS;
@@ -568,8 +570,11 @@ int ObAIColumnResolver::create_hidden_columns(ObIAllocator &alloc,
     }
     if (OB_SUCC(ret)) {
       if (on_create_path) {
-        if (OB_FAIL(table_schema.add_column(hidden))) {
-          LOG_WARN("add hidden column failed", K(ret), K(name_buf));
+        // column ids are assigned later by add_pending_hidden_columns so the
+        // resolver's id counter stays consistent with later user columns
+        if (OB_ISNULL(pending_create_cols) || OB_FAIL(pending_create_cols->push_back(hidden))) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("stash pending hidden column failed", K(ret), K(name_buf));
         }
       } else {
         AlterColumnSchema &alter_hidden = hidden;
@@ -584,6 +589,22 @@ int ObAIColumnResolver::create_hidden_columns(ObIAllocator &alloc,
       }
     }
   }
+  return ret;
+}
+
+int ObAIColumnResolver::add_pending_hidden_columns(uint64_t &column_id_seed,
+                                                   ObTableSchema &table_schema,
+                                                   ObIArray<ObColumnSchemaV2> &pending)
+{
+  int ret = OB_SUCCESS;
+  for (int64_t i = 0; OB_SUCC(ret) && i < pending.count(); ++i) {
+    ObColumnSchemaV2 &hidden = pending.at(i);
+    hidden.set_column_id(++column_id_seed);
+    if (OB_FAIL(table_schema.add_column(hidden))) {
+      LOG_WARN("add pending hidden column failed", K(ret), K(hidden.get_column_name_str()));
+    }
+  }
+  pending.reset();
   return ret;
 }
 

@@ -2318,7 +2318,8 @@ int ObDDLResolver::resolve_normal_column_attribute(ObColumnSchemaV2 &column,
             SQL_RESV_LOG(WARN, "table schema not found for AI COLUMN", K(ret));
           } else if (OB_FAIL(ObAIColumnResolver::resolve_ai_column_attribute(
                          *allocator_, *cur_stmt, cur_schema_checker, column,
-                         *attr_ai_node, tbl_type_node, *cur_table_schema))) {
+                         *attr_ai_node, tbl_type_node, *cur_table_schema,
+                         stmt::T_CREATE_TABLE == cur_stmt->get_stmt_type() ? &ai_pending_hidden_cols_ : nullptr))) {
             SQL_RESV_LOG(WARN, "resolve ai column attribute failed", K(ret),
                          K(column.get_column_name_str()));
           }

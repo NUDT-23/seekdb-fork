@@ -20,6 +20,7 @@
 #include "share/ob_autoincrement_service.h"
 #include "query/session/ob_inner_sql_connection_access.h"
 #include "sql/engine/ob_physical_plan.h"
+#include "sql/engine/dml/ob_ai_column_dml_helper.h"
 #include "sql/engine/dml/ob_dml_service.h"
 
 namespace oceanbase
@@ -621,6 +622,7 @@ ObTableModifyOp::ObTableModifyOp(ObExecContext &ctx,
     iter_end_(false),
     dml_rtctx_(eval_ctx_, ctx, *this),
     execute_single_row_(false),
+    has_ai_columns_(false),
     dml_modify_rows_(ctx.get_allocator()),
     last_store_row_(),
     saved_session_(NULL)
@@ -641,6 +643,7 @@ int ObTableModifyOp::inner_open()
   } else if (MY_SPEC.plan_->has_nested_sql() && OB_FAIL(open_inner_conn())) {
   } else if (OB_FAIL(calc_single_table_loc())) {
   } else if (OB_FAIL(check_need_exec_single_row())) {
+  } else if (OB_FAIL(ObAIColumnDMLHelper::check_table_has_ai_columns(*this, has_ai_columns_))) {
   } else {
     init_das_dml_ctx();
   }

@@ -80,7 +80,14 @@ private:
                                    ObColumnSchemaV2 &column,
                                    ObTableSchema &table_schema,
                                    const common::ObString &def_json,
-                                   bool on_create_path);
+                                   bool on_create_path,
+                                   common::ObIArray<ObColumnSchemaV2> *pending_create_cols);
+  // CREATE TABLE post pass: assigns column ids to the hidden columns resolved
+  // earlier and adds them to the table schema.  Must run before
+  // ObTableSchema::set_max_used_column_id() fixes the id watermark.
+  static int add_pending_hidden_columns(uint64_t &column_id_seed,
+                                        ObTableSchema &table_schema,
+                                        common::ObIArray<ObColumnSchemaV2> &pending);
 };
 
 }  // end namespace sql

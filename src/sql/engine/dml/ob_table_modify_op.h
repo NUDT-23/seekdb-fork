@@ -309,6 +309,10 @@ public:
   bool iter_end_;
   ObDMLRtCtx dml_rtctx_;
   bool execute_single_row_;
+  // true when the target table of this single table DML has AI columns; set
+  // at inner_open time by ObAIColumnDMLHelper::check_table_has_ai_columns and
+  // used to route rows into the after-row processing list.
+  bool has_ai_columns_;
   ObSEArray<ObExpr *, 4> trigger_clear_exprs_;
   ObDMLModifyRowsList dml_modify_rows_;
   ObSEArray<ObForeignKeyChecker *, 4> fk_checkers_;

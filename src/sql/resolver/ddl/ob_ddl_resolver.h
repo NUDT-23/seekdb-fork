@@ -882,6 +882,9 @@ protected:
   common::ObString vec_column_name_;
   ObIndexType vec_index_type_;
   ObSemiStructEncodingType semistruct_encoding_type_;
+  // AI COLUMN hidden columns resolved during CREATE TABLE; their column ids
+  // are assigned right before the table schema's max used column id is fixed
+  common::ObSEArray<share::schema::ObColumnSchemaV2, 8> ai_pending_hidden_cols_;
 private:
   template <typename STMT>
   DISALLOW_COPY_AND_ASSIGN(ObDDLResolver);
