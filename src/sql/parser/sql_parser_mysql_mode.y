@@ -6299,7 +6299,7 @@ opt_ai_column_options:
 }
 | WITH '(' ai_column_option_list ')'
 {
-  merge_nodes($$, result, T_OPTION_LIST, $3);
+  merge_nodes($$, result, T_CONSTR_AI_COLUMN_OPTS, $3);
 }
 ;
 

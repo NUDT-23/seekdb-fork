@@ -208,7 +208,7 @@ int ObAIColumnResolver::parse_options(ObIAllocator &alloc, ParseNode *options_no
   int ret = OB_SUCCESS;
   if (OB_ISNULL(options_node)) {
     // defaults
-  } else if (T_OPTION_LIST != options_node->type_) {
+  } else if (T_CONSTR_AI_COLUMN_OPTS != options_node->type_) {
     ret = OB_ERR_PARSER_SYNTAX;
     LOG_WARN("invalid ai column options node", K(ret));
   } else {
