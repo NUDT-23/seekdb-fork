@@ -17512,7 +17512,7 @@ READ_CSV '(' STRING_VALUE file_read_param_list ')'
 | READ_CSV '(' STRING_VALUE file_read_param_list ')' AS relation_name
 {
   ParseNode *path_node = $3;
-  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, path_node, $4, $8);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, path_node, $4, $7);
   $$->str_value_ = "read_csv";
   $$->str_len_ = 8;
 }
@@ -17533,7 +17533,7 @@ READ_CSV '(' STRING_VALUE file_read_param_list ')'
 | READ_JSON '(' STRING_VALUE file_read_param_list ')' AS relation_name
 {
   ParseNode *path_node = $3;
-  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, path_node, $4, $8);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, path_node, $4, $7);
   $$->str_value_ = "read_json";
   $$->str_len_ = 9;
 }
@@ -17554,7 +17554,7 @@ READ_CSV '(' STRING_VALUE file_read_param_list ')'
 | READ_NDJSON '(' STRING_VALUE file_read_param_list ')' AS relation_name
 {
   ParseNode *path_node = $3;
-  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, path_node, $4, $8);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, path_node, $4, $7);
   $$->str_value_ = "read_ndjson";
   $$->str_len_ = 11;
 }
@@ -17575,7 +17575,7 @@ READ_CSV '(' STRING_VALUE file_read_param_list ')'
 | READ_PARQUET '(' STRING_VALUE file_read_param_list ')' AS relation_name
 {
   ParseNode *path_node = $3;
-  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, path_node, $4, $8);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, path_node, $4, $7);
   $$->str_value_ = "read_parquet";
   $$->str_len_ = 12;
 }
@@ -17596,7 +17596,7 @@ READ_CSV '(' STRING_VALUE file_read_param_list ')'
 | GLOB '(' STRING_VALUE ')' AS relation_name
 {
   ParseNode *path_node = $3;
-  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, path_node, NULL, $7);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, path_node, NULL, $6);
   $$->str_value_ = "glob";
   $$->str_len_ = 4;
 }
@@ -17637,10 +17637,6 @@ BOOL_VALUE
 {
   $$ = $2;
   $$->value_ = -$$->value_;
-}
-| STRING_VALUE
-{
-  $$ = $1;
 }
 | text_string
 {
@@ -17846,10 +17842,6 @@ BOOL_VALUE
 {
   $$ = $2;
   $$->value_ = -$$->value_;
-}
-| STRING_VALUE
-{
-  $$ = $1;
 }
 | text_string
 {
