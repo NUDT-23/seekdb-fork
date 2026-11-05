@@ -71,6 +71,7 @@
 #include "share/schema/ob_table_sql_service.h"
 #include "share/schema/ob_ddl_trans_controller.h"  // relocated-definition owner
 #include "share/schema/ob_part_mgr_util.h"
+#include "share/ai_column/ob_ai_column_ddl_util.h"
 #include "lib/stat/ob_diagnostic_info_guard.h"
 #include "common/ob_timeout_ctx.h"
 #include "share/ob_share_util.h"
@@ -8224,6 +8225,37 @@ int ObDDLService::update_prev_id_and_add_column_(
     if (OB_ERR_COLUMN_DUPLICATE == ret) {
       const ObString &column_name = alter_column_schema.get_column_name_str();
       LOG_USER_ERROR(OB_ERR_COLUMN_DUPLICATE, column_name.length(), column_name.ptr());
+    }
+  }
+  return ret;
+}
+
+// Writes the __all_ai_column rows of every AI column added by this ALTER
+// TABLE.  Must run after all add_new_column_to_table_schema() calls so that
+// the AI result columns and their three hidden columns are all present in
+// %new_table_schema (the final column ids are read from it).
+static int write_ai_column_rows_for_added_columns_(const AlterTableSchema &alter_table_schema,
+                                                   const ObTableSchema &new_table_schema,
+                                                   common::ObMySQLTransaction &trans)
+{
+  int ret = OB_SUCCESS;
+  ObTableSchema::const_column_iterator it_begin = alter_table_schema.column_begin();
+  ObTableSchema::const_column_iterator it_end = alter_table_schema.column_end();
+  for (; OB_SUCC(ret) && it_begin != it_end; ++it_begin) {
+    const AlterColumnSchema *alter_column_schema = static_cast<const AlterColumnSchema *>(*it_begin);
+    if (OB_ISNULL(alter_column_schema)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("alter column schema is null", K(ret));
+    } else if (OB_DDL_ADD_COLUMN == alter_column_schema->alter_type_
+               && alter_column_schema->is_ai_column()
+               && OB_FAIL(ObAIColumnDDLUtil::insert_ai_column_row_for_add_column(
+                          trans,
+                          new_table_schema.get_table_id(),
+                          new_table_schema,
+                          alter_column_schema->get_column_name_str()))) {
+      LOG_WARN("insert ai column row for added column failed", K(ret),
+               K(new_table_schema.get_table_id()),
+               K(alter_column_schema->get_column_name_str()));
     }
   }
   return ret;

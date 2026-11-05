@@ -27,6 +27,7 @@
 #include "sql/engine/cmd/ob_partition_executor_utils.h"
 #include "share/schema/ob_table_sql_service.h"
 #include "share/schema/ob_multi_version_schema_service.h"
+#include "share/ai_column/ob_ai_column_ddl_util.h"
 #include "sql/resolver/ddl/ob_index_builder_util.h"
 #include "sql/resolver/ob_resolver_utils.h"
 
@@ -204,6 +205,10 @@ int ObTableHelper::create_tables_(const ObString *ddl_stmt_str)
                  OB_FAIL(ObVectorIndexUtil::add_dbms_vector_jobs(get_trans_(),
                                                                  new_table.get_table_id(),
                                                                  new_table.get_exec_env()))) {
+      } else if (ObAIColumnDDLUtil::has_ai_column(new_table) &&
+                 OB_FAIL(ObAIColumnDDLUtil::insert_ai_column_rows(get_trans_(),
+                                                                  new_table.get_table_id(),
+                                                                  new_table))) {
       }
     } // end for
     if (FAILEDx(schema_service_impl->get_table_sql_service().batch_create_table(new_tables_,

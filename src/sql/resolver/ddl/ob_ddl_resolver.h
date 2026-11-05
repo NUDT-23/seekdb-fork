@@ -535,7 +535,8 @@ protected:
                                       common::ObString &pk_name,
                                       bool &is_modify_column,
                                       bool &is_modify_column_visibility,
-                                      const bool allow_has_default = true);
+                                      const bool allow_has_default = true,
+                                      const ParseNode *type_node = NULL);
   int resolve_normal_column_attribute_check_cons(ObColumnSchemaV2 &column,
                                                  ParseNode *attrs_node,
                                                  ObCreateTableStmt *create_table_stmt);

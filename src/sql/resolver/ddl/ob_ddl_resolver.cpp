@@ -19,7 +19,10 @@
 #include "ob_ddl_resolver.h"
 #include "data_plane/blocksstable/ob_index_block_util.h"
 #include "sql/resolver/dml/ob_dml_resolver.h"
+#include "sql/resolver/ddl/ob_ai_column_resolver.h"
 #include "sql/resolver/ddl/ob_index_builder_util.h"
+#include "sql/resolver/ddl/ob_alter_table_stmt.h"
+#include "sql/resolver/ddl/ob_create_table_stmt.h"
 #include "sql/resolver/ddl/ob_fts_index_builder_util.h"
 #include "sql/optimizer/ob_optimizer_util.h"
 #include "sql/resolver/dcl/ob_dcl_resolver.h"
@@ -1921,7 +1924,8 @@ int ObDDLResolver::resolve_column_definition(ObColumnSchemaV2 &column,
                                                          pk_name,
                                                          is_modify_column,
                                                          is_modify_column_visibility,
-                                                         allow_has_default))) {
+                                                         allow_has_default,
+                                                         type_node))) {
       }
     }
     // Specify the position of the column for add column syntax
@@ -2062,7 +2066,8 @@ int ObDDLResolver::resolve_normal_column_attribute(ObColumnSchemaV2 &column,
                                                    ObString &pk_name,
                                                    bool &is_modify_column,
                                                    bool &is_modify_column_visibility,
-                                                   const bool allow_has_default)
+                                                   const bool allow_has_default,
+                                                   const ParseNode *type_node)
 {
   int ret = OB_SUCCESS;
   ObObjParam default_value;
@@ -2284,6 +2289,40 @@ int ObDDLResolver::resolve_normal_column_attribute(ObColumnSchemaV2 &column,
       case T_VISIBLE:
       case T_INVISIBLE:
       {
+        break;
+      }
+      case T_CONSTR_AI_COLUMN: {
+        ParseNode *attr_ai_node = attr_node;
+        ObStmt *cur_stmt = stmt_;
+        ObSchemaChecker *cur_schema_checker = schema_checker_;
+        ParseNode *tbl_type_node = const_cast<ParseNode *>(type_node);
+        if (OB_ISNULL(cur_stmt) || OB_ISNULL(cur_schema_checker) || OB_ISNULL(allocator_)) {
+          ret = OB_ERR_UNEXPECTED;
+          SQL_RESV_LOG(WARN, "resolver context is invalid", K(ret));
+        } else if (column.is_generated_column()) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "AI COLUMN on a generated column is");
+        } else {
+          // resolve against the table schema being built (create path) or the
+          // original table (alter add column path)
+          ObTableSchema *cur_table_schema = nullptr;
+          if (stmt::T_CREATE_TABLE == cur_stmt->get_stmt_type()) {
+            ObCreateTableStmt *create_stmt = static_cast<ObCreateTableStmt *>(cur_stmt);
+            cur_table_schema = &create_stmt->get_create_table_arg().schema_;
+          } else if (stmt::T_ALTER_TABLE == cur_stmt->get_stmt_type()) {
+            ObAlterTableStmt *alter_stmt = static_cast<ObAlterTableStmt *>(cur_stmt);
+            cur_table_schema = &alter_stmt->get_alter_table_arg().alter_table_schema_;
+          }
+          if (OB_ISNULL(cur_table_schema)) {
+            ret = OB_ERR_UNEXPECTED;
+            SQL_RESV_LOG(WARN, "table schema not found for AI COLUMN", K(ret));
+          } else if (OB_FAIL(ObAIColumnResolver::resolve_ai_column_attribute(
+                         *allocator_, *cur_stmt, cur_schema_checker, column,
+                         *attr_ai_node, tbl_type_node, *cur_table_schema))) {
+            SQL_RESV_LOG(WARN, "resolve ai column attribute failed", K(ret),
+                         K(column.get_column_name_str()));
+          }
+        }
         break;
       }
       default:  // won't be here
