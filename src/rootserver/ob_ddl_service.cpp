@@ -8233,12 +8233,17 @@ int ObDDLService::update_prev_id_and_add_column_(
 // Writes the __all_ai_column rows of every AI column added by this ALTER
 // TABLE.  Must run after all add_new_column_to_table_schema() calls so that
 // the AI result columns and their three hidden columns are all present in
-// %new_table_schema (the final column ids are read from it).
+// %new_table_schema (the final column ids are read from it).  An added AI
+// column is recognised by its hidden state column "__ai_state_<result name>";
+// the AI_COLUMN_FLAG on the result column itself is accepted as an
+// alternative marker for robustness.
 static int write_ai_column_rows_for_added_columns_(const AlterTableSchema &alter_table_schema,
                                                    const ObTableSchema &new_table_schema,
                                                    common::ObMySQLTransaction &trans)
 {
   int ret = OB_SUCCESS;
+  const int64_t state_prefix_len = strlen("__ai_state_");
+  common::ObSEArray<common::ObString, 4> result_names;
   ObTableSchema::const_column_iterator it_begin = alter_table_schema.column_begin();
   ObTableSchema::const_column_iterator it_end = alter_table_schema.column_end();
   for (; OB_SUCC(ret) && it_begin != it_end; ++it_begin) {
@@ -8246,16 +8251,44 @@ static int write_ai_column_rows_for_added_columns_(const AlterTableSchema &alter
     if (OB_ISNULL(alter_column_schema)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("alter column schema is null", K(ret));
-    } else if (OB_DDL_ADD_COLUMN == alter_column_schema->alter_type_
-               && alter_column_schema->is_ai_column()
-               && OB_FAIL(ObAIColumnDDLUtil::insert_ai_column_row_for_add_column(
-                          trans,
-                          new_table_schema.get_table_id(),
-                          new_table_schema,
-                          alter_column_schema->get_column_name_str()))) {
+    } else if (OB_DDL_ADD_COLUMN != alter_column_schema->alter_type_) {
+      // only added columns introduce AI columns
+    } else if (alter_column_schema->is_ai_state_column()) {
+      const common::ObString &state_name = alter_column_schema->get_column_name_str();
+      if (OB_UNLIKELY(state_name.length() <= state_prefix_len)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("invalid ai state column name", K(ret), K(state_name));
+      } else {
+        const common::ObString result_name(
+            static_cast<common::ObString::obstr_size_t>(state_name.length() - state_prefix_len),
+            state_name.ptr() + state_prefix_len);
+        bool found = false;
+        for (int64_t j = 0; !found && j < result_names.count(); ++j) {
+          found = (result_names.at(j) == result_name);
+        }
+        if (!found && OB_FAIL(result_names.push_back(result_name))) {
+          LOG_WARN("push back ai column name failed", K(ret), K(state_name));
+        }
+      }
+    } else if (alter_column_schema->is_ai_column()) {
+      const common::ObString &result_name = alter_column_schema->get_column_name_str();
+      bool found = false;
+      for (int64_t j = 0; !found && j < result_names.count(); ++j) {
+        found = (result_names.at(j) == result_name);
+      }
+      if (!found && OB_FAIL(result_names.push_back(result_name))) {
+        LOG_WARN("push back ai column name failed", K(ret), K(result_name));
+      }
+    }
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < result_names.count(); ++i) {
+    if (OB_FAIL(ObAIColumnDDLUtil::insert_ai_column_row_for_add_column(
+                trans,
+                new_table_schema.get_table_id(),
+                new_table_schema,
+                result_names.at(i)))) {
       LOG_WARN("insert ai column row for added column failed", K(ret),
-               K(new_table_schema.get_table_id()),
-               K(alter_column_schema->get_column_name_str()));
+               K(new_table_schema.get_table_id()), K(result_names.at(i)));
     }
   }
   return ret;

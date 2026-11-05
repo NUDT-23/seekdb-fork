@@ -164,6 +164,55 @@ static const schema::ObColumnSchemaV2 *find_column_by_name_(
   return found;
 }
 
+static int push_unique_name_(common::ObSEArray<common::ObString, 4> &names,
+                             const common::ObString &name)
+{
+  int ret = OB_SUCCESS;
+  bool found = false;
+  for (int64_t i = 0; !found && i < names.count(); ++i) {
+    found = (names.at(i) == name);
+  }
+  if (!found && OB_FAIL(names.push_back(name))) {
+    LOG_WARN("push back ai column name failed", K(ret), K(name));
+  }
+  return ret;
+}
+
+// Collects the names of the AI result columns of a table.  An AI column is
+// discoverable from its hidden state column "__ai_state_<result name>" (the
+// resolver always creates it); the AI_COLUMN_FLAG on the result column itself
+// is accepted as an alternative marker for robustness.
+static int collect_ai_result_column_names_(
+    const schema::ObTableSchema &table_schema,
+    common::ObSEArray<common::ObString, 4> &names)
+{
+  int ret = OB_SUCCESS;
+  const int64_t state_prefix_len = strlen(OB_AI_DDL_STATE_PREFIX);
+  const int64_t column_count = table_schema.get_column_count();
+  for (int64_t i = 0; OB_SUCC(ret) && i < column_count; ++i) {
+    const schema::ObColumnSchemaV2 *column = table_schema.get_column_schema_by_idx(i);
+    if (OB_ISNULL(column)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("column schema is null", K(ret), K(i));
+    } else if (column->is_ai_state_column()) {
+      const common::ObString &state_name = column->get_column_name_str();
+      if (state_name.length() > state_prefix_len
+          && OB_FAIL(push_unique_name_(names,
+                 common::ObString(static_cast<common::ObString::obstr_size_t>(
+                                      state_name.length() - state_prefix_len),
+                                  state_name.ptr() + state_prefix_len)))) {
+        LOG_WARN("collect ai column name failed", K(ret), K(state_name));
+      }
+    } else if (column->is_ai_column()) {
+      if (OB_FAIL(push_unique_name_(names, column->get_column_name_str()))) {
+        LOG_WARN("collect ai column name failed", K(ret),
+                 K(column->get_column_name_str()));
+      }
+    }
+  }
+  return ret;
+}
+
 static int build_hidden_column_name_(const char *prefix,
                                      const common::ObString &column_name,
                                      char *buf,
@@ -185,7 +234,9 @@ static int write_ai_column_row_(common::ObISQLClient &sql_client,
 {
   int ret = OB_SUCCESS;
   const common::ObString result_name = result_column.get_column_name_str();
-  char buf[OB_MAX_COLUMN_NAME_BUF_LENGTH + 32];
+  // must match the resolver's hidden-name buffer size (OB_MAX_COLUMN_NAME_LENGTH)
+  // so both sides truncate long column names identically
+  char buf[OB_MAX_COLUMN_NAME_LENGTH];
   const schema::ObColumnSchemaV2 *state_column = nullptr;
   const schema::ObColumnSchemaV2 *request_column = nullptr;
   const schema::ObColumnSchemaV2 *result_spec_column = nullptr;
@@ -204,17 +255,17 @@ static int write_ai_column_row_(common::ObISQLClient &sql_client,
   }
 
   const char *comment = (nullptr != state_column) ? state_column->get_comment() : nullptr;
+  // the parsed strings point into this allocator's memory, so it must stay
+  // alive until the row has been spliced below
+  common::ObArenaAllocator allocator(ObModIds::OB_SCHEMA_GETTER_GUARD);
   AIColumnDefParts parts;
   if (OB_FAIL(ret)) {
   } else if (nullptr == comment || '\0' == comment[0]) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("ai state column comment does not contain the def json",
              K(ret), K(table_id), K(result_name));
-  } else {
-    common::ObArenaAllocator allocator(ObModIds::OB_SCHEMA_GETTER_GUARD);
-    if (OB_FAIL(parse_ai_column_def_json_(allocator, common::ObString(comment), parts))) {
-      LOG_WARN("parse ai column def json failed", K(ret), K(table_id), K(result_name));
-    }
+  } else if (OB_FAIL(parse_ai_column_def_json_(allocator, common::ObString(comment), parts))) {
+    LOG_WARN("parse ai column def json failed", K(ret), K(table_id), K(result_name));
   }
   if (OB_SUCC(ret)) {
     ObDMLSqlSplicer splicer;
@@ -269,7 +320,8 @@ bool ObAIColumnDDLUtil::has_ai_column(const schema::ObTableSchema &table_schema)
   const int64_t column_count = table_schema.get_column_count();
   for (int64_t i = 0; !has_ai && i < column_count; ++i) {
     const schema::ObColumnSchemaV2 *column = table_schema.get_column_schema_by_idx(i);
-    has_ai = (nullptr != column && column->is_ai_column());
+    has_ai = (nullptr != column
+              && (column->is_ai_column() || column->is_ai_state_column()));
   }
   return has_ai;
 }
@@ -279,16 +331,19 @@ int ObAIColumnDDLUtil::insert_ai_column_rows(common::ObISQLClient &sql_client,
                                              const schema::ObTableSchema &table_schema)
 {
   int ret = OB_SUCCESS;
-  const int64_t column_count = table_schema.get_column_count();
-  for (int64_t i = 0; OB_SUCC(ret) && i < column_count; ++i) {
-    const schema::ObColumnSchemaV2 *column = table_schema.get_column_schema_by_idx(i);
-    if (nullptr == column) {
+  common::ObSEArray<common::ObString, 4> result_names;
+  if (OB_FAIL(collect_ai_result_column_names_(table_schema, result_names))) {
+    LOG_WARN("collect ai result column names failed", K(ret), K(table_id));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < result_names.count(); ++i) {
+    const schema::ObColumnSchemaV2 *column = find_column_by_name_(table_schema,
+                                                                  result_names.at(i));
+    if (OB_ISNULL(column)) {
       ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("column schema is null", K(ret), K(table_id), K(i));
-    } else if (column->is_ai_column()
-               && OB_FAIL(write_ai_column_row_(sql_client, table_id, table_schema, *column))) {
-      LOG_WARN("write ai column row failed", K(ret), K(table_id),
-               K(column->get_column_name_str()));
+      LOG_WARN("ai result column not found in table schema", K(ret), K(table_id),
+               K(result_names.at(i)));
+    } else if (OB_FAIL(write_ai_column_row_(sql_client, table_id, table_schema, *column))) {
+      LOG_WARN("write ai column row failed", K(ret), K(table_id), K(result_names.at(i)));
     }
   }
   return ret;
@@ -321,9 +376,9 @@ int ObAIColumnDDLUtil::insert_ai_column_row_for_add_column(common::ObISQLClient 
 {
   int ret = OB_SUCCESS;
   const schema::ObColumnSchemaV2 *column = find_column_by_name_(table_schema, ai_column_name);
-  if (nullptr == column || !column->is_ai_column()) {
+  if (nullptr == column) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("the added column is not an ai column of the table schema",
+    LOG_WARN("the added ai column is not in the table schema",
              K(ret), K(table_id), K(ai_column_name));
   } else if (OB_FAIL(write_ai_column_row_(sql_client, table_id, table_schema, *column))) {
     LOG_WARN("write ai column row failed", K(ret), K(table_id), K(ai_column_name));

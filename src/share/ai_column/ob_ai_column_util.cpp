@@ -18,7 +18,7 @@
 
 #include "share/ai_column/ob_ai_column_util.h"
 
-#include "lib/allocator/ob_arena_allocator.h"
+#include "lib/allocator/page_arena.h"
 #include "lib/mysqlclient/ob_mysql_proxy.h"
 #include "lib/atomic/ob_atomic.h"
 #include "lib/mysqlclient/ob_mysql_result.h"

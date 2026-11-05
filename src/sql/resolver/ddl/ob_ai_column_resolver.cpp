@@ -141,6 +141,11 @@ int ObAIColumnResolver::resolve_ai_column_attribute(
       }
     }
 
+    // mark the result column as an AI column so DML/runtime code can
+    // recognize it from the schema alone
+    if (OB_SUCC(ret)) {
+      column.add_column_flag(share::AI_COLUMN_FLAG);
+    }
     // dependency checks: the prompt expression may only reference existing
     // non-AI columns
     if (OB_SUCC(ret)) {
