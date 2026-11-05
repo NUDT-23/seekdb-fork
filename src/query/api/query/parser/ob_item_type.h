@@ -2275,6 +2275,8 @@ typedef enum ObItemType
   T_DIFF_TABLE = 4918,
   T_MERGE_TABLE = 4919,
   T_FLUSH_PRIVILEGES = 4920,
+  T_FILE_TABLE_EXPRESSION = 4921, // read_csv/read_json/read_ndjson/read_parquet/glob table function
+  T_COPY_TO_OUTFILE = 4922, // COPY (query|table) TO 'file' (copy options)
   T_MAX //Attention: add a new type before T_MAX
 } ObItemType;
 

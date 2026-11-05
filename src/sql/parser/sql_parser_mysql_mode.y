@@ -290,7 +290,7 @@ END_P SET_VAR DELIMITER
         FIELD_OPTIONALLY_ENCLOSED_BY FIELD_DELIMITER FIELD_ENCLOSED_BY FILE_EXTENSION
 
         GENERAL GEOMETRY GEOMCOLLECTION GEOMETRYCOLLECTION GET_FORMAT GLOBAL GRANTS GROUP_CONCAT GROUPING
-        GLOBAL_ALIAS
+        GLOBAL_ALIAS GLOB
 
         HASH HEAP HELP HISTOGRAM HOUR HIDDEN HYBRID HYBRID_HIST HYBRID_SEARCH
 
@@ -337,6 +337,7 @@ END_P SET_VAR DELIMITER
         REWRITE ROLLBACK ROLLUP ROUTINE ROW ROWID ROW_COUNT ROW_FORMAT ROWS RTREE
         RUN RECYCLEBIN REPLICATION ROTATE ROW_NUMBER RUDUNDANT RECURSIVE RANDOM REDO_TRANSPORT_OPTIONS
         RANK READ_ONLY RECOVERY REJECT ROLE
+        READ_CSV READ_JSON READ_NDJSON READ_PARQUET
 
         SAMPLE SAVEPOINT SCALARS SCHEMA_NAME SCN SCOPE SCORE SECOND SECURITY SEED
         SEMISTRUCT_ENCODING_TYPE SERIAL SERIALIZABLE SESSION SESSION_USER SET_TP SHARE SHARED SHUTDOWN SIGNED
@@ -500,6 +501,8 @@ END_P SET_VAR DELIMITER
 %type <node> json_table_expr unnest_expr mock_jt_on_error_on_empty jt_column_list json_table_column_def
 %type <node> json_table_ordinality_column_def json_table_exists_column_def json_table_value_column_def json_table_nested_column_def
 %type <node> opt_value_on_empty_or_error_or_mismatch opt_on_mismatch
+%type <node> file_read_expr file_read_param_list file_read_param file_read_param_value
+%type <node> copy_stmt copy_source opt_copy_options copy_option_list copy_option copy_param_value
 %type <node> table_values_clause table_values_clause_with_order_by_and_limit values_row_list row_value
 %type <node> geometry_collection
 %type <node> merge_insert_types opt_empty_table_list user_host_or_current_user
@@ -556,6 +559,7 @@ opt_end_p:
 /* only preparable statement will set question mark size */
 stmt:
     select_stmt             { $$ = $1; question_mark_issue($$, result); }
+  | copy_stmt               { $$ = $1; }
   | insert_stmt             { $$ = $1; question_mark_issue($$, result); }
   | create_table_stmt       {
     $$ = $1;
@@ -10835,6 +10839,10 @@ tbl_name
 {
   $$ = $1;
 }
+| file_read_expr
+{
+  $$ = $1;
+}
 | '(' table_references ')'
 {
   $$ = $2;
@@ -17479,6 +17487,376 @@ literal
 }
 ;
 
+/*****************************************************************************
+ *
+ *	file sql grammar: read_csv / read_json / read_ndjson / read_parquet / glob
+ *  and COPY ... TO ...
+ *
+ *****************************************************************************/
+
+file_read_expr:
+READ_CSV '(' STRING_VALUE file_read_param_list ')'
+{
+  ParseNode *path_node = $3;
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, path_node, $4, NULL);
+  $$->str_value_ = "read_csv";
+  $$->str_len_ = 8;
+}
+| READ_CSV '(' STRING_VALUE file_read_param_list ')' relation_name
+{
+  ParseNode *path_node = $3;
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, path_node, $4, $6);
+  $$->str_value_ = "read_csv";
+  $$->str_len_ = 8;
+}
+| READ_CSV '(' STRING_VALUE file_read_param_list ')' AS relation_name
+{
+  ParseNode *path_node = $3;
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, path_node, $4, $8);
+  $$->str_value_ = "read_csv";
+  $$->str_len_ = 8;
+}
+| READ_JSON '(' STRING_VALUE file_read_param_list ')'
+{
+  ParseNode *path_node = $3;
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, path_node, $4, NULL);
+  $$->str_value_ = "read_json";
+  $$->str_len_ = 9;
+}
+| READ_JSON '(' STRING_VALUE file_read_param_list ')' relation_name
+{
+  ParseNode *path_node = $3;
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, path_node, $4, $6);
+  $$->str_value_ = "read_json";
+  $$->str_len_ = 9;
+}
+| READ_JSON '(' STRING_VALUE file_read_param_list ')' AS relation_name
+{
+  ParseNode *path_node = $3;
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, path_node, $4, $8);
+  $$->str_value_ = "read_json";
+  $$->str_len_ = 9;
+}
+| READ_NDJSON '(' STRING_VALUE file_read_param_list ')'
+{
+  ParseNode *path_node = $3;
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, path_node, $4, NULL);
+  $$->str_value_ = "read_ndjson";
+  $$->str_len_ = 11;
+}
+| READ_NDJSON '(' STRING_VALUE file_read_param_list ')' relation_name
+{
+  ParseNode *path_node = $3;
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, path_node, $4, $6);
+  $$->str_value_ = "read_ndjson";
+  $$->str_len_ = 11;
+}
+| READ_NDJSON '(' STRING_VALUE file_read_param_list ')' AS relation_name
+{
+  ParseNode *path_node = $3;
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, path_node, $4, $8);
+  $$->str_value_ = "read_ndjson";
+  $$->str_len_ = 11;
+}
+| READ_PARQUET '(' STRING_VALUE file_read_param_list ')'
+{
+  ParseNode *path_node = $3;
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, path_node, $4, NULL);
+  $$->str_value_ = "read_parquet";
+  $$->str_len_ = 12;
+}
+| READ_PARQUET '(' STRING_VALUE file_read_param_list ')' relation_name
+{
+  ParseNode *path_node = $3;
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, path_node, $4, $6);
+  $$->str_value_ = "read_parquet";
+  $$->str_len_ = 12;
+}
+| READ_PARQUET '(' STRING_VALUE file_read_param_list ')' AS relation_name
+{
+  ParseNode *path_node = $3;
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, path_node, $4, $8);
+  $$->str_value_ = "read_parquet";
+  $$->str_len_ = 12;
+}
+| GLOB '(' STRING_VALUE ')'
+{
+  ParseNode *path_node = $3;
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, path_node, NULL, NULL);
+  $$->str_value_ = "glob";
+  $$->str_len_ = 4;
+}
+| GLOB '(' STRING_VALUE ')' relation_name
+{
+  ParseNode *path_node = $3;
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, path_node, NULL, $5);
+  $$->str_value_ = "glob";
+  $$->str_len_ = 4;
+}
+| GLOB '(' STRING_VALUE ')' AS relation_name
+{
+  ParseNode *path_node = $3;
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, path_node, NULL, $7);
+  $$->str_value_ = "glob";
+  $$->str_len_ = 4;
+}
+;
+
+file_read_param_list:
+/* EMPTY */
+{
+  $$ = NULL;
+}
+| file_read_param_list ',' file_read_param
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3);
+}
+| file_read_param
+{
+  $$ = $1;
+}
+;
+
+file_read_param:
+relation_name COMP_EQ file_read_param_value
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3);
+}
+;
+
+file_read_param_value:
+BOOL_VALUE
+{
+  $$ = $1;
+}
+| INTNUM
+{
+  $$ = $1;
+}
+| '-' INTNUM
+{
+  $$ = $2;
+  $$->value_ = -$$->value_;
+}
+| STRING_VALUE
+{
+  $$ = $1;
+}
+| text_string
+{
+  $$ = $1;
+}
+;
+
+/*****************************************************************************
+ *
+ *	COPY (query | table) TO 'file' (copy options)
+ *
+ *****************************************************************************/
+
+copy_stmt:
+COPY copy_source TO STRING_VALUE opt_copy_options
+{
+  ParseNode *select_node = $2;
+  ParseNode *into_node = NULL;
+  ParseNode *format_list = NULL;
+  if (NULL != $5) {
+    merge_nodes(format_list, result, T_LINK_NODE, $5);
+  }
+  malloc_non_terminal_node(into_node, result->malloc_pool_, T_COPY_TO_OUTFILE, 2, $4, format_list);
+  if (NULL != select_node->children_[PARSE_SELECT_INTO]
+      || NULL != select_node->children_[PARSE_SELECT_INTO_EXTRA]) {
+    yyerror(&@1, result, "syntax error, unexpected INTO");
+    YYERROR;
+  } else {
+    select_node->children_[PARSE_SELECT_INTO] = into_node;
+  }
+  $$ = select_node;
+}
+;
+
+copy_source:
+select_with_parens
+{
+  $$ = $1;
+  $$->value_ = 0;
+}
+| relation_factor
+{
+  ParseNode *project_node = NULL;
+  ParseNode *star_node = NULL;
+  ParseNode *org_node = NULL;
+  ParseNode *from_list = NULL;
+  ParseNode *select_node = NULL;
+  malloc_terminal_node(star_node, result->malloc_pool_, T_STAR);
+  malloc_list_node(project_node, result->malloc_pool_, T_PROJECT_LIST, 2, 1, star_node);
+  malloc_non_terminal_node(org_node, result->malloc_pool_, T_ORG, 4, $1, NULL, NULL, NULL);
+  malloc_list_node(from_list, result->malloc_pool_, T_FROM_LIST, 2, 1, org_node);
+  malloc_select_node(select_node, result->malloc_pool_);
+  select_node->children_[PARSE_SELECT_SELECT] = project_node;
+  select_node->children_[PARSE_SELECT_FROM] = from_list;
+  $$ = select_node;
+  $$->value_ = 0;
+}
+;
+
+opt_copy_options:
+/* EMPTY */
+{
+  $$ = NULL;
+}
+| '(' copy_option_list ')'
+{
+  $$ = $2;
+}
+;
+
+copy_option_list:
+copy_option
+{
+  $$ = $1;
+}
+| copy_option_list ',' copy_option
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3);
+}
+;
+
+copy_option:
+FORMAT NAME_OB
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_EXTERNAL_FILE_FORMAT_TYPE, 1, $2);
+}
+| FORMAT STRING_VALUE
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_EXTERNAL_FILE_FORMAT_TYPE, 1, $2);
+}
+| NAME_OB
+{
+  // bare soft-keyword option: header
+  if (OB_ISNULL($1) || OB_ISNULL($1->str_value_)
+      || 0 != strcasecmp("header", $1->str_value_)) {
+    yyerror(&@1, result, "invalid copy option");
+    YYERROR;
+  } else {
+    ParseNode *header_node = NULL;
+    malloc_terminal_node(header_node, result->malloc_pool_, T_INT);
+    header_node->value_ = 1;
+    header_node->is_hidden_const_ = 1;
+    malloc_non_terminal_node($$, result->malloc_pool_, T_SKIP_HEADER, 1, header_node);
+    $$->value_ = 1;
+  }
+}
+| NAME_OB copy_param_value
+{
+  // soft-keyword option with a value: nullstr 'NULL', delimiter ',', quote '"', escape '\\'
+  ParseNode *name_node = $1;
+  if (OB_ISNULL(name_node) || OB_ISNULL(name_node->str_value_) || OB_ISNULL($2)) {
+    yyerror(&@1, result, "invalid copy option");
+    YYERROR;
+  } else if (0 == strcasecmp("nullstr", name_node->str_value_)) {
+    malloc_non_terminal_node($$, result->malloc_pool_, T_NULL_IF_EXETERNAL, 1, $2);
+  } else if (0 == strcasecmp("delimiter", name_node->str_value_)
+             || 0 == strcasecmp("field_delimiter", name_node->str_value_)) {
+    malloc_non_terminal_node($$, result->malloc_pool_, T_FIELD_TERMINATED_STR, 1, $2);
+    dup_expr_string($$, result, @2.first_column, @2.last_column);
+  } else if (0 == strcasecmp("quote", name_node->str_value_)) {
+    malloc_non_terminal_node($$, result->malloc_pool_, T_CLOSED_STR, 1, $2);
+    dup_expr_string($$, result, @2.first_column, @2.last_column);
+  } else if (0 == strcasecmp("escape", name_node->str_value_)) {
+    malloc_non_terminal_node($$, result->malloc_pool_, T_ESCAPED_STR, 1, $2);
+    dup_expr_string($$, result, @2.first_column, @2.last_column);
+  } else if (0 == strcasecmp("line_delimiter", name_node->str_value_)
+             || 0 == strcasecmp("line_separator", name_node->str_value_)) {
+    malloc_non_terminal_node($$, result->malloc_pool_, T_LINE_TERMINATED_STR, 1, $2);
+    dup_expr_string($$, result, @2.first_column, @2.last_column);
+  } else {
+    yyerror(&@1, result, "invalid copy option");
+    YYERROR;
+  }
+}
+| NAME_OB COMP_EQ copy_param_value
+{
+  // soft-keyword option with '=': header = true, nullstr = 'NULL'
+  ParseNode *name_node = $1;
+  if (OB_ISNULL(name_node) || OB_ISNULL(name_node->str_value_) || OB_ISNULL($3)) {
+    yyerror(&@1, result, "invalid copy option");
+    YYERROR;
+  } else if (0 == strcasecmp("header", name_node->str_value_)) {
+    malloc_non_terminal_node($$, result->malloc_pool_, T_SKIP_HEADER, 1, $3);
+    $$->value_ = 1;
+  } else if (0 == strcasecmp("nullstr", name_node->str_value_)) {
+    malloc_non_terminal_node($$, result->malloc_pool_, T_NULL_IF_EXETERNAL, 1, $3);
+  } else if (0 == strcasecmp("delimiter", name_node->str_value_)
+             || 0 == strcasecmp("field_delimiter", name_node->str_value_)) {
+    malloc_non_terminal_node($$, result->malloc_pool_, T_FIELD_TERMINATED_STR, 1, $3);
+    dup_expr_string($$, result, @3.first_column, @3.last_column);
+  } else if (0 == strcasecmp("quote", name_node->str_value_)) {
+    malloc_non_terminal_node($$, result->malloc_pool_, T_CLOSED_STR, 1, $3);
+    dup_expr_string($$, result, @3.first_column, @3.last_column);
+  } else if (0 == strcasecmp("escape", name_node->str_value_)) {
+    malloc_non_terminal_node($$, result->malloc_pool_, T_ESCAPED_STR, 1, $3);
+    dup_expr_string($$, result, @3.first_column, @3.last_column);
+  } else if (0 == strcasecmp("line_delimiter", name_node->str_value_)
+             || 0 == strcasecmp("line_separator", name_node->str_value_)) {
+    malloc_non_terminal_node($$, result->malloc_pool_, T_LINE_TERMINATED_STR, 1, $3);
+    dup_expr_string($$, result, @3.first_column, @3.last_column);
+  } else {
+    yyerror(&@1, result, "invalid copy option");
+    YYERROR;
+  }
+}
+| FIELD_DELIMITER COMP_EQ expr
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FIELD_TERMINATED_STR, 1, $3);
+  dup_expr_string($$, result, @3.first_column, @3.last_column);
+}
+| LINE_DELIMITER COMP_EQ expr
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINE_TERMINATED_STR, 1, $3);
+  dup_expr_string($$, result, @3.first_column, @3.last_column);
+}
+| ESCAPE COMP_EQ expr
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_ESCAPED_STR, 1, $3);
+  dup_expr_string($$, result, @3.first_column, @3.last_column);
+}
+| FIELD_ENCLOSED_BY COMP_EQ expr
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_CLOSED_STR, 1, $3);
+  dup_expr_string($$, result, @3.first_column, @3.last_column);
+}
+| FIELD_OPTIONALLY_ENCLOSED_BY COMP_EQ expr
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_OPTIONALLY_CLOSED_STR, 1, $3);
+  dup_expr_string($$, result, @3.first_column, @3.last_column);
+}
+;
+
+copy_param_value:
+BOOL_VALUE
+{
+  $$ = $1;
+}
+| INTNUM
+{
+  $$ = $1;
+}
+| '-' INTNUM
+{
+  $$ = $2;
+  $$->value_ = -$$->value_;
+}
+| STRING_VALUE
+{
+  $$ = $1;
+}
+| text_string
+{
+  $$ = $1;
+}
+;
+
 unreserved_keyword:
 unreserved_keyword_for_role_name { $$=$1;}
 | unreserved_keyword_ambiguous_roles { $$=$1;}
@@ -17711,6 +18089,7 @@ ACCOUNT
 |       GEOMETRYCOLLECTION
 |       GET_FORMAT
 |       GLOBAL %prec LOWER_PARENS
+|       GLOB
 |       GRANTS
 |       GROUPING
 |       GROUP_CONCAT
@@ -17937,6 +18316,10 @@ ACCOUNT
 |       QUICK
 |       RANK
 |       READ_ONLY
+|       READ_CSV
+|       READ_JSON
+|       READ_NDJSON
+|       READ_PARQUET
 |       RECOVER
 |       RECOVERY
 |       RECURSIVE
