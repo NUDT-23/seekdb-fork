@@ -91,48 +91,57 @@ int load_ai_table_ctx(schema::ObSchemaGetterGuard &guard,
   table_ctx.table_id_ = table_id;
   if (OB_ISNULL(GCTX.schema_service_)) {
     // observer not ready (bootstrap), treat as no AI columns
-  } else if (OB_FAIL(ObAiColumnCache::get_instance().get_table_items(
-                 table_id, schema_version, alloc, table_ctx.items_, table_ctx.found_))) {
-    LOG_WARN("load ai column items failed", K(ret), K(table_id), K(schema_version));
-  } else if (!table_ctx.found_) {
-    // table has no AI column, nothing to do
-  } else if (OB_FAIL(guard.get_table_schema(table_id, table_schema))) {
-    LOG_WARN("get table schema failed", K(ret), K(table_id));
-  } else if (OB_ISNULL(table_schema)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("table schema is null", K(ret), K(table_id));
   } else {
-    uint64_t db_id = table_schema->get_database_id();
-    const schema::ObDatabaseSchema *db_schema = nullptr;
-    if (OB_FAIL(guard.get_database_schema(db_id, db_schema))) {
-      LOG_WARN("get database schema failed", K(ret), K(db_id));
-    } else if (OB_ISNULL(db_schema)) {
-      // fall back to the unqualified table name when db resolution fails
-    } else if (OB_FAIL(ob_write_string(alloc, db_schema->get_database_name_str(),
-                                       table_ctx.db_name_))) {
-      LOG_WARN("write db name failed", K(ret));
+    // the process wide cache is initialized lazily and idempotently; when
+    // another thread initializes it concurrently the error is benign
+    int init_ret = ObAiColumnCache::get_instance().init();
+    if (OB_SUCCESS != init_ret) {
+      LOG_WARN("init ai column cache failed", K(init_ret));
     }
-    if (OB_SUCC(ret)) {
-      if (OB_FAIL(ob_write_string(alloc, table_schema->get_table_name_str(),
-                                  table_ctx.table_name_))) {
-        LOG_WARN("write table name failed", K(ret));
+    if (OB_FAIL(ObAiColumnCache::get_instance().get_table_items(
+                 table_id, schema_version, alloc, table_ctx.items_, table_ctx.found_))) {
+      LOG_WARN("load ai column items failed", K(ret), K(table_id), K(schema_version));
+    }
+  }
+  if (OB_SUCC(ret) && table_ctx.found_) {
+    if (OB_FAIL(guard.get_table_schema(table_id, table_schema))) {
+      LOG_WARN("get table schema failed", K(ret), K(table_id));
+    } else if (OB_ISNULL(table_schema)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("table schema is null", K(ret), K(table_id));
+    } else {
+      uint64_t db_id = table_schema->get_database_id();
+      const schema::ObDatabaseSchema *db_schema = nullptr;
+      if (OB_FAIL(guard.get_database_schema(db_id, db_schema))) {
+        LOG_WARN("get database schema failed", K(ret), K(db_id));
+      } else if (OB_ISNULL(db_schema)) {
+        // fall back to the unqualified table name when db resolution fails
+      } else if (OB_FAIL(ob_write_string(alloc, db_schema->get_database_name_str(),
+                                         table_ctx.db_name_))) {
+        LOG_WARN("write db name failed", K(ret));
       }
-    }
-    for (int64_t i = 0; OB_SUCC(ret) && i < table_schema->get_rowkey_info().get_size(); ++i) {
-      uint64_t cid = OB_INVALID_ID;
-      const schema::ObColumnSchemaV2 *col_schema = nullptr;
-      ObString name_copy;
-      if (OB_FAIL(table_schema->get_rowkey_info().get_column_id(i, cid))) {
-        LOG_WARN("get rowkey column id failed", K(ret), K(i));
-      } else if (OB_ISNULL(col_schema = table_schema->get_column_schema(cid))) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("rowkey column schema not found", K(ret), K(cid));
-      } else if (OB_FAIL(ob_write_string(alloc, col_schema->get_column_name_str(), name_copy))) {
-        LOG_WARN("write rowkey name failed", K(ret));
-      } else if (OB_FAIL(table_ctx.rowkey_cids_.push_back(cid))) {
-        LOG_WARN("push back rowkey cid failed", K(ret));
-      } else if (OB_FAIL(table_ctx.rowkey_names_.push_back(name_copy))) {
-        LOG_WARN("push back rowkey name failed", K(ret));
+      if (OB_SUCC(ret)) {
+        if (OB_FAIL(ob_write_string(alloc, table_schema->get_table_name_str(),
+                                    table_ctx.table_name_))) {
+          LOG_WARN("write table name failed", K(ret));
+        }
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < table_schema->get_rowkey_info().get_size(); ++i) {
+        uint64_t cid = OB_INVALID_ID;
+        const schema::ObColumnSchemaV2 *col_schema = nullptr;
+        ObString name_copy;
+        if (OB_FAIL(table_schema->get_rowkey_info().get_column_id(i, cid))) {
+          LOG_WARN("get rowkey column id failed", K(ret), K(i));
+        } else if (OB_ISNULL(col_schema = table_schema->get_column_schema(cid))) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("rowkey column schema not found", K(ret), K(cid));
+        } else if (OB_FAIL(ob_write_string(alloc, col_schema->get_column_name_str(), name_copy))) {
+          LOG_WARN("write rowkey name failed", K(ret));
+        } else if (OB_FAIL(table_ctx.rowkey_cids_.push_back(cid))) {
+          LOG_WARN("push back rowkey cid failed", K(ret));
+        } else if (OB_FAIL(table_ctx.rowkey_names_.push_back(name_copy))) {
+          LOG_WARN("push back rowkey name failed", K(ret));
+        }
       }
     }
   }
@@ -617,11 +626,11 @@ int ObAIColumnDMLHelper::check_table_has_ai_columns(ObTableModifyOp &op, bool &h
     if (OB_FAIL(get_exec_schema_guard(op, guard))) {
       // keep DML working even without a schema guard, just no AI linkage
       ret = OB_SUCCESS;
-      SQL_ENG_LOG(WARN, "no schema guard for ai column check", K(table_id));
+      LOG_WARN("no schema guard for ai column check", K(table_id));
     } else if (OB_FAIL(guard->get_schema_version(schema_version))) {
       ret = OB_SUCCESS;
-      SQL_ENG_LOG(WARN, "get schema version for ai column check failed",
-                  K(ret), K(table_id));
+      LOG_WARN("get schema version for ai column check failed",
+               K(ret), K(table_id));
     } else if (OB_FAIL(load_ai_table_ctx(*guard, table_id, schema_version, alloc, table_ctx))) {
       LOG_WARN("load ai table ctx failed", K(ret), K(table_id), K(schema_version));
     } else {
