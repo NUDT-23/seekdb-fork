@@ -521,6 +521,7 @@ SQL_PRIVATE_HEADERS = [
     "engine/cmd/ob_variable_set_executor.h",
     "engine/cmd/ob_vector_index_refresh.h",
     "engine/direct_load/table_load/ob_table_load_context_service.h",
+    "engine/dml/ob_ai_column_dml_helper.h",
     "engine/dml/ob_conflict_checker.h",
     "engine/dml/ob_dml_service.h",
     "engine/dml/ob_table_delete_op.h",

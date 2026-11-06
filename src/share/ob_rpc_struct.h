@@ -1108,7 +1108,7 @@ private:
 
 struct ObAlterTableArg : public ObDDLArg
 {
-  OB_UNIS_VERSION(1);
+  OB_UNIS_VERSION(2);
 public:
   enum ModifiableTableColumns {
        AUTO_INCREMENT = 1,
@@ -1195,7 +1195,9 @@ public:
       lock_session_id_(0),
       lock_session_create_ts_(0),
       lock_priority_(transaction::tablelock::ObTableLockPriority::NORMAL),
-      data_version_(0)
+      data_version_(0),
+      ai_retry_column_name_(),
+      ai_retry_where_cond_()
   {
   }
   virtual ~ObAlterTableArg()
@@ -1268,7 +1270,9 @@ public:
                K_(lock_session_id),
                K_(lock_session_create_ts),
                K_(lock_priority),
-               K_(data_version));
+               K_(data_version),
+               K_(ai_retry_column_name),
+               K_(ai_retry_where_cond));
 private:
   int alloc_index_arg(const ObIndexArg::IndexActionType index_action_type, ObIndexArg *&index_arg);
 public:
@@ -1302,6 +1306,11 @@ public:
   int64_t lock_session_create_ts_;
   transaction::tablelock::ObTableLockPriority lock_priority_;
   uint64_t data_version_;
+  // ALTER TABLE ... RETRY AI COLUMN: the target AI result column name and the
+  // (rewritten) WHERE condition text; both empty for an ordinary ALTER TABLE.
+  // The executor runs the retry inline and never sends this arg over RPC.
+  common::ObString ai_retry_column_name_;
+  common::ObString ai_retry_where_cond_;
   int serialize_index_args(char *buf, const int64_t data_len, int64_t &pos) const;
   int deserialize_index_args(const char *buf, const int64_t data_len, int64_t &pos);
   int64_t get_index_args_serialize_size() const;

@@ -17,6 +17,7 @@
 #define USING_LOG_PREFIX SQL_ENG
 #include "config_bridge.h"
 #include "sql/engine/dml/ob_dml_service.h"
+#include "sql/engine/dml/ob_ai_column_dml_helper.h"
 #include "sql/engine/expr/ob_datum_cast.h"
 #include "share/rc/ob_server_runtime.h"
 #include "sql/das/ob_das_insert_op.h"
@@ -2254,6 +2255,14 @@ int ObDMLService::handle_after_row_processing(ObTableModifyOp *op,
     ret = handle_after_processing_single_row(dml_modify_rows);
   } else {
     ret = handle_after_processing_multi_row(dml_modify_rows, op);
+  }
+  // process the AI column DML linkage (task creation and invalidation) after
+  // the foreign key and trigger handling; it returns immediately when the
+  // target table has no AI column
+  if (OB_SUCC(ret) && OB_NOT_NULL(op) && OB_NOT_NULL(dml_modify_rows)) {
+    if (OB_FAIL(ObAIColumnDMLHelper::process_after_rows(*op, *dml_modify_rows))) {
+      LOG_WARN("failed to process ai column after rows", K(ret));
+    }
   }
   return ret;
 }
