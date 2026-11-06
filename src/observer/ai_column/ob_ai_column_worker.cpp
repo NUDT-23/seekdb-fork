@@ -1225,8 +1225,25 @@ int ObAiColumnWorkerTask::validate_and_build_literal_(common::ObIAllocator &allo
     } else {
       valid = true;
     }
-    if (valid && OB_FAIL(sql_append_hex_escape_str(output, lit_buf))) {
-      LOG_INFO("escape json literal failed", K(ret));
+    if (valid && OB_SUCC(ret)) {
+      // JSON 结果必须写成普通字符串字面量：X'..' 会按二进制写入，
+      // 之后 json_extract 读到的不是 JSON 值
+      if (OB_FAIL(lit_buf.append("'"))) {
+        LOG_INFO("append json quote failed", K(ret));
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < output.length(); ++i) {
+        const char c = output.ptr()[i];
+        if ('\'' == c) {
+          if (OB_FAIL(lit_buf.append("''"))) {
+            LOG_INFO("escape json quote failed", K(ret));
+          }
+        } else if (OB_FAIL(lit_buf.append_fmt("%c", c))) {
+          LOG_INFO("append json char failed", K(ret));
+        }
+      }
+      if (OB_SUCC(ret) && OB_FAIL(lit_buf.append("'"))) {
+        LOG_INFO("append json tail quote failed", K(ret));
+      }
     }
   } else if (is_integer_result_type(type_str)) {
     common::ObString trimmed;

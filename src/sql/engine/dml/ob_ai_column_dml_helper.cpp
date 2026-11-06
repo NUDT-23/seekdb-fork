@@ -295,17 +295,18 @@ int emit_delete_task_stmt(ObTableModifyOp &op,
   char *name_buf = nullptr;
   int64_t name_len = 0;
   int64_t name_pos = 0;
+  const int64_t signed_hash = static_cast<int64_t>(rowkey_hash);
   ObSqlString sql;
   if (OB_FAIL(gen_task_table_name(alloc, name_buf, name_len, name_pos))) {
     LOG_WARN("gen task table name failed", K(ret));
   } else if (with_column) {
-    if (OB_FAIL(sql.assign_fmt("delete from %s where table_id = %lu and rowkey_hash = %lu"
+    if (OB_FAIL(sql.assign_fmt("delete from %s where table_id = %lu and rowkey_hash = %ld"
                                " and column_id = %lu",
-                               name_buf, table_id, rowkey_hash, column_id))) {
+                               name_buf, table_id, signed_hash, column_id))) {
       LOG_WARN("build ai task delete sql failed", K(ret));
     }
-  } else if (OB_FAIL(sql.assign_fmt("delete from %s where table_id = %lu and rowkey_hash = %lu",
-                                    name_buf, table_id, rowkey_hash))) {
+  } else if (OB_FAIL(sql.assign_fmt("delete from %s where table_id = %lu and rowkey_hash = %ld",
+                                    name_buf, table_id, signed_hash))) {
     LOG_WARN("build ai task delete sql failed", K(ret));
   }
   if (OB_SUCC(ret)) {
@@ -314,6 +315,27 @@ int emit_delete_task_stmt(ObTableModifyOp &op,
     } else {
       LOG_TRACE("ai column task deleted", K(sql.ptr()));
     }
+  }
+  return ret;
+}
+
+// 任务表主键是 (table_id, rowkey_hash, column_id)：插入前先删掉同主键的旧行，
+// 避免被替换的旧请求残留导致主键冲突
+int delete_stale_task(ObTableModifyOp &op,
+                      const char *name_buf,
+                      const uint64_t table_id,
+                      const uint64_t rowkey_hash,
+                      const uint64_t column_id)
+{
+  int ret = OB_SUCCESS;
+  ObSqlString sql;
+  const int64_t signed_hash = static_cast<int64_t>(rowkey_hash);
+  if (OB_FAIL(sql.assign_fmt("delete from %s where table_id = %lu and rowkey_hash = %ld"
+                             " and column_id = %lu",
+                             name_buf, table_id, signed_hash, column_id))) {
+    LOG_WARN("build ai task delete sql failed", K(ret));
+  } else if (OB_FAIL(op.execute_write(sql.ptr()))) {
+    LOG_WARN("execute ai task delete sql failed", K(ret), K(sql.ptr()));
   }
   return ret;
 }
@@ -340,6 +362,9 @@ int emit_insert_task_stmt(ObTableModifyOp &op,
   } else if (OB_FAIL(databuff_printf(pred_buf, pred_len, pred_pos, alloc, "%.*s",
                                      rowkey_pred.length(), rowkey_pred.ptr()))) {
     LOG_WARN("copy rowkey predicate failed", K(ret));
+  } else if (OB_FAIL(delete_stale_task(op, name_buf, item.table_id_, rowkey_hash,
+                                       item.column_id_))) {
+    LOG_WARN("delete stale ai task failed", K(ret), K(item.table_id_), K(rowkey_hash));
   } else if (OB_FAIL(splicer.add_pk_column("table_id", item.table_id_))) {
     LOG_WARN("add table_id failed", K(ret));
   } else if (OB_FAIL(splicer.add_pk_column("rowkey_hash", rowkey_hash))) {
