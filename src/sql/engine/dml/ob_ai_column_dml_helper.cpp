@@ -69,7 +69,7 @@ int get_exec_schema_guard(ObTableModifyOp &op, schema::ObSchemaGetterGuard *&gua
   if (OB_NOT_NULL(exec_ctx.get_sql_ctx()) && OB_NOT_NULL(exec_ctx.get_sql_ctx()->schema_guard_)) {
     guard = exec_ctx.get_sql_ctx()->schema_guard_;
   } else if (OB_NOT_NULL(exec_ctx.get_my_session())) {
-    guard = &exec_ctx.get_my_session()->get_schema_guard();
+    guard = &exec_ctx.get_my_session()->get_cached_schema_guard_info().get_schema_guard();
   }
   if (OB_ISNULL(guard)) {
     ret = OB_ERR_UNEXPECTED;

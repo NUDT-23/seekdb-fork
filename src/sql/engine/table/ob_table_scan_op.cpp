@@ -81,7 +81,7 @@ static int check_ai_column_strict_read(ObExecContext &ctx, const ObTableScanSpec
       if (OB_NOT_NULL(ctx.get_sql_ctx()) && OB_NOT_NULL(ctx.get_sql_ctx()->schema_guard_)) {
         guard = ctx.get_sql_ctx()->schema_guard_;
       } else {
-        guard = &my_session->get_schema_guard();
+        guard = &my_session->get_cached_schema_guard_info().get_schema_guard();
       }
       int64_t schema_version = 0;
       if (OB_ISNULL(guard)) {

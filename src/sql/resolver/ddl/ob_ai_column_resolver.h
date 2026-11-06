@@ -45,7 +45,8 @@ public:
       ObColumnSchemaV2 &column,
       ParseNode &ai_attr_node,
       const ParseNode *type_node,
-      ObTableSchema &table_schema);
+      ObTableSchema &table_schema,
+      common::ObIArray<ObColumnSchemaV2> *pending_create_cols);
 
 private:
   static int parse_options(common::ObIAllocator &alloc, ParseNode *options_node,

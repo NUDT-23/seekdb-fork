@@ -799,7 +799,7 @@ static int execute_ai_column_retry(ObExecContext &ctx, obcall::ObAlterTableArg &
   } else if (OB_NOT_NULL(ctx.get_sql_ctx()) && OB_NOT_NULL(ctx.get_sql_ctx()->schema_guard_)) {
     guard = ctx.get_sql_ctx()->schema_guard_;
   } else {
-    guard = &my_session->get_schema_guard();
+    guard = &my_session->get_cached_schema_guard_info().get_schema_guard();
   }
   const ObTableSchema *table_schema = NULL;
   const ObDatabaseSchema *db_schema = NULL;

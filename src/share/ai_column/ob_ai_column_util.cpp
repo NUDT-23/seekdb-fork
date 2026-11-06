@@ -433,7 +433,7 @@ int gen_ai_request_id(char *buf, const int64_t buf_len)
 {
   int ret = OB_SUCCESS;
   static volatile int64_t seq = 0;
-  const int64_t cur_seq = ATOMIC_ADD(&seq, 1);
+  const int64_t cur_seq = ATOMIC_AAF(&seq, 1);
   const int64_t now_us = common::ObTimeUtility::current_time();
   const int64_t rand_val = common::ObRandom::rand(0, INT64_MAX);
   if (OB_FAIL(common::databuff_printf(buf, buf_len,

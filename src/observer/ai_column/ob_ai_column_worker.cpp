@@ -1049,7 +1049,8 @@ bool ObAiColumnWorkerTask::probe_endpoint_reachable_(const common::ObString &url
   char host_buf[256];
   if (host_len <= 0 || host_len >= static_cast<int64_t>(sizeof(host_buf)) || !port_ok
       || OB_ISNULL(p)) {
-    LOG_WARN("cannot parse ai endpoint url for the reachability probe", K(url));
+    // 该函数无 ret 变量，日志宏在此展开会引用 ret，改用无参形式
+    LOG_WARN_RET(OB_ERR_UNEXPECTED, "cannot parse ai endpoint url for the reachability probe", K(url));
   } else {
     MEMCPY(host_buf, p + host_start, host_len);
     host_buf[host_len] = '\0';
@@ -1061,11 +1062,11 @@ bool ObAiColumnWorkerTask::probe_endpoint_reachable_(const common::ObString &url
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     if (0 != getaddrinfo(host_buf, port_buf, &hints, &addr) || OB_ISNULL(addr)) {
-      LOG_WARN("resolve ai endpoint host failed", K(host_buf));
+      LOG_WARN_RET(OB_ERR_UNEXPECTED, "resolve ai endpoint host failed", K(host_buf));
     } else {
       const int fd = socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
       if (fd < 0) {
-        LOG_WARN("create probe socket failed", K(errno));
+        LOG_WARN_RET(OB_ERR_UNEXPECTED, "create probe socket failed", K(errno));
       } else {
         const int flags = fcntl(fd, F_GETFL, 0);
         if (flags >= 0) {
