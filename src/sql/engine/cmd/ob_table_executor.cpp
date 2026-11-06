@@ -790,16 +790,22 @@ static int execute_ai_column_retry(ObExecContext &ctx, obcall::ObAlterTableArg &
   int ret = OB_SUCCESS;
   ObSQLSessionInfo *my_session = ctx.get_my_session();
   ObSchemaGetterGuard *guard = NULL;
+  // session 的 cached guard 在本线程没有初始化过，取 schema version 会直接返回
+  // -4016，因此这里自己从 schema service 拿一个运行期 guard。
+  ObSchemaGetterGuard local_guard;
   // ObAlterTableArg::table_id_ is not filled by the resolver; the resolved
   // table id lives in the alter table schema
   const uint64_t table_id = arg.alter_table_schema_.get_table_id();
   if (OB_ISNULL(my_session)) {
     ret = OB_ERR_UNEXPECTED;
     SQL_ENG_LOG(WARN, "session is null for ai column retry", K(ret));
-  } else if (OB_NOT_NULL(ctx.get_sql_ctx()) && OB_NOT_NULL(ctx.get_sql_ctx()->schema_guard_)) {
-    guard = ctx.get_sql_ctx()->schema_guard_;
+  } else if (OB_ISNULL(GCTX.schema_service_)) {
+    ret = OB_NOT_INIT;
+    SQL_ENG_LOG(WARN, "schema service is null for ai column retry", K(ret));
+  } else if (OB_FAIL(GCTX.schema_service_->get_runtime_schema_guard(local_guard))) {
+    SQL_ENG_LOG(WARN, "get runtime schema guard for ai column retry failed", K(ret));
   } else {
-    guard = &my_session->get_cached_schema_guard_info().get_schema_guard();
+    guard = &local_guard;
   }
   const ObTableSchema *table_schema = NULL;
   const ObDatabaseSchema *db_schema = NULL;
@@ -919,10 +925,7 @@ static int execute_ai_column_retry(ObExecContext &ctx, obcall::ObAlterTableArg &
     }
   }
   common::sqlclient::ObISQLConnectionGuard conn_guard;
-  ObIInnerSQLConnection *conn = NULL;
-  ObSQLSessionInfo::StmtSavedValue saved_session;
-  ObIInnerSQLConnection::SavedValue saved_conn;
-  bool in_nested_session = false;
+  common::sqlclient::ObISQLConnection *conn = NULL;
   ObArray<ObString> preds;  // deep copied rowkey predicates, NUL terminated
   // mark the statements spawned below as engine maintenance SQL (same pattern
   // as ObAIColumnDMLHelper): they are allowed to assign the AI columns
@@ -935,14 +938,9 @@ static int execute_ai_column_retry(ObExecContext &ctx, obcall::ObAlterTableArg &
     if (OB_FAIL(query::ObInnerSQLConnectionAccess::create_connection_with_external_session(
             my_session, conn_guard))) {
       SQL_ENG_LOG(WARN, "create inner connection with external session failed", K(ret));
-    } else if (OB_ISNULL(conn = sql::as_inner_sql_connection(conn_guard.get_ptr()))) {
+    } else if (OB_ISNULL(conn = conn_guard.get_ptr())) {
       ret = OB_ERR_UNEXPECTED;
       SQL_ENG_LOG(WARN, "inner connection is null", K(ret));
-    } else if (OB_FAIL(conn->begin_nested_session(saved_session, saved_conn,
-                                                  true /*skip_cur_stmt_tables*/))) {
-      SQL_ENG_LOG(WARN, "begin nested session for ai column retry failed", K(ret));
-    } else {
-      in_nested_session = true;
     }
   }
   if (OB_SUCC(ret)) {
@@ -1053,15 +1051,6 @@ static int execute_ai_column_retry(ObExecContext &ctx, obcall::ObAlterTableArg &
       SQL_ENG_LOG(WARN, "execute ai retry task insert failed", K(ret), K(ins_sql.ptr()));
     } else {
       SQL_ENG_LOG(TRACE, "ai column retry row processed", K(pred), K(rid_buf));
-    }
-  }
-  if (in_nested_session) {
-    int tmp_ret = conn->end_nested_session(saved_session, saved_conn);
-    if (OB_SUCCESS != tmp_ret) {
-      SQL_ENG_LOG(WARN, "end nested session for ai column retry failed", K(tmp_ret));
-      if (OB_SUCCESS == ret) {
-        ret = tmp_ret;
-      }
     }
   }
   ctx.get_das_ctx().is_fk_cascading_ = save_is_fk_cascading;
