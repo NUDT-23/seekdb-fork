@@ -126,6 +126,11 @@ static const uint64_t OB_MIN_ID  = 0;//used for lower_bound
 #define GENERATED_VEC_IVF_CENTER_ID_COLUMN_FLAG (INT64_C(1) << 28)
 #define STRING_LOB_COLUMN_FLAG (INT64_C(1) << 29)
 #define HEAP_TABLE_PRIMARY_KEY_FLAG (INT64_C(1) << 30)
+/* AI COLUMN result/hidden columns */
+#define AI_COLUMN_FLAG (INT64_C(1) << 7) // the AI result column itself
+#define AI_STATE_COLUMN_FLAG (INT64_C(1) << 9) // hidden per-row state column (PENDING/READY/FAILED)
+#define AI_REQUEST_COLUMN_FLAG (INT64_C(1) << 10) // hidden per-row request id column
+#define AI_RESULT_SPEC_COLUMN_FLAG (INT64_C(1) << 11) // hidden per-row result spec column
 
 //the high 32-bit flag isn't stored in __all_column
 #define GENERATED_DEPS_CASCADE_FLAG (INT64_C(1) << 32)

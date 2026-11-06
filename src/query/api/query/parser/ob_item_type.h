@@ -2277,6 +2277,11 @@ typedef enum ObItemType
   T_FLUSH_PRIVILEGES = 4920,
   T_FILE_TABLE_EXPRESSION = 4921, // read_csv/read_json/read_ndjson/read_parquet/glob table function
   T_COPY_TO_OUTFILE = 4922, // COPY (query|table) TO 'file' (copy options)
+  T_CONSTR_AI_COLUMN = 4923, // AI COLUMN (expr) WITH (...) column attribute
+  T_CONSTR_AI_COLUMN_EXPR = 4926, // AI_COMPLETE/AI_EMBED('model', prompt[, dim]) call inside AI COLUMN
+  T_CONSTR_AI_COLUMN_OPTS = 4927, // WITH (sync_mode='async', max_retries=N) options of AI COLUMN
+  T_ALTER_AI_RETRY_COLUMN = 4924, // ALTER TABLE ... RETRY AI COLUMN col [WHERE cond]
+  T_SHOW_AI_COLUMNS = 4925, // SHOW AI COLUMNS [FROM tbl]
   T_MAX //Attention: add a new type before T_MAX
 } ObItemType;
 

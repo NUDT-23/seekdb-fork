@@ -535,7 +535,8 @@ protected:
                                       common::ObString &pk_name,
                                       bool &is_modify_column,
                                       bool &is_modify_column_visibility,
-                                      const bool allow_has_default = true);
+                                      const bool allow_has_default = true,
+                                      const ParseNode *type_node = NULL);
   int resolve_normal_column_attribute_check_cons(ObColumnSchemaV2 &column,
                                                  ParseNode *attrs_node,
                                                  ObCreateTableStmt *create_table_stmt);
@@ -881,6 +882,9 @@ protected:
   common::ObString vec_column_name_;
   ObIndexType vec_index_type_;
   ObSemiStructEncodingType semistruct_encoding_type_;
+  // AI COLUMN hidden columns resolved during CREATE TABLE; their column ids
+  // are assigned right before the table schema's max used column id is fixed
+  common::ObSEArray<share::schema::ObColumnSchemaV2, 8> ai_pending_hidden_cols_;
 private:
   template <typename STMT>
   DISALLOW_COPY_AND_ASSIGN(ObDDLResolver);

@@ -30,6 +30,14 @@
 #include "sql/das/iter/ob_das_iter_utils.h"
 #include "sql/engine/px/ob_granule_iterator_op.h"
 #include "sql/engine/expr/ob_expr_lob_utils.h"
+#include "share/ai_column/ob_ai_column_util.h"
+#include "share/schema/ob_schema_struct.h"
+#include "share/schema/ob_schema_getter_guard.h"
+#include "query/session/ob_inner_sql_connection_access.h"
+#include "sql/session/ob_inner_sql_connection.h"
+#include "common/mysqlclient/ob_mysql_result.h"
+#include "lib/string/ob_sql_string.h"
+#include "lib/utility/ob_mod_define.h"
 
 namespace oceanbase
 {
@@ -43,6 +51,181 @@ namespace sql
 
 namespace
 {
+
+// AI COLUMN strict read (ai_column_strict_read): when the session variable is
+// enabled, a table scan that touches an AI column (the result column or one of
+// its hidden state/request/spec columns) must fail with
+// OB_ERR_AI_COLUMN_UNFINISHED_TASK while any row of the column has a state
+// other than 'READY'.  The check query below runs on the caller's session (so
+// it sees the transaction's own uncommitted PENDING writes) through a nested
+// session, which also marks it as nested SQL: nested SQL and inner sessions
+// never re-enter this check.
+static int check_ai_column_strict_read(ObExecContext &ctx, const ObTableScanSpec &spec)
+{
+  int ret = OB_SUCCESS;
+  static thread_local bool in_ai_strict_check = false;
+  ObSQLSessionInfo *my_session = GET_MY_SESSION(ctx);
+  if (OB_ISNULL(my_session) || in_ai_strict_check || NULL != ctx.get_parent_ctx()
+      || my_session->is_inner()) {
+    // engine-internal SQL never triggers the strict check
+  } else {
+    int64_t strict_read = 0;
+    if (OB_FAIL(my_session->get_sys_variable(share::SYS_VAR_AI_COLUMN_STRICT_READ, strict_read))) {
+      // a missing variable must not break ordinary reads
+      LOG_WARN("read ai_column_strict_read failed, skip strict check", K(ret));
+      ret = OB_SUCCESS;
+    } else if (0 == strict_read) {
+      // strict read disabled
+    } else {
+      ObSchemaGetterGuard *guard = NULL;
+      if (OB_NOT_NULL(ctx.get_sql_ctx()) && OB_NOT_NULL(ctx.get_sql_ctx()->schema_guard_)) {
+        guard = ctx.get_sql_ctx()->schema_guard_;
+      } else {
+        guard = &my_session->get_cached_schema_guard_info().get_schema_guard();
+      }
+      int64_t schema_version = 0;
+      if (OB_ISNULL(guard)) {
+        // no schema guard available, skip the check
+      } else if (OB_FAIL(guard->get_schema_version(schema_version))) {
+        LOG_WARN("get schema version for ai strict check failed", K(ret));
+        ret = OB_SUCCESS;
+      } else {
+        // check the initially scanned table and, for index back, the main
+        // table reached through the lookup
+        const ObDASScanCtDef *scan_ctdefs[2] = {&spec.tsc_ctdef_.scan_ctdef_,
+                                                spec.tsc_ctdef_.lookup_ctdef_};
+        ObArenaAllocator alloc(ObModIds::OB_SQL_EXECUTOR);
+        // the process wide cache is initialized lazily and idempotently; when
+        // another thread initializes it concurrently the error is benign.  If
+        // init genuinely fails the cache is unusable, skip the strict check.
+        if (OB_FAIL(ObAiColumnCache::get_instance().init())) {
+          LOG_WARN("init ai column cache for strict check failed, skip check", K(ret));
+          ret = OB_SUCCESS;
+        } else {
+        for (int64_t i = 0; OB_SUCC(ret) && i < 2; ++i) {
+          const ObDASScanCtDef *ctdef = scan_ctdefs[i];
+          if (OB_ISNULL(ctdef)) {
+            continue;
+          }
+          const uint64_t table_id = ctdef->ref_table_id_;
+          const ObTableSchema *table_schema = NULL;
+          const ObDatabaseSchema *db_schema = NULL;
+          ObArray<ObAIColumnItem> items;
+          bool found = false;
+          ObString db_name;
+          ObString table_name;
+          if (OB_FAIL(guard->get_table_schema(table_id, table_schema))) {
+            LOG_WARN("get table schema for ai strict check failed", K(ret), K(table_id));
+            ret = OB_SUCCESS;
+          } else if (OB_ISNULL(table_schema)) {
+            // table dropped or not visible to this guard, skip
+          } else if (OB_FAIL(guard->get_database_schema(table_schema->get_database_id(),
+                                                        db_schema))) {
+            LOG_WARN("get database schema for ai strict check failed", K(ret), K(table_id));
+            ret = OB_SUCCESS;
+          } else if (OB_ISNULL(db_schema)) {
+          } else if (OB_FAIL(ObAiColumnCache::get_instance().get_table_items(
+                         table_id, schema_version, alloc, items, found))) {
+            LOG_WARN("load ai column items for strict check failed", K(ret), K(table_id));
+            ret = OB_SUCCESS;
+          } else if (!found) {
+            // the scanned table has no AI column
+          } else if (OB_FAIL(ob_write_string(alloc, db_schema->get_database_name_str(),
+                                             db_name, true))) {
+            LOG_WARN("write db name failed", K(ret));
+          } else if (OB_FAIL(ob_write_string(alloc, table_schema->get_table_name_str(),
+                                             table_name, true))) {
+            LOG_WARN("write table name failed", K(ret));
+          } else {
+            for (int64_t j = 0; OB_SUCC(ret) && j < items.count(); ++j) {
+              const ObAIColumnItem &item = items.at(j);
+              const uint64_t ai_cids[4] = {item.column_id_, item.state_column_id_,
+                                           item.request_column_id_, item.result_spec_column_id_};
+              bool referenced = false;
+              for (int64_t k = 0; !referenced && k < 4; ++k) {
+                for (int64_t c = 0; !referenced && c < ctdef->access_column_ids_.count(); ++c) {
+                  referenced = (ai_cids[k] == ctdef->access_column_ids_.at(c));
+                }
+              }
+              if (!referenced) {
+                continue;
+              }
+              // any row with a state other than READY makes the whole column
+              // unreadable in strict mode
+              ObSqlString check_sql;
+              if (db_name.empty() || table_name.empty()) {
+                // cannot qualify the table, skip the check
+              } else if (OB_FAIL(check_sql.assign_fmt("select `%.*s` from `%.*s`.`%.*s`"
+                                                      " where `%.*s` <> 'READY' limit 1",
+                                                      item.state_column_name_.length(),
+                                                      item.state_column_name_.ptr(),
+                                                      db_name.length(), db_name.ptr(),
+                                                      table_name.length(), table_name.ptr(),
+                                                      item.state_column_name_.length(),
+                                                      item.state_column_name_.ptr()))) {
+                LOG_WARN("build ai strict check sql failed", K(ret));
+              } else {
+                common::sqlclient::ObISQLConnectionGuard conn_guard;
+                ObIInnerSQLConnection *conn = NULL;
+                ObSQLSessionInfo::StmtSavedValue saved_session;
+                ObIInnerSQLConnection::SavedValue saved_conn;
+                if (OB_FAIL(query::ObInnerSQLConnectionAccess::create_connection_with_external_session(
+                        my_session, conn_guard))) {
+                  LOG_WARN("create ai strict check connection failed", K(ret));
+                } else if (OB_ISNULL(conn = sql::as_inner_sql_connection(conn_guard.get_ptr()))) {
+                  ret = OB_ERR_UNEXPECTED;
+                  LOG_WARN("ai strict check connection is null", K(ret));
+                } else if (OB_FAIL(conn->begin_nested_session(saved_session, saved_conn,
+                                                              true /*skip_cur_stmt_tables*/))) {
+                  LOG_WARN("begin nested session for ai strict check failed", K(ret));
+                } else {
+                  in_ai_strict_check = true;
+                  SMART_VAR(ObISQLClient::ReadResult, res) {
+                    common::sqlclient::ObMySQLResult *result = NULL;
+                    if (OB_FAIL(conn->execute_read(check_sql.ptr(), res))) {
+                      LOG_WARN("execute ai strict check sql failed", K(ret), K(check_sql.ptr()));
+                    } else if (OB_ISNULL(result = res.get_result())) {
+                      ret = OB_ERR_UNEXPECTED;
+                      LOG_WARN("ai strict check result is null", K(ret));
+                    } else {
+                      int tmp_ret = result->next();
+                      if (OB_SUCCESS == tmp_ret) {
+                        // the column has at least one unfinished row
+                        ret = OB_ERR_AI_COLUMN_UNFINISHED_TASK;
+                        LOG_USER_ERROR(OB_ERR_AI_COLUMN_UNFINISHED_TASK,
+                                       static_cast<int64_t>(table_id),
+                                       static_cast<int64_t>(item.column_id_));
+                        LOG_WARN("ai column strict read rejected the scan",
+                                 K(ret), K(table_id), K(item.column_id_));
+                      } else if (OB_ITER_END == tmp_ret) {
+                        // all rows are READY
+                        ret = OB_SUCCESS;
+                      } else {
+                        ret = tmp_ret;
+                        LOG_WARN("iterate ai strict check result failed", K(ret));
+                      }
+                    }
+                  }
+                  in_ai_strict_check = false;
+                  int end_ret = conn->end_nested_session(saved_session, saved_conn);
+                  if (OB_SUCCESS != end_ret) {
+                    LOG_WARN("end nested session for ai strict check failed", K(end_ret));
+                    if (OB_SUCCESS == ret) {
+                      ret = end_ret;
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
 // Recursively find ObDASVecAuxScanCtDef with skip_delta_buffer_ in the attach hierarchy.
 // Used for HNSW+async: when index lookup finds deleted row, skip it instead of 4377.
 bool find_skip_delta_buffer_in_ctdef(const ObDASBaseCtDef *ctdef)
@@ -1497,6 +1680,14 @@ int ObTableScanOp::inner_open()
   }
   output_ = iter_tree_;
   if (OB_SUCC(ret) && OB_FAIL(rand_scan_processor_.init(&spec, this))) {
+  }
+  if (OB_SUCC(ret)) {
+    // AI COLUMN strict read: reject scans that touch an unfinished AI column
+    // when the session enables ai_column_strict_read
+    int tmp_ret = check_ai_column_strict_read(ctx_, spec);
+    if (OB_SUCCESS != tmp_ret) {
+      ret = tmp_ret;
+    }
   }
   return ret;
 }

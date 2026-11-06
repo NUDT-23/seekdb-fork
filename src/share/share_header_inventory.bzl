@@ -333,6 +333,8 @@ SHARE_INTERFACE_CLOSURE_HEADERS = [
 ]
 
 SHARE_PRIVATE_HEADERS = [
+    "ai_column/ob_ai_column_ddl_util.h",
+    "ai_column/ob_ai_column_util.h",
     "datum/ob_datum_funcs_compilation/ob_datum_funcs_compilation.ipp",
     "datum/ob_datum_funcs_impl.h",
     "datum/ob_str_datum_funcs_compilation/ob_str_datum_funcs_compilation.ipp",

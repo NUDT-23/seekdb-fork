@@ -147,6 +147,7 @@ class ObPluginVectorIndexService;
 class ObChangeStreamMgr;
 class ObITabletAutoincrementService;
 class ObITabletAutoincrementAdmin;
+class ObAiColumnWorkerService;
 struct ObFreezeInfo;
 namespace schema
 {
@@ -754,6 +755,7 @@ private:
   rootserver::ObSystemPackageLoadService * mods_system_package_load_service_ = nullptr;
   rootserver::ObDDLScheduler * mods_ddl_scheduler_ = nullptr;
   omt::ObAiService * mods_ai_service_ = nullptr;
+  share::ObAiColumnWorkerService * mods_ai_column_worker_service_ = nullptr;
   share::ObChangeStreamMgr * mods_change_stream_mgr_ = nullptr;
   ObLSRuntimeAdapter ls_runtime_adapter_;
 }; // end of class ObServer

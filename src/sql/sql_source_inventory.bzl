@@ -316,6 +316,7 @@ SQL_UNITY_GROUPS = [
         name = "ob_sql_engine_dml_0",
         language = "c++",
         srcs = [
+            "src/sql/engine/dml/ob_ai_column_dml_helper.cpp",
             "src/sql/engine/dml/ob_conflict_checker.cpp",
             "src/sql/engine/dml/ob_dml_ctx_define.cpp",
             "src/sql/engine/dml/ob_dml_service.cpp",
@@ -1439,6 +1440,7 @@ SQL_UNITY_GROUPS = [
             "src/sql/resolver/ddl/ob_create_table_resolver_base.cpp",
             "src/sql/resolver/ddl/ob_create_table_stmt.cpp",
             "src/sql/resolver/ddl/ob_create_view_resolver.cpp",
+            "src/sql/resolver/ddl/ob_ai_column_resolver.cpp",
             "src/sql/resolver/ddl/ob_ddl_resolver.cpp",
             "src/sql/resolver/ddl/ob_ddl_stmt.cpp",
             "src/sql/resolver/ddl/ob_drop_database_resolver.cpp",

@@ -37,6 +37,7 @@
 #include "pl/pl_cache/ob_pl_cache_mgr.h"
 #include "share/schema/ob_dependency_info.h"  // relocated-definition owner
 #include "share/schema/ob_multi_version_schema_service.h"  // relocated-definition owner
+#include "share/ai_column/ob_ai_column_ddl_util.h"
 
 namespace oceanbase
 {
@@ -2867,6 +2868,12 @@ int ObDDLOperator::drop_table(
     const uint64_t table_id = table_schema.get_table_id();
     if ((table_schema.is_vec_delta_buffer_type() || table_schema.is_hybrid_vec_index_log_type()) &&
                OB_FAIL(ObVectorIndexUtil::remove_dbms_vector_jobs(trans, table_schema.get_table_id()))) {
+    }
+  }
+
+  if (OB_SUCC(ret)) {
+    if (ObAIColumnDDLUtil::has_ai_column(table_schema) &&
+        OB_FAIL(ObAIColumnDDLUtil::delete_ai_column_rows(trans, table_schema.get_table_id()))) {
     }
   }
 

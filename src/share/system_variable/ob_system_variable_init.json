@@ -1,4 +1,30 @@
 {
+  "enable_file_sql": {
+    "id": 10760,
+    "name": "enable_file_sql",
+    "default_value": "0",
+    "base_value": "0",
+    "data_type": "bool",
+    "info": "Allow reading local csv/json/parquet files as tables",
+    "flags": "SESSION | NEED_SERIALIZE",
+    "publish_version": "",
+    "info_cn": "",
+    "background_cn": "",
+    "ref_url": ""
+  },
+  "ai_column_strict_read": {
+    "id": 10761,
+    "name": "ai_column_strict_read",
+    "default_value": "0",
+    "base_value": "0",
+    "data_type": "bool",
+    "info": "Error when a statement reads an AI column with unfinished rows",
+    "flags": "SESSION | NEED_SERIALIZE",
+    "publish_version": "",
+    "info_cn": "",
+    "background_cn": "",
+    "ref_url": ""
+  },
   "auto_increment_increment": {
     "id": 0,
     "name": "auto_increment_increment",

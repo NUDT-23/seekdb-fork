@@ -24,6 +24,8 @@
 #include "sql/parser/parse_malloc.h"
 #include "query/vector/ob_vector_index_util.h"
 #include "sql/das/ob_domain_id.h"
+#include "sql/engine/ob_exec_context.h"
+#include "sql/ob_sql_utils.h"
 
 namespace oceanbase
 {
@@ -33,6 +35,44 @@ using namespace share::schema;
 using namespace pl;
 namespace sql
 {
+
+namespace
+{
+// AI COLUMN (赛题三): reject a direct assignment to an AI result column from
+// user SQL (UPDATE SET / INSERT column list).  Internal writers keep access:
+// the AI worker publish SQL (non user session / inner SQL) and the nested
+// maintenance SQL of the DML linkage hook, foreign key cascade and triggers.
+int check_ai_column_not_assignable(ObSchemaChecker &schema_checker,
+                                   ObSQLSessionInfo *session_info,
+                                   const uint64_t table_id,
+                                   const uint64_t column_id)
+{
+  int ret = OB_SUCCESS;
+  const ObTableSchema *table_schema = nullptr;
+  const ObColumnSchemaV2 *col_schema = nullptr;
+  ObExecContext *exec_ctx = OB_NOT_NULL(session_info) ? session_info->get_cur_exec_ctx() : nullptr;
+  if (OB_ISNULL(session_info) || session_info->is_inner() || !session_info->is_user_session()) {
+    // internal SQL (e.g. the AI worker publish) may write AI columns
+  } else if (OB_NOT_NULL(exec_ctx) && ObSQLUtils::is_nested_sql(exec_ctx)) {
+    // nested SQL (AI column DML linkage, foreign key cascade, trigger) may
+    // write AI columns
+  } else if (OB_FAIL(schema_checker.get_table_schema(table_id, table_schema))) {
+    if (OB_TABLE_NOT_EXIST == ret) {
+      // leave the error to the normal resolve path
+      ret = OB_SUCCESS;
+    } else {
+      LOG_WARN("get table schema for ai column check failed", K(ret), K(table_id));
+    }
+  } else if (OB_ISNULL(table_schema)) {
+  } else if (OB_ISNULL(col_schema = table_schema->get_column_schema(column_id))) {
+    // unknown column here, leave the error to the normal resolve path
+  } else if (col_schema->is_ai_column()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "assign value to AI column directly");
+  }
+  return ret;
+}
+}  // anonymous namespace
 
 int ObTableAssignment::expand_expr(ObRawExprFactory &expr_factory,
                                    const ObIArray<ObAssignment> &assigns,
@@ -121,6 +161,16 @@ int ObDelUpdResolver::resolve_assignments(const ParseNode &parse_node,
       }
       if (OB_SUCC(ret) && T_INSERT_SCOPE == scope) {
         if (OB_FAIL(mock_values_column_ref(ref_expr))) {
+        }
+      }
+      // AI COLUMN: reject direct assignment to an AI result column
+      if (OB_SUCC(ret)) {
+        const uint64_t ai_check_tid = OB_INVALID_ID != column->base_tid_
+                                      ? column->base_tid_ : table->ref_id_;
+        const uint64_t ai_check_cid = OB_INVALID_ID != column->base_cid_
+                                      ? column->base_cid_ : column->column_id_;
+        if (OB_FAIL(check_ai_column_not_assignable(*schema_checker_, session_info_,
+                                                   ai_check_tid, ai_check_cid))) {
         }
       }
       // process expression
@@ -2170,6 +2220,9 @@ int ObDelUpdResolver::resolve_insert_columns(const ParseNode *node,
       } else if (!session_info_->get_ddl_info().is_ddl() && OB_HIDDEN_SESS_CREATE_TIME_COLUMN_ID == column_expr->get_column_id()) {
         ret = OB_NOT_SUPPORTED;
         LOG_USER_ERROR(OB_NOT_SUPPORTED, "specify __sess_create_time value");
+      } else if (OB_FAIL(check_ai_column_not_assignable(*schema_checker_, session_info_,
+                                                        table_item->ref_id_,
+                                                        column_expr->get_column_id()))) {
       } else if (OB_FAIL(mock_values_column_ref(column_expr))) {
       }
     }//end for
