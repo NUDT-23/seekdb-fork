@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#define USING_LOG_PREFIX OBSERVER
+#define USING_LOG_PREFIX SQL_ENG
 
 #include "observer/ai_column/ob_ai_column_worker.h"
 
@@ -33,12 +33,13 @@
 
 #include "common/json_type/ob_json_parse.h"
 #include "common/mysqlclient/ob_mysql_result.h"
+#include "lib/oblog/ob_log_module.h"
 #include "common/mysqlclient/ob_mysql_transaction.h"
 #include "common/ob_timeout_ctx.h"
 #include "lib/allocator/ob_malloc.h"
 #include "lib/container/ob_array.h"
 #include "lib/container/ob_se_array.h"
-#include "lib/mysqlclient/ob_mysql_proxy.h"
+#include "common/mysqlclient/ob_mysql_proxy.h"
 #include "lib/time/ob_time_utility.h"
 #include "lib/utility/ob_mod_define.h"
 #include "lib/utility/ob_utility.h"
@@ -337,7 +338,7 @@ int ObAiColumnWorkerTask::poll_tasks_(common::ObIAllocator &alloc,
     LOG_WARN("build poll sql failed", K(ret));
   } else {
     SMART_VAR(ObMySQLProxy::MySQLResult, res) {
-      ObMySQLResult *result = nullptr;
+      common::sqlclient::ObMySQLResult *result = nullptr;
       if (OB_FAIL(proxy->read(res, sql.ptr()))) {
         LOG_WARN("poll ai column tasks failed", K(ret), K(sql.ptr()));
       } else if (OB_ISNULL(result = res.get_result())) {
@@ -430,7 +431,7 @@ int ObAiColumnWorkerTask::load_group_tasks_(common::ObIAllocator &alloc,
     LOG_WARN("build group task sql failed", K(ret));
   } else {
     SMART_VAR(ObMySQLProxy::MySQLResult, res) {
-      ObMySQLResult *result = nullptr;
+      common::sqlclient::ObMySQLResult *result = nullptr;
       if (OB_FAIL(proxy->read(res, sql.ptr()))) {
         LOG_WARN("load ai column group tasks failed", K(ret), K(sql.ptr()));
       } else if (OB_ISNULL(result = res.get_result())) {
@@ -697,7 +698,7 @@ int ObAiColumnWorkerTask::claim_group_(const uint64_t table_id,
   int ret = OB_SUCCESS;
   affected = 0;
   ObSqlString sql;
-  ObMySQLTransaction trans;
+  common::ObMySQLTransaction trans;
   if (OB_ISNULL(GCTX.sql_proxy_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("sql proxy is null", K(ret));
@@ -740,7 +741,7 @@ int ObAiColumnWorkerTask::count_group_task_rows_(const uint64_t table_id,
     LOG_WARN("build count sql failed", K(ret));
   } else {
     SMART_VAR(ObMySQLProxy::MySQLResult, res) {
-      ObMySQLResult *result = nullptr;
+      common::sqlclient::ObMySQLResult *result = nullptr;
       if (OB_FAIL(proxy->read(res, sql.ptr()))) {
         LOG_WARN("count ai column task rows failed", K(ret), K(sql.ptr()));
       } else if (OB_ISNULL(result = res.get_result())) {
@@ -961,7 +962,7 @@ int ObAiColumnWorkerTask::read_user_prompt_(common::ObIAllocator &alloc, const T
     LOG_WARN("build ai prompt sql failed", K(ret));
   } else {
     SMART_VAR(ObMySQLProxy::MySQLResult, res) {
-      ObMySQLResult *result = nullptr;
+      common::sqlclient::ObMySQLResult *result = nullptr;
       if (OB_FAIL(proxy->read(res, sql.ptr()))) {
         LOG_WARN("read ai prompt failed", K(ret), K(sql.ptr()));
       } else if (OB_ISNULL(result = res.get_result())) {
@@ -1286,7 +1287,7 @@ int ObAiColumnWorkerTask::defer_retry_(PolledTask &task)
 {
   int ret = OB_SUCCESS;
   ObSqlString sql;
-  ObMySQLTransaction trans;
+  common::ObMySQLTransaction trans;
   if (OB_ISNULL(GCTX.sql_proxy_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("sql proxy is null", K(ret));
@@ -1329,7 +1330,7 @@ int ObAiColumnWorkerTask::publish_group_(MemGroup &group, const TableName &names
   int ret = OB_SUCCESS;
   affected = 0;
   ObSqlString sql;
-  ObMySQLTransaction trans;
+  common::ObMySQLTransaction trans;
   bool published = false;  // whether at least one member contributes a SET/WHERE part
   if (OB_ISNULL(GCTX.sql_proxy_)) {
     ret = OB_ERR_UNEXPECTED;
@@ -1448,7 +1449,7 @@ int ObAiColumnWorkerTask::requeue_group_(const uint64_t table_id,
 {
   int ret = OB_SUCCESS;
   ObSqlString sql;
-  ObMySQLTransaction trans;
+  common::ObMySQLTransaction trans;
   if (OB_ISNULL(GCTX.sql_proxy_)) {
     ret = OB_ERR_UNEXPECTED;
   } else if (OB_FAIL(trans.start(GCTX.sql_proxy_))) {
@@ -1483,7 +1484,7 @@ int ObAiColumnWorkerTask::delete_group_tasks_(const uint64_t table_id,
   int ret = OB_SUCCESS;
   affected = 0;
   ObSqlString sql;
-  ObMySQLTransaction trans;
+  common::ObMySQLTransaction trans;
   if (OB_ISNULL(GCTX.sql_proxy_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("sql proxy is null", K(ret));

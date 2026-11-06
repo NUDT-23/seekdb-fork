@@ -82,6 +82,7 @@ private:
                                    const common::ObString &def_json,
                                    bool on_create_path,
                                    common::ObIArray<ObColumnSchemaV2> *pending_create_cols);
+public:
   // CREATE TABLE post pass: assigns column ids to the hidden columns resolved
   // earlier and adds them to the table schema.  Must run before
   // ObTableSchema::set_max_used_column_id() fixes the id watermark.

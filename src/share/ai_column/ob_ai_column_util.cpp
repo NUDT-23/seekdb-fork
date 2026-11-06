@@ -19,9 +19,9 @@
 #include "share/ai_column/ob_ai_column_util.h"
 
 #include "lib/allocator/page_arena.h"
-#include "lib/mysqlclient/ob_mysql_proxy.h"
+#include "common/mysqlclient/ob_mysql_proxy.h"
 #include "lib/atomic/ob_atomic.h"
-#include "lib/mysqlclient/ob_mysql_result.h"
+#include "common/mysqlclient/ob_mysql_result.h"
 #include "lib/profile/ob_trace_id.h"
 #include "lib/random/ob_random.h"
 #include "lib/time/ob_time_utility.h"
@@ -57,7 +57,7 @@ int ObAiColumnCache::init()
     LOG_WARN("allocate cache allocator failed", K(ret));
   } else {
     new (cache_alloc_) common::ObArenaAllocator(ObModIds::OB_SCHEMA_GETTER_GUARD);
-    if (OB_FAIL(table_items_.create(1024, ObModIds::OB_SCHEMA_GETTER_GUARD))) {
+    if (OB_FAIL(table_items_.create(1024, 0))) {
       LOG_WARN("create table item map failed", K(ret));
     } else {
       inited_ = true;
@@ -127,7 +127,6 @@ int ObAiColumnCache::get_table_items(const uint64_t table_id, const int64_t sche
           ret = OB_ALLOCATE_MEMORY_FAILED;
         } else {
           empty_list = new (empty_list) ItemList();
-          empty_list->set_allocator(cache_alloc_);
           TableItemMap::iterator iter = table_items_.get(table_id);
           if (table_items_.end() != iter) {
             iter->second->~ObArray<ObAIColumnItem>();
@@ -216,7 +215,6 @@ int ObAiColumnCache::load_table_items(const uint64_t table_id, const int64_t sch
       ret = OB_ALLOCATE_MEMORY_FAILED;
     } else {
       empty_list = new (empty_list) ItemList();
-      empty_list->set_allocator(cache_alloc_);
       if (OB_FAIL(table_items_.put(table_id, empty_list))) {
         LOG_WARN("put empty list failed", K(ret));
       }
@@ -227,11 +225,10 @@ int ObAiColumnCache::load_table_items(const uint64_t table_id, const int64_t sch
       ret = OB_ALLOCATE_MEMORY_FAILED;
     } else {
       new_list = new (new_list) ItemList();
-      new_list->set_allocator(cache_alloc_);
       // read the AI columns of this table from the system table
       common::ObSqlString sql;
       SMART_VAR(common::ObMySQLProxy::MySQLResult, res) {
-        common::ObMySQLResult *result = nullptr;
+        common::sqlclient::ObMySQLResult *result = nullptr;
         if (OB_FAIL(sql.assign_fmt("SELECT column_id, column_name, func_type, model_name, sync_mode, "
                                    "max_retries, def_version, user_expr, normalized_expr, dep_column_ids, "
                                    "result_type, vector_dim, state_column_id, request_column_id, "
@@ -394,8 +391,6 @@ int ObAiColumnCache::deep_copy_item(common::ObIAllocator &alloc,
   dst = src;
   dst.dep_column_ids_.reset();
   dst.rowkey_column_names_.reset();
-  dst.dep_column_ids_.set_allocator(&alloc);
-  dst.rowkey_column_names_.set_allocator(&alloc);
   if (OB_FAIL(common::ob_write_string(alloc, src.column_name_, dst.column_name_))) {
     LOG_WARN("copy column name failed", K(ret));
   } else if (OB_FAIL(common::ob_write_string(alloc, src.model_name_, dst.model_name_))) {
@@ -438,7 +433,7 @@ int gen_ai_request_id(char *buf, const int64_t buf_len)
 {
   int ret = OB_SUCCESS;
   static volatile int64_t seq = 0;
-  const int64_t cur_seq = common::atomic_add(&seq, 1);
+  const int64_t cur_seq = ATOMIC_ADD(&seq, 1);
   const int64_t now_us = common::ObTimeUtility::current_time();
   const int64_t rand_val = common::ObRandom::rand(0, INT64_MAX);
   if (OB_FAIL(common::databuff_printf(buf, buf_len,

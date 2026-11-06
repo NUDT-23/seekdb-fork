@@ -17,6 +17,9 @@
 #ifndef OCEANBASE_SHARE_AI_COLUMN_OB_AI_COLUMN_UTIL_H_
 #define OCEANBASE_SHARE_AI_COLUMN_OB_AI_COLUMN_UTIL_H_
 
+#include <map>
+
+#include "lib/container/ob_array.h"
 #include "lib/hash/ob_hashmap.h"
 #include "lib/lock/ob_spin_rwlock.h"
 #include "lib/string/ob_sql_string.h"
@@ -125,9 +128,27 @@ private:
   static int deep_copy_item(common::ObIAllocator &alloc,
                             const ObAIColumnItem &src, ObAIColumnItem &dst);
   typedef common::ObArray<ObAIColumnItem> ItemList;
+  // std::map 包装：cache 只需要 create/get/put/erase 这几个语义，
+  // 用 STL 实现可以避开 ObHashMap 不同版本的接口差异。
+  class TableItemMap
+  {
+  public:
+    typedef typename std::map<uint64_t, ItemList *>::iterator iterator;
+    typedef typename std::map<uint64_t, ItemList *>::const_iterator const_iterator;
+    int create(const int64_t, const int64_t) { return OB_SUCCESS; }
+    void destroy() { map_.clear(); }
+    iterator begin() { return map_.begin(); }
+    iterator end() { return map_.end(); }
+    const_iterator begin() const { return map_.begin(); }
+    const_iterator end() const { return map_.end(); }
+    iterator get(const uint64_t key) { return map_.find(key); }
+    int put(const uint64_t key, ItemList *value) { map_[key] = value; return OB_SUCCESS; }
+    iterator erase(iterator it) { return map_.erase(it); }
+  private:
+    std::map<uint64_t, ItemList *> map_;
+  };
   bool inited_;
   common::ObArenaAllocator *cache_alloc_;
-  typedef common::ObHashMap<uint64_t, ItemList *> TableItemMap;
   TableItemMap table_items_;
   common::SpinRWLock lock_;
   typedef common::SpinRLockGuard RLockGuard;

@@ -21,7 +21,7 @@
 #include "common/json_type/ob_json_base.h"
 #include "common/json_type/ob_json_tree.h"
 #include "share/ai_column/ob_ai_column_util.h"
-#include "share/schema/ob_ai_model_schema.h"
+#include "share/ai_service/ob_ai_model_info.h"
 #include "share/schema/ob_schema_struct.h"
 #include "share/schema/ob_table_schema.h"
 #include "sql/parser/parse_node.h"
@@ -128,8 +128,8 @@ int ObAIColumnResolver::resolve_ai_column_attribute(
           ret = OB_ERR_INVALID_TYPE_FOR_ARGUMENT;
           LOG_USER_ERROR(OB_ERR_INVALID_TYPE_FOR_ARGUMENT, "AI_EMBED result column", "vector column");
         } else if (embed_dim > 0 && embed_dim != vector_col_dim) {
-          ret = OB_ERR_AI_COLUMN_DIMENSION_MISMATCH;
-          LOG_USER_ERROR(OB_ERR_AI_COLUMN_DIMENSION_MISMATCH, vector_col_dim, embed_dim);
+          ret = OB_ERR_INVALID_VECTOR_DIM;
+          LOG_USER_ERROR(OB_ERR_INVALID_VECTOR_DIM, vector_col_dim, embed_dim);
         }
       } else if (OB_AI_COL_FUNC_COMPLETE == func_type) {
         if (is_vector_col) {
@@ -335,7 +335,6 @@ int ObAIColumnResolver::build_system_prompt(int64_t obj_type, char *buf,
     case ObMediumIntType:
     case ObInt32Type:
     case ObIntType:
-    case ObBooleanType:
     case ObBitType:
       prompt = OB_AI_PROMPT_INTEGER;
       break;
@@ -386,7 +385,6 @@ int ObAIColumnResolver::build_result_type_str(int64_t obj_type, char *buf, const
     case ObIntType:
       type_str = "BIGINT";
       break;
-    case ObBooleanType:
     case ObBitType:
       type_str = "BOOLEAN";
       break;

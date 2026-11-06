@@ -12733,7 +12733,7 @@ SHOW opt_extended_or_full TABLES opt_from_or_in_database_clause opt_show_conditi
 }
 | SHOW AI COLUMNS opt_show_condition
 {
-  malloc_non_terminal_node($$, result->malloc_pool_, T_SHOW_AI_COLUMNS, 3, NULL, NULL, $3);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_SHOW_AI_COLUMNS, 3, NULL, NULL, $4);
 }
 | SHOW AI COLUMNS from_or_in relation_factor opt_from_or_in_database_clause opt_show_condition
 {

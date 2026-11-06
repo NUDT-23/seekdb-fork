@@ -31,7 +31,7 @@
 #include "sql/engine/px/ob_granule_iterator_op.h"
 #include "sql/engine/expr/ob_expr_lob_utils.h"
 #include "share/ai_column/ob_ai_column_util.h"
-#include "share/schema/ob_database_schema.h"
+#include "share/schema/ob_schema_struct.h"
 #include "share/schema/ob_schema_getter_guard.h"
 #include "query/session/ob_inner_sql_connection_access.h"
 #include "sql/session/ob_inner_sql_connection.h"

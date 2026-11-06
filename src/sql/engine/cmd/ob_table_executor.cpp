@@ -45,7 +45,7 @@
 #include "share/ai_column/ob_ai_column_util.h"
 #include "share/inner_table/ob_inner_table_schema.h"
 #include "share/ob_dml_sql_splicer.h"
-#include "share/schema/ob_database_schema.h"
+#include "share/schema/ob_schema_struct.h"
 #include "share/schema/ob_schema_getter_guard.h"
 #include "sql/session/ob_inner_sql_connection.h"
 #include "common/mysqlclient/ob_mysql_result.h"

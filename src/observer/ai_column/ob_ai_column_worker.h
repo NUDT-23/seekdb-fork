@@ -83,7 +83,6 @@ private:
       : table_id_(0), request_id_(), rowkey_predicate_(), tasks_(),
         processing_(false), alloc_(ObModIds::OMT)
     {
-      tasks_.set_allocator(&alloc_);
     }
     ~MemGroup() {}
 
