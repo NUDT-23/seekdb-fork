@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Copyright (c) 2025 OceanBase.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -154,7 +154,7 @@ int ObAiColumnWorkerTask::init()
   if (OB_UNLIKELY(inited_)) {
     ret = OB_INIT_TWICE;
   } else if (OB_FAIL(ObAiColumnCache::get_instance().init())) {
-    LOG_WARN("init ai column cache failed", K(ret));
+    LOG_INFO("init ai column cache failed", K(ret));
   } else {
     recovered_ = false;
     inited_ = true;
@@ -171,7 +171,7 @@ int ObAiColumnWorkerTask::start(common::ObTimer &timer)
   } else if (timer.task_exist(*this)) {
     // ignore duplicate schedule
   } else if (OB_FAIL(timer.schedule(*this, OB_AI_WORKER_SCHEDULE_INTERVAL_US, did_repeat))) {
-    LOG_WARN("schedule ai column worker task failed", K(ret));
+    LOG_INFO("schedule ai column worker task failed", K(ret));
   } else {
     LOG_INFO("ai column worker task scheduled", K(OB_AI_WORKER_SCHEDULE_INTERVAL_US));
   }
@@ -217,9 +217,9 @@ void ObAiColumnWorkerTask::runTimerTask()
     // model calls may take seconds, use a large worker timeout
     ObTimeoutCtx ctx;
     if (OB_FAIL(ctx.set_timeout(OB_AI_WORKER_TIMEOUT_US))) {
-      LOG_WARN("set ai column worker timeout failed", K(ret));
+      LOG_INFO("set ai column worker timeout failed", K(ret));
     } else if (OB_FAIL(run_once_())) {
-      LOG_WARN("ai column worker tick failed", K(ret));
+      LOG_INFO("ai column worker tick failed", K(ret));
     }
   }
 }
@@ -232,7 +232,7 @@ int ObAiColumnWorkerTask::run_once_()
   } else if (!recovered_) {
     // first tick after start: requeue tasks stuck in EXECUTING by a crash
     if (OB_FAIL(recover_executing_tasks_())) {
-      LOG_WARN("recover executing ai column tasks failed", K(ret));
+      LOG_INFO("recover executing ai column tasks failed", K(ret));
     } else {
       recovered_ = true;
     }
@@ -243,7 +243,7 @@ int ObAiColumnWorkerTask::run_once_()
     common::ObArenaAllocator tick_alloc(ObModIds::OMT);
     ObSEArray<PolledTask, 16> tasks;
     if (OB_FAIL(poll_tasks_(tick_alloc, tasks))) {
-      LOG_WARN("poll ai column tasks failed", K(ret));
+      LOG_INFO("poll ai column tasks failed", K(ret));
     } else if (tasks.empty()) {
       // no eligible task
     } else {
@@ -276,14 +276,14 @@ int ObAiColumnWorkerTask::run_once_()
         ObSEArray<PolledTask *, 8> group_tasks;
         for (int64_t i = idx; OB_SUCC(ret) && i < end; ++i) {
           if (OB_FAIL(group_tasks.push_back(&tasks.at(i)))) {
-            LOG_WARN("push back polled task failed", K(ret));
+            LOG_INFO("push back polled task failed", K(ret));
           }
         }
         if (OB_SUCC(ret)) {
           ++processed;
           if (OB_FAIL(process_group_(tick_alloc, group_tasks))) {
             // one broken group must not stop the worker
-            LOG_WARN("process ai column group failed", K(ret), K(first.table_id_),
+            LOG_INFO("process ai column group failed", K(ret), K(first.table_id_),
                      K(first.request_id_));
             ret = OB_SUCCESS;
           }
@@ -303,14 +303,14 @@ int ObAiColumnWorkerTask::recover_executing_tasks_()
   ObMySQLProxy *proxy = GCTX.sql_proxy_;
   if (OB_ISNULL(proxy)) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("sql proxy is null", K(ret));
+    LOG_INFO("sql proxy is null", K(ret));
   } else if (OB_FAIL(sql.assign_fmt("UPDATE %s SET state = %ld WHERE state = %ld",
                                     OB_ALL_AI_COLUMN_TASK_TNAME,
                                     static_cast<int64_t>(OB_AI_TASK_STATE_PENDING),
                                     static_cast<int64_t>(OB_AI_TASK_STATE_EXECUTING)))) {
-    LOG_WARN("build recovery sql failed", K(ret));
+    LOG_INFO("build recovery sql failed", K(ret));
   } else if (OB_FAIL(proxy->write(sql.ptr(), affected))) {
-    LOG_WARN("recover executing ai column tasks failed", K(ret), K(sql.ptr()));
+    LOG_INFO("recover executing ai column tasks failed", K(ret), K(sql.ptr()));
   } else if (affected > 0) {
     LOG_INFO("recovered executing ai column tasks", K(affected));
   }
@@ -325,7 +325,7 @@ int ObAiColumnWorkerTask::poll_tasks_(common::ObIAllocator &alloc,
   ObMySQLProxy *proxy = GCTX.sql_proxy_;
   if (OB_ISNULL(proxy)) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("sql proxy is null", K(ret));
+    LOG_INFO("sql proxy is null", K(ret));
   } else if (OB_FAIL(sql.assign_fmt(
       "SELECT table_id, rowkey_hash, column_id, rowkey_predicate, request_id, state, "
       "retry_count, max_retries, def_version FROM %s "
@@ -335,15 +335,15 @@ int ObAiColumnWorkerTask::poll_tasks_(common::ObIAllocator &alloc,
       static_cast<int64_t>(OB_AI_TASK_STATE_PENDING),
       static_cast<int64_t>(OB_AI_TASK_STATE_RETRY_WAIT),
       OB_AI_WORKER_MAX_POLL_TASKS))) {
-    LOG_WARN("build poll sql failed", K(ret));
+    LOG_INFO("build poll sql failed", K(ret));
   } else {
     SMART_VAR(ObMySQLProxy::MySQLResult, res) {
       common::sqlclient::ObMySQLResult *result = nullptr;
       if (OB_FAIL(proxy->read(res, sql.ptr()))) {
-        LOG_WARN("poll ai column tasks failed", K(ret), K(sql.ptr()));
+        LOG_INFO("poll ai column tasks failed", K(ret), K(sql.ptr()));
       } else if (OB_ISNULL(result = res.get_result())) {
         ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("poll result is null", K(ret));
+        LOG_INFO("poll result is null", K(ret));
       } else {
         while (OB_SUCC(ret)) {
           const int tmp_ret = result->next();
@@ -351,7 +351,7 @@ int ObAiColumnWorkerTask::poll_tasks_(common::ObIAllocator &alloc,
             break;
           } else if (OB_SUCCESS != tmp_ret) {
             ret = tmp_ret;
-            LOG_WARN("iterate ai column task rows failed", K(ret));
+            LOG_INFO("iterate ai column task rows failed", K(ret));
           } else {
             PolledTask task;
             int64_t v = 0;
@@ -392,13 +392,13 @@ int ObAiColumnWorkerTask::poll_tasks_(common::ObIAllocator &alloc,
             // deep copy into the tick allocator, the result set goes away
             if (OB_SUCC(ret)) {
               if (OB_FAIL(ob_write_string(alloc, pred, task.rowkey_predicate_, true))) {
-                LOG_WARN("copy rowkey predicate failed", K(ret));
+                LOG_INFO("copy rowkey predicate failed", K(ret));
               } else if (OB_FAIL(ob_write_string(alloc, rid, task.request_id_, true))) {
-                LOG_WARN("copy request id failed", K(ret));
+                LOG_INFO("copy request id failed", K(ret));
               }
             }
             if (OB_SUCC(ret) && OB_FAIL(tasks.push_back(task))) {
-              LOG_WARN("push back polled task failed", K(ret));
+              LOG_INFO("push back polled task failed", K(ret));
             }
           }
         }
@@ -421,22 +421,22 @@ int ObAiColumnWorkerTask::load_group_tasks_(common::ObIAllocator &alloc,
   ObMySQLProxy *proxy = GCTX.sql_proxy_;
   if (OB_ISNULL(proxy)) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("sql proxy is null", K(ret));
+    LOG_INFO("sql proxy is null", K(ret));
   } else if (OB_FAIL(sql.assign_fmt(
       "SELECT rowkey_hash, column_id, rowkey_predicate, request_id, state, "
       "retry_count, max_retries, def_version FROM %s "
       "WHERE table_id = %lu AND request_id = '%.*s' AND state = %ld",
       OB_ALL_AI_COLUMN_TASK_TNAME, table_id, request_id.length(), request_id.ptr(),
       static_cast<int64_t>(OB_AI_TASK_STATE_EXECUTING)))) {
-    LOG_WARN("build group task sql failed", K(ret));
+    LOG_INFO("build group task sql failed", K(ret));
   } else {
     SMART_VAR(ObMySQLProxy::MySQLResult, res) {
       common::sqlclient::ObMySQLResult *result = nullptr;
       if (OB_FAIL(proxy->read(res, sql.ptr()))) {
-        LOG_WARN("load ai column group tasks failed", K(ret), K(sql.ptr()));
+        LOG_INFO("load ai column group tasks failed", K(ret), K(sql.ptr()));
       } else if (OB_ISNULL(result = res.get_result())) {
         ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("group task result is null", K(ret));
+        LOG_INFO("group task result is null", K(ret));
       } else {
         while (OB_SUCC(ret)) {
           const int tmp_ret = result->next();
@@ -444,7 +444,7 @@ int ObAiColumnWorkerTask::load_group_tasks_(common::ObIAllocator &alloc,
             break;
           } else if (OB_SUCCESS != tmp_ret) {
             ret = tmp_ret;
-            LOG_WARN("iterate ai column group tasks failed", K(ret));
+            LOG_INFO("iterate ai column group tasks failed", K(ret));
           } else {
             PolledTask task;
             task.table_id_ = table_id;
@@ -479,13 +479,13 @@ int ObAiColumnWorkerTask::load_group_tasks_(common::ObIAllocator &alloc,
             }
             if (OB_SUCC(ret)) {
               if (OB_FAIL(ob_write_string(alloc, pred, task.rowkey_predicate_, true))) {
-                LOG_WARN("copy rowkey predicate failed", K(ret));
+                LOG_INFO("copy rowkey predicate failed", K(ret));
               } else if (OB_FAIL(ob_write_string(alloc, request_id, task.request_id_, true))) {
-                LOG_WARN("copy request id failed", K(ret));
+                LOG_INFO("copy request id failed", K(ret));
               }
             }
             if (OB_SUCC(ret) && OB_FAIL(tasks.push_back(task))) {
-              LOG_WARN("push back group task failed", K(ret));
+              LOG_INFO("push back group task failed", K(ret));
             }
           }
         }
@@ -512,16 +512,16 @@ int ObAiColumnWorkerTask::process_group_(common::ObIAllocator &tick_alloc,
       void *buf = common::ob_malloc(sizeof(MemGroup), ObModIds::OMT);
       if (OB_ISNULL(buf)) {
         ret = OB_ALLOCATE_MEMORY_FAILED;
-        LOG_WARN("allocate ai column mem group failed", K(ret));
+        LOG_INFO("allocate ai column mem group failed", K(ret));
       } else if (FALSE_IT(group = new (buf) MemGroup())) {
       } else if (OB_FAIL(ob_write_string(group->alloc_, request_id, group->request_id_, true))) {
-        LOG_WARN("copy request id failed", K(ret));
+        LOG_INFO("copy request id failed", K(ret));
       } else if (OB_FAIL(ob_write_string(group->alloc_, tasks.at(0)->rowkey_predicate_,
                                          group->rowkey_predicate_, true))) {
-        LOG_WARN("copy rowkey predicate failed", K(ret));
+        LOG_INFO("copy rowkey predicate failed", K(ret));
       } else if (!mem_groups_.add_last(group)) {
         ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("add ai column mem group failed", K(ret));
+        LOG_INFO("add ai column mem group failed", K(ret));
       } else {
         group->table_id_ = table_id;
         created = true;
@@ -543,14 +543,14 @@ int ObAiColumnWorkerTask::process_group_(common::ObIAllocator &tick_alloc,
   if (OB_FAIL(ret)) {
     // fall through to the cleanup below
   } else if (OB_FAIL(claim_group_(table_id, request_id, affected))) {
-    LOG_WARN("claim ai column group failed", K(ret), K(table_id), K(request_id));
+    LOG_INFO("claim ai column group failed", K(ret), K(table_id), K(request_id));
   } else if (0 == affected) {
     // another worker owns the group, or the request was replaced while we
     // polled; a group without remaining task rows is finished elsewhere
     int64_t remaining = 0;
     const int tmp_ret = count_group_task_rows_(table_id, request_id, remaining);
     if (OB_SUCCESS != tmp_ret) {
-      LOG_WARN_RET(tmp_ret, "count remaining ai column task rows failed", K(tmp_ret), K(table_id),
+      LOG_INFO("count remaining ai column task rows failed", K(tmp_ret), K(table_id),
                    K(request_id));
     }
     lib::ObMutexGuard guard(mem_lock_);
@@ -562,6 +562,7 @@ int ObAiColumnWorkerTask::process_group_(common::ObIAllocator &tick_alloc,
     }
   } else {
     claimed = true;
+    LOG_INFO("ai column group claimed", K(table_id), K(affected), K(request_id));
   }
   if (OB_SUCC(ret) && !claimed) {
     return ret;  // the group is released (or freed) above
@@ -576,13 +577,13 @@ int ObAiColumnWorkerTask::process_group_(common::ObIAllocator &tick_alloc,
     // fall through to the cleanup below
   } else if (OB_FAIL(resolve_table_meta_(tick_alloc, table_id, table_exists, schema_version,
                                          names))) {
-    LOG_WARN("resolve ai column table meta failed", K(ret), K(table_id));
+    LOG_INFO("resolve ai column table meta failed", K(ret), K(table_id));
   } else if (!table_exists) {
     // the table is gone: drop the group's task rows and the in-memory group
     int64_t tmp_affected = 0;
     const int tmp_ret = delete_group_tasks_(table_id, request_id, tmp_affected);
     if (OB_SUCCESS != tmp_ret) {
-      LOG_WARN_RET(tmp_ret, "delete ai column task rows of dropped table failed", K(tmp_ret),
+      LOG_INFO("delete ai column task rows of dropped table failed", K(tmp_ret),
                    K(table_id), K(request_id));
     }
     lib::ObMutexGuard guard(mem_lock_);
@@ -592,13 +593,15 @@ int ObAiColumnWorkerTask::process_group_(common::ObIAllocator &tick_alloc,
     bool found = false;
     if (OB_FAIL(ObAiColumnCache::get_instance().get_table_items(
             table_id, schema_version, tick_alloc, items, found))) {
-      LOG_WARN("load ai column items failed", K(ret), K(table_id), K(schema_version));
+      LOG_INFO("load ai column items failed", K(ret), K(table_id), K(schema_version));
     } else if (!found || items.empty()) {
+      LOG_INFO("ai column group has no items", K(table_id), K(schema_version),
+               K(found), K(items.count()));
       // the table has no ai column any more: drop the group's task rows
       int64_t tmp_affected = 0;
       const int tmp_ret = delete_group_tasks_(table_id, request_id, tmp_affected);
       if (OB_SUCCESS != tmp_ret) {
-        LOG_WARN_RET(tmp_ret, "delete ai column task rows of dropped ai columns failed",
+        LOG_INFO("delete ai column task rows of dropped ai columns failed",
                      K(tmp_ret), K(table_id), K(request_id));
       }
       lib::ObMutexGuard guard(mem_lock_);
@@ -612,7 +615,7 @@ int ObAiColumnWorkerTask::process_group_(common::ObIAllocator &tick_alloc,
   ObSEArray<PolledTask, 8> exec_tasks;
   if (OB_SUCC(ret) && nullptr != group) {
     if (OB_FAIL(load_group_tasks_(tick_alloc, table_id, request_id, exec_tasks))) {
-      LOG_WARN("load ai column group tasks failed", K(ret), K(table_id), K(request_id));
+      LOG_INFO("load ai column group tasks failed", K(ret), K(table_id), K(request_id));
     } else if (exec_tasks.empty()) {
       // the task rows vanished (replaced request): nothing left to do
       lib::ObMutexGuard guard(mem_lock_);
@@ -623,7 +626,7 @@ int ObAiColumnWorkerTask::process_group_(common::ObIAllocator &tick_alloc,
         PolledTask &task = exec_tasks.at(i);
         if (OB_FAIL(execute_task_(tick_alloc, *group, task, names, items, row_deleted))) {
           // a broken task must not stop the group
-          LOG_WARN("execute ai column task failed", K(ret), K(table_id), K(request_id),
+          LOG_INFO("execute ai column task failed", K(ret), K(table_id), K(request_id),
                    K(task.column_id_));
           ret = OB_SUCCESS;
         }
@@ -638,7 +641,7 @@ int ObAiColumnWorkerTask::process_group_(common::ObIAllocator &tick_alloc,
     // they are not recomputed
     int tmp_ret = requeue_group_(table_id, request_id);
     if (OB_SUCCESS != tmp_ret) {
-      LOG_WARN_RET(tmp_ret, "requeue ai column group failed", K(tmp_ret), K(table_id),
+      LOG_INFO("requeue ai column group failed", K(tmp_ret), K(table_id),
                    K(request_id));
     }
     lib::ObMutexGuard guard(mem_lock_);
@@ -667,15 +670,17 @@ int ObAiColumnWorkerTask::process_group_(common::ObIAllocator &tick_alloc,
     if (!all_terminal) {
       // some member waits for its retry: keep the cached results of the
       // already succeeded members for the next tick
+      LOG_INFO("ai column group not terminal yet", K(table_id), "exec_cnt", exec_tasks.count(),
+               "group_cnt", group->tasks_.count());
       lib::ObMutexGuard guard(mem_lock_);
       group->processing_ = false;
     } else if (OB_FAIL(publish_group_(*group, names, items, affected))) {
-      LOG_WARN("publish ai column group failed", K(ret), K(table_id), K(request_id));
+      LOG_INFO("publish ai column group failed", K(ret), K(table_id), K(request_id));
       // give the whole group another chance in a later tick; the cached
       // results are dropped so that the members are recomputed
       int tmp_ret = requeue_group_(table_id, request_id);
       if (OB_SUCCESS != tmp_ret) {
-        LOG_WARN_RET(tmp_ret, "requeue ai column group failed", K(tmp_ret), K(table_id),
+        LOG_INFO("requeue ai column group failed", K(tmp_ret), K(table_id),
                      K(request_id));
       }
       lib::ObMutexGuard guard(mem_lock_);
@@ -701,9 +706,9 @@ int ObAiColumnWorkerTask::claim_group_(const uint64_t table_id,
   common::ObMySQLTransaction trans;
   if (OB_ISNULL(GCTX.sql_proxy_)) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("sql proxy is null", K(ret));
+    LOG_INFO("sql proxy is null", K(ret));
   } else if (OB_FAIL(trans.start(GCTX.sql_proxy_))) {
-    LOG_WARN("start trans failed", K(ret));
+    LOG_INFO("start trans failed", K(ret));
   } else if (OB_FAIL(sql.assign_fmt(
       "UPDATE %s SET state = %ld WHERE table_id = %lu AND request_id = '%.*s' AND state IN (%ld, %ld)",
       OB_ALL_AI_COLUMN_TASK_TNAME,
@@ -711,14 +716,14 @@ int ObAiColumnWorkerTask::claim_group_(const uint64_t table_id,
       table_id, request_id.length(), request_id.ptr(),
       static_cast<int64_t>(OB_AI_TASK_STATE_PENDING),
       static_cast<int64_t>(OB_AI_TASK_STATE_RETRY_WAIT)))) {
-    LOG_WARN("build claim sql failed", K(ret));
+    LOG_INFO("build claim sql failed", K(ret));
   } else if (OB_FAIL(trans.write(sql.ptr(), affected))) {
-    LOG_WARN("claim ai column tasks failed", K(ret), K(sql.ptr()));
+    LOG_INFO("claim ai column tasks failed", K(ret), K(sql.ptr()));
   }
   if (trans.is_started()) {
     int tmp_ret = OB_SUCCESS;
     if (OB_SUCCESS != (tmp_ret = trans.end(OB_SUCC(ret)))) {
-      LOG_WARN("end trans failed", K(tmp_ret));
+      LOG_INFO("end trans failed", K(tmp_ret));
       ret = OB_SUCC(ret) ? tmp_ret : ret;
     }
   }
@@ -738,12 +743,12 @@ int ObAiColumnWorkerTask::count_group_task_rows_(const uint64_t table_id,
   } else if (OB_FAIL(sql.assign_fmt(
       "SELECT count(*) AS cnt FROM %s WHERE table_id = %lu AND request_id = '%.*s'",
       OB_ALL_AI_COLUMN_TASK_TNAME, table_id, request_id.length(), request_id.ptr()))) {
-    LOG_WARN("build count sql failed", K(ret));
+    LOG_INFO("build count sql failed", K(ret));
   } else {
     SMART_VAR(ObMySQLProxy::MySQLResult, res) {
       common::sqlclient::ObMySQLResult *result = nullptr;
       if (OB_FAIL(proxy->read(res, sql.ptr()))) {
-        LOG_WARN("count ai column task rows failed", K(ret), K(sql.ptr()));
+        LOG_INFO("count ai column task rows failed", K(ret), K(sql.ptr()));
       } else if (OB_ISNULL(result = res.get_result())) {
         ret = OB_ERR_UNEXPECTED;
       } else {
@@ -752,7 +757,7 @@ int ObAiColumnWorkerTask::count_group_task_rows_(const uint64_t table_id,
           // no row: count stays 0
         } else if (OB_SUCCESS != tmp_ret) {
           ret = tmp_ret;
-          LOG_WARN("iterate count row failed", K(ret));
+          LOG_INFO("iterate count row failed", K(ret));
         } else {
           int64_t v = 0;
           EXTRACT_INT_FIELD_MYSQL(*result, "cnt", v, int64_t);
@@ -778,16 +783,16 @@ int ObAiColumnWorkerTask::resolve_table_meta_(common::ObIAllocator &alloc,
   const schema::ObDatabaseSchema *db_schema = nullptr;
   if (OB_ISNULL(GCTX.schema_service_)) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("schema service is null", K(ret));
+    LOG_INFO("schema service is null", K(ret));
   } else if (OB_FAIL(GCTX.schema_service_->get_runtime_schema_guard(guard))) {
-    LOG_WARN("get runtime schema guard failed", K(ret));
+    LOG_INFO("get runtime schema guard failed", K(ret));
   } else if (OB_FAIL(guard.get_schema_version(schema_version))) {
-    LOG_WARN("get schema version failed", K(ret));
+    LOG_INFO("get schema version failed", K(ret));
   } else if (OB_FAIL(guard.get_table_schema(table_id, table_schema))) {
     if (OB_TABLE_NOT_EXIST == ret) {
       ret = OB_SUCCESS;  // the table is gone
     } else {
-      LOG_WARN("get table schema failed", K(ret), K(table_id));
+      LOG_INFO("get table schema failed", K(ret), K(table_id));
     }
   } else if (OB_ISNULL(table_schema)) {
     // the table is gone
@@ -795,16 +800,16 @@ int ObAiColumnWorkerTask::resolve_table_meta_(common::ObIAllocator &alloc,
     if (OB_TABLE_NOT_EXIST == ret) {
       ret = OB_SUCCESS;  // the database is gone
     } else {
-      LOG_WARN("get database schema failed", K(ret), K(table_id));
+      LOG_INFO("get database schema failed", K(ret), K(table_id));
     }
   } else if (OB_ISNULL(db_schema)) {
     // the database is gone
   } else if (OB_FAIL(ob_write_string(alloc, db_schema->get_database_name_str(),
                                      names.db_name_, true))) {
-    LOG_WARN("copy database name failed", K(ret));
+    LOG_INFO("copy database name failed", K(ret));
   } else if (OB_FAIL(ob_write_string(alloc, table_schema->get_table_name_str(),
                                      names.table_name_, true))) {
-    LOG_WARN("copy table name failed", K(ret));
+    LOG_INFO("copy table name failed", K(ret));
   } else {
     table_exists = true;
   }
@@ -832,7 +837,7 @@ int ObAiColumnWorkerTask::execute_task_(common::ObIAllocator &tick_alloc, MemGro
   if (nullptr == item) {
     // the ai column was dropped while the task was in flight: record a
     // terminal failure so that the group can be published without it
-    LOG_WARN("ai column item not found, fail the task", K(task.column_id_), K(task.table_id_));
+    LOG_INFO("ai column item not found, fail the task", K(task.column_id_), K(task.table_id_));
     lib::ObMutexGuard guard(mem_lock_);
     if (nullptr == mem) {
       MemTask fresh;
@@ -840,7 +845,7 @@ int ObAiColumnWorkerTask::execute_task_(common::ObIAllocator &tick_alloc, MemGro
       fresh.status_ = MEM_TASK_FAILED;
       fresh.def_version_ = task.def_version_;
       if (OB_FAIL(group.tasks_.push_back(fresh))) {
-        LOG_WARN("push back mem task failed", K(ret));
+        LOG_INFO("push back mem task failed", K(ret));
       }
     } else {
       mem->status_ = MEM_TASK_FAILED;
@@ -859,7 +864,7 @@ int ObAiColumnWorkerTask::execute_task_(common::ObIAllocator &tick_alloc, MemGro
     if (OB_FAIL(read_user_prompt_(tick_alloc, names, *item, task.rowkey_predicate_,
                                   row_count, user_prompt))) {
       // infra failure: a failed attempt is recorded below
-      LOG_WARN("read ai prompt failed", K(ret), K(task.table_id_), K(task.column_id_));
+      LOG_INFO("read ai prompt failed", K(ret), K(task.table_id_), K(task.column_id_));
       ret = OB_SUCCESS;
     } else if (0 == row_count) {
       // the user row is gone: the whole group's task rows are dropped
@@ -867,11 +872,11 @@ int ObAiColumnWorkerTask::execute_task_(common::ObIAllocator &tick_alloc, MemGro
       int64_t tmp_affected = 0;
       const int tmp_ret = delete_group_tasks_(group.table_id_, group.request_id_, tmp_affected);
       if (OB_SUCCESS != tmp_ret) {
-        LOG_WARN_RET(tmp_ret, "delete ai column task rows of deleted row failed", K(tmp_ret),
+        LOG_INFO("delete ai column task rows of deleted row failed", K(tmp_ret),
                      K(group.table_id_), K(group.request_id_));
       }
     } else if (user_prompt.empty()) {
-      LOG_WARN("ai prompt is empty, fail the attempt", K(task.column_id_));
+      LOG_INFO("ai prompt is empty, fail the attempt", K(task.column_id_));
     } else {
       prompt_ok = true;
     }
@@ -884,14 +889,14 @@ int ObAiColumnWorkerTask::execute_task_(common::ObIAllocator &tick_alloc, MemGro
     } else if (!prompt_ok) {
       // failed attempt without a model call
     } else if (OB_FAIL(call_model_(tick_alloc, *item, user_prompt, output))) {
-      LOG_WARN("ai model call failed", K(ret), K(task.column_id_), K(item->model_name_));
+      LOG_INFO("ai model call failed", K(ret), K(task.column_id_), K(item->model_name_));
       ret = OB_SUCCESS;
     } else if (output.empty()) {
-      LOG_WARN("ai model output is empty", K(task.column_id_));
+      LOG_INFO("ai model output is empty", K(task.column_id_));
     } else {
       const int tmp_ret = validate_and_build_literal_(group.alloc_, *item, output, valid, literal);
       if (OB_SUCCESS != tmp_ret) {
-        LOG_WARN_RET(tmp_ret, "build ai output literal failed", K(tmp_ret), K(task.column_id_));
+        LOG_INFO("build ai output literal failed", K(tmp_ret), K(task.column_id_));
         valid = false;
       }
     }
@@ -899,12 +904,15 @@ int ObAiColumnWorkerTask::execute_task_(common::ObIAllocator &tick_alloc, MemGro
     if (!row_deleted && OB_SUCC(ret)) {
       // decide the outcome of the attempt
       bool terminal_fail = true;
+      LOG_INFO("ai column attempt outcome", K(task.column_id_), K(task.rowkey_hash_),
+               K(task.retry_count_), K(task.max_retries_), K(valid), K(prompt_ok),
+               "out_len", output.length());
       if (valid) {
         terminal_fail = false;
       } else if (task.retry_count_ < task.max_retries_) {
         terminal_fail = false;
         if (OB_FAIL(defer_retry_(task))) {
-          LOG_WARN("defer ai task retry failed", K(ret), K(task.column_id_));
+          LOG_INFO("defer ai task retry failed", K(ret), K(task.column_id_));
           terminal_fail = true;
           ret = OB_SUCCESS;
         }
@@ -915,7 +923,7 @@ int ObAiColumnWorkerTask::execute_task_(common::ObIAllocator &tick_alloc, MemGro
         MemTask fresh;
         fresh.column_id_ = task.column_id_;
         if (OB_FAIL(group.tasks_.push_back(fresh))) {
-          LOG_WARN("push back mem task failed", K(ret));
+          LOG_INFO("push back mem task failed", K(ret));
         } else {
           mem = group.find_task(task.column_id_);
         }
@@ -953,28 +961,28 @@ int ObAiColumnWorkerTask::read_user_prompt_(common::ObIAllocator &alloc, const T
   ObMySQLProxy *proxy = GCTX.sql_proxy_;
   if (OB_ISNULL(proxy)) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("sql proxy is null", K(ret));
+    LOG_INFO("sql proxy is null", K(ret));
   } else if (OB_FAIL(sql.assign_fmt("SELECT %.*s AS p FROM `%.*s`.`%.*s` WHERE %.*s",
                                     item.user_expr_.length(), item.user_expr_.ptr(),
                                     names.db_name_.length(), names.db_name_.ptr(),
                                     names.table_name_.length(), names.table_name_.ptr(),
                                     rowkey_predicate.length(), rowkey_predicate.ptr()))) {
-    LOG_WARN("build ai prompt sql failed", K(ret));
+    LOG_INFO("build ai prompt sql failed", K(ret));
   } else {
     SMART_VAR(ObMySQLProxy::MySQLResult, res) {
       common::sqlclient::ObMySQLResult *result = nullptr;
       if (OB_FAIL(proxy->read(res, sql.ptr()))) {
-        LOG_WARN("read ai prompt failed", K(ret), K(sql.ptr()));
+        LOG_INFO("read ai prompt failed", K(ret), K(sql.ptr()));
       } else if (OB_ISNULL(result = res.get_result())) {
         ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("prompt result is null", K(ret));
+        LOG_INFO("prompt result is null", K(ret));
       } else {
         const int tmp_ret = result->next();
         if (OB_ITER_END == tmp_ret) {
           // the user row is gone
         } else if (OB_SUCCESS != tmp_ret) {
           ret = tmp_ret;
-          LOG_WARN("iterate ai prompt row failed", K(ret));
+          LOG_INFO("iterate ai prompt row failed", K(ret));
         } else {
           row_count = 1;
           common::ObString val;
@@ -983,10 +991,10 @@ int ObAiColumnWorkerTask::read_user_prompt_(common::ObIAllocator &alloc, const T
               // NULL prompt: a failed attempt without a model call
               ret = OB_SUCCESS;
             } else {
-              LOG_WARN("get ai prompt value failed", K(ret));
+              LOG_INFO("get ai prompt value failed", K(ret));
             }
           } else if (OB_FAIL(ob_write_string(alloc, val, prompt, true))) {
-            LOG_WARN("copy ai prompt failed", K(ret));
+            LOG_INFO("copy ai prompt failed", K(ret));
           }
         }
       }
@@ -1050,7 +1058,7 @@ bool ObAiColumnWorkerTask::probe_endpoint_reachable_(const common::ObString &url
   if (host_len <= 0 || host_len >= static_cast<int64_t>(sizeof(host_buf)) || !port_ok
       || OB_ISNULL(p)) {
     // 该函数无 ret 变量，日志宏在此展开会引用 ret，改用无参形式
-    LOG_WARN_RET(OB_ERR_UNEXPECTED, "cannot parse ai endpoint url for the reachability probe", K(url));
+    LOG_INFO("cannot parse ai endpoint url for the reachability probe", K(url));
   } else {
     MEMCPY(host_buf, p + host_start, host_len);
     host_buf[host_len] = '\0';
@@ -1062,11 +1070,11 @@ bool ObAiColumnWorkerTask::probe_endpoint_reachable_(const common::ObString &url
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     if (0 != getaddrinfo(host_buf, port_buf, &hints, &addr) || OB_ISNULL(addr)) {
-      LOG_WARN_RET(OB_ERR_UNEXPECTED, "resolve ai endpoint host failed", K(host_buf));
+      LOG_INFO("resolve ai endpoint host failed", K(host_buf));
     } else {
       const int fd = socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
       if (fd < 0) {
-        LOG_WARN_RET(OB_ERR_UNEXPECTED, "create probe socket failed", K(errno));
+        LOG_INFO("create probe socket failed", K(errno));
       } else {
         const int flags = fcntl(fd, F_GETFL, 0);
         if (flags >= 0) {
@@ -1106,12 +1114,12 @@ int ObAiColumnWorkerTask::call_model_(common::ObIAllocator &alloc, const ObAICol
   ObAiModelEndpointInfo endpoint;
   if (OB_ISNULL(resolver)) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("ai endpoint resolver not bound", K(ret));
+    LOG_INFO("ai endpoint resolver not bound", K(ret));
   } else if (OB_FAIL(resolver->resolve_by_model_name(item.model_name_, alloc, endpoint))) {
-    LOG_WARN("resolve ai endpoint failed", K(ret), K(item.model_name_));
+    LOG_INFO("resolve ai endpoint failed", K(ret), K(item.model_name_));
   } else if (!probe_endpoint_reachable_(endpoint.get_url())) {
     ret = OB_CURL_ERROR;
-    LOG_WARN("ai endpoint is not reachable", K(ret), K(endpoint.get_url()));
+    LOG_INFO("ai endpoint is not reachable", K(ret), K(endpoint.get_url()));
   } else {
     // the request model name: endpoint override first, then the model schema
     common::ObString request_model_name = endpoint.get_request_model_name();
@@ -1119,7 +1127,7 @@ int ObAiColumnWorkerTask::call_model_(common::ObIAllocator &alloc, const ObAICol
       common::ObString resolved;
       if (OB_FAIL(query::ObAIModelResolver::resolve_model_name(alloc, item.model_name_,
                                                                resolved))) {
-        LOG_WARN("resolve ai model name failed", K(ret), K(item.model_name_));
+        LOG_INFO("resolve ai model name failed", K(ret), K(item.model_name_));
       } else {
         request_model_name = resolved;
       }
@@ -1128,7 +1136,7 @@ int ObAiColumnWorkerTask::call_model_(common::ObIAllocator &alloc, const ObAICol
     common::ObArray<common::ObString> headers;
     if (OB_FAIL(ret)) {
     } else if (OB_FAIL(endpoint.get_unencrypted_access_key(alloc, unencrypted_key))) {
-      LOG_WARN("get unencrypted access key failed", K(ret), K(item.model_name_));
+      LOG_INFO("get unencrypted access key failed", K(ret), K(item.model_name_));
     } else if (OB_AI_COL_FUNC_EMBED == item.func_type_) {
       ObAIFuncIEmbed *provider = nullptr;
       common::ObArray<common::ObString> contents;
@@ -1138,24 +1146,24 @@ int ObAiColumnWorkerTask::call_model_(common::ObIAllocator &alloc, const ObAICol
       ObAIFuncClient client;
       client.set_timeout_sec(OB_AI_WORKER_TIMEOUT_SEC);
       if (OB_FAIL(ObAIFuncUtils::get_embed_provider(alloc, endpoint.get_provider(), provider))) {
-        LOG_WARN("get embed provider failed", K(ret), K(endpoint.get_provider()));
+        LOG_INFO("get embed provider failed", K(ret), K(endpoint.get_provider()));
       } else if (OB_FAIL(contents.push_back(user_prompt))) {
-        LOG_WARN("push back embed content failed", K(ret));
+        LOG_INFO("push back embed content failed", K(ret));
       } else if (OB_FAIL(provider->get_header(alloc, unencrypted_key, headers))) {
-        LOG_WARN("get embed header failed", K(ret));
+        LOG_INFO("get embed header failed", K(ret));
       } else if (OB_FAIL(provider->get_body(alloc, request_model_name, contents, nullptr, body))) {
-        LOG_WARN("get embed body failed", K(ret));
+        LOG_INFO("get embed body failed", K(ret));
       } else if (OB_FAIL(client.send_post(alloc, endpoint.get_url(), headers, body, response))) {
-        LOG_WARN("ai embed request failed", K(ret), K(endpoint.get_url()));
+        LOG_INFO("ai embed request failed", K(ret), K(endpoint.get_url()));
       } else if (OB_FAIL(provider->parse_output(alloc, response, result_base))) {
-        LOG_WARN("parse ai embed output failed", K(ret));
+        LOG_INFO("parse ai embed output failed", K(ret));
       } else if (item.is_vector_ && item.vector_dim_ > 0
                  && OB_FAIL(ObAIFuncUtils::validate_embedding_vector(result_base,
                                                                      item.vector_dim_))) {
-        LOG_WARN("embedding vector does not match the column dimension", K(ret),
+        LOG_INFO("embedding vector does not match the column dimension", K(ret),
                  K(item.vector_dim_));
       } else if (OB_FAIL(ObAIFuncJsonUtils::print_json_to_str(alloc, result_base, output))) {
-        LOG_WARN("print ai embed output failed", K(ret));
+        LOG_INFO("print ai embed output failed", K(ret));
       }
     } else {
       ObAIFuncIComplete *provider = nullptr;
@@ -1172,18 +1180,18 @@ int ObAiColumnWorkerTask::call_model_(common::ObIAllocator &alloc, const ObAICol
       client.set_timeout_sec(OB_AI_WORKER_TIMEOUT_SEC);
       if (OB_FAIL(ObAIFuncUtils::get_complete_provider(alloc, endpoint.get_provider(),
                                                        provider))) {
-        LOG_WARN("get complete provider failed", K(ret), K(endpoint.get_provider()));
+        LOG_INFO("get complete provider failed", K(ret), K(endpoint.get_provider()));
       } else if (OB_FAIL(provider->get_header(alloc, unencrypted_key, headers))) {
-        LOG_WARN("get complete header failed", K(ret));
+        LOG_INFO("get complete header failed", K(ret));
       } else if (OB_FAIL(provider->get_body(alloc, request_model_name, system_prompt_str,
                                             user_prompt_str, nullptr, body))) {
-        LOG_WARN("get complete body failed", K(ret));
+        LOG_INFO("get complete body failed", K(ret));
       } else if (OB_FAIL(client.send_post(alloc, endpoint.get_url(), headers, body, response))) {
-        LOG_WARN("ai complete request failed", K(ret), K(endpoint.get_url()));
+        LOG_INFO("ai complete request failed", K(ret), K(endpoint.get_url()));
       } else if (OB_FAIL(provider->parse_output(alloc, response, result_base))) {
-        LOG_WARN("parse ai complete output failed", K(ret));
+        LOG_INFO("parse ai complete output failed", K(ret));
       } else if (OB_FAIL(ObAIFuncJsonUtils::print_json_to_str(alloc, result_base, output))) {
-        LOG_WARN("print ai complete output failed", K(ret));
+        LOG_INFO("print ai complete output failed", K(ret));
       }
     }
   }
@@ -1203,29 +1211,29 @@ int ObAiColumnWorkerTask::validate_and_build_literal_(common::ObIAllocator &allo
   if (OB_AI_COL_FUNC_EMBED == item.func_type_) {
     // the printed embedding array is the bare bracket vector literal
     if (OB_FAIL(lit_buf.assign(output.ptr(), output.length()))) {
-      LOG_WARN("assign vector literal failed", K(ret));
+      LOG_INFO("assign vector literal failed", K(ret));
     } else {
       valid = true;
     }
   } else if (0 == type_str.case_compare("JSON")) {
     ObJsonNode *j_tree = nullptr;
     if (OB_ISNULL(output.ptr()) || output.empty()) {
-      LOG_WARN("empty ai output for a json result column", K(item.column_id_));
+      LOG_INFO("empty ai output for a json result column", K(item.column_id_));
     } else if (OB_FAIL(ObJsonParser::get_tree(&alloc, output, j_tree))) {
-      LOG_WARN("ai output is not a valid json value", K(ret), K(output));
+      LOG_INFO("ai output is not a valid json value", K(ret), K(output));
       ret = OB_SUCCESS;  // validation failure, not an infra failure
     } else {
       valid = true;
     }
     if (valid && OB_FAIL(sql_append_hex_escape_str(output, lit_buf))) {
-      LOG_WARN("escape json literal failed", K(ret));
+      LOG_INFO("escape json literal failed", K(ret));
     }
   } else if (is_integer_result_type(type_str)) {
     common::ObString trimmed;
     trim_sql_whitespace(output, trimmed);
     char buf[64];
     if (trimmed.empty() || trimmed.length() >= static_cast<int64_t>(sizeof(buf))) {
-      LOG_WARN("ai output is not a valid integer", K(item.column_id_), K(output));
+      LOG_INFO("ai output is not a valid integer", K(item.column_id_), K(output));
     } else {
       MEMCPY(buf, trimmed.ptr(), trimmed.length());
       buf[trimmed.length()] = '\0';
@@ -1233,9 +1241,9 @@ int ObAiColumnWorkerTask::validate_and_build_literal_(common::ObIAllocator &allo
       char *end = nullptr;
       const long long value = strtoll(buf, &end, 10);
       if (buf == end || nullptr == end || '\0' != *end || ERANGE == errno) {
-        LOG_WARN("ai output is not a valid integer", K(item.column_id_), K(output));
+        LOG_INFO("ai output is not a valid integer", K(item.column_id_), K(output));
       } else if (OB_FAIL(lit_buf.append_fmt("%lld", value))) {
-        LOG_WARN("append integer literal failed", K(ret));
+        LOG_INFO("append integer literal failed", K(ret));
       } else {
         valid = true;
       }
@@ -1252,7 +1260,7 @@ int ObAiColumnWorkerTask::validate_and_build_literal_(common::ObIAllocator &allo
           || 'e' == c || 'E' == c;
     }
     if (!numeric_chars) {
-      LOG_WARN("ai output is not a valid number", K(item.column_id_), K(output));
+      LOG_INFO("ai output is not a valid number", K(item.column_id_), K(output));
     } else {
       MEMCPY(buf, trimmed.ptr(), trimmed.length());
       buf[trimmed.length()] = '\0';
@@ -1260,9 +1268,9 @@ int ObAiColumnWorkerTask::validate_and_build_literal_(common::ObIAllocator &allo
       char *end = nullptr;
       const double value = strtod(buf, &end);
       if (buf == end || nullptr == end || '\0' != *end || ERANGE == errno || !isfinite(value)) {
-        LOG_WARN("ai output is not a valid number", K(item.column_id_), K(output));
+        LOG_INFO("ai output is not a valid number", K(item.column_id_), K(output));
       } else if (OB_FAIL(lit_buf.assign(trimmed.ptr(), trimmed.length()))) {
-        LOG_WARN("assign number literal failed", K(ret));
+        LOG_INFO("assign number literal failed", K(ret));
       } else {
         valid = true;
       }
@@ -1271,14 +1279,14 @@ int ObAiColumnWorkerTask::validate_and_build_literal_(common::ObIAllocator &allo
     // VARCHAR and the date/time types: publish as-is, the UPDATE cast of the
     // result column validates the value
     if (OB_FAIL(sql_append_hex_escape_str(output, lit_buf))) {
-      LOG_WARN("escape string literal failed", K(ret));
+      LOG_INFO("escape string literal failed", K(ret));
     } else {
       valid = true;
     }
   }
   if (OB_SUCC(ret) && valid) {
     if (OB_FAIL(ob_write_string(alloc, lit_buf.string(), literal))) {
-      LOG_WARN("copy result literal failed", K(ret));
+      LOG_INFO("copy result literal failed", K(ret));
     }
   }
   return ret;
@@ -1291,23 +1299,23 @@ int ObAiColumnWorkerTask::defer_retry_(PolledTask &task)
   common::ObMySQLTransaction trans;
   if (OB_ISNULL(GCTX.sql_proxy_)) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("sql proxy is null", K(ret));
+    LOG_INFO("sql proxy is null", K(ret));
   } else if (OB_FAIL(trans.start(GCTX.sql_proxy_))) {
-    LOG_WARN("start trans failed", K(ret));
+    LOG_INFO("start trans failed", K(ret));
   } else if (OB_FAIL(sql.assign_fmt(
       "UPDATE %s SET state = %ld, retry_count = retry_count + 1, "
       "eligible_ts = DATE_ADD(now(6), INTERVAL %ld MICROSECOND) "
-      "WHERE table_id = %lu AND rowkey_hash = %lu AND column_id = %lu AND request_id = '%.*s'",
+      "WHERE table_id = %lu AND rowkey_hash = %ld AND column_id = %lu AND request_id = '%.*s'",
       OB_ALL_AI_COLUMN_TASK_TNAME,
       static_cast<int64_t>(OB_AI_TASK_STATE_RETRY_WAIT),
       OB_AI_WORKER_RETRY_INTERVAL_US,
-      task.table_id_, task.rowkey_hash_, task.column_id_,
+      task.table_id_, static_cast<int64_t>(task.rowkey_hash_), task.column_id_,
       task.request_id_.length(), task.request_id_.ptr()))) {
-    LOG_WARN("build retry sql failed", K(ret));
+    LOG_INFO("build retry sql failed", K(ret));
   } else {
     int64_t affected = 0;
     if (OB_FAIL(trans.write(sql.ptr(), affected))) {
-      LOG_WARN("defer ai task retry failed", K(ret), K(sql.ptr()));
+      LOG_INFO("defer ai task retry failed", K(ret), K(sql.ptr()));
     } else if (0 == affected) {
       // the task row was replaced while we were working on it
       LOG_INFO("ai task row vanished before the retry was recorded",
@@ -1317,7 +1325,7 @@ int ObAiColumnWorkerTask::defer_retry_(PolledTask &task)
   if (trans.is_started()) {
     int tmp_ret = OB_SUCCESS;
     if (OB_SUCCESS != (tmp_ret = trans.end(OB_SUCC(ret)))) {
-      LOG_WARN("end trans failed", K(tmp_ret));
+      LOG_INFO("end trans failed", K(tmp_ret));
       ret = OB_SUCC(ret) ? tmp_ret : ret;
     }
   }
@@ -1335,11 +1343,11 @@ int ObAiColumnWorkerTask::publish_group_(MemGroup &group, const TableName &names
   bool published = false;  // whether at least one member contributes a SET/WHERE part
   if (OB_ISNULL(GCTX.sql_proxy_)) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("sql proxy is null", K(ret));
+    LOG_INFO("sql proxy is null", K(ret));
   } else if (OB_FAIL(sql.assign_fmt("UPDATE `%.*s`.`%.*s` SET ",
                                     names.db_name_.length(), names.db_name_.ptr(),
                                     names.table_name_.length(), names.table_name_.ptr()))) {
-    LOG_WARN("build publish sql head failed", K(ret));
+    LOG_INFO("build publish sql head failed", K(ret));
   } else {
     // SET clauses of every member with a live column definition
     bool first = true;
@@ -1352,7 +1360,7 @@ int ObAiColumnWorkerTask::publish_group_(MemGroup &group, const TableName &names
       }
       published = true;
       if (!first && OB_FAIL(sql.append(", "))) {
-        LOG_WARN("append set separator failed", K(ret));
+        LOG_INFO("append set separator failed", K(ret));
       }
       first = false;
       if (OB_SUCC(ret)) {
@@ -1360,13 +1368,13 @@ int ObAiColumnWorkerTask::publish_group_(MemGroup &group, const TableName &names
           if (OB_FAIL(sql.append_fmt("`%.*s` = NULL",
                                      item->result_column_name_.length(),
                                      item->result_column_name_.ptr()))) {
-            LOG_WARN("append null result failed", K(ret));
+            LOG_INFO("append null result failed", K(ret));
           }
         } else if (OB_FAIL(sql.append_fmt("`%.*s` = ",
                                           item->result_column_name_.length(),
                                           item->result_column_name_.ptr()))
                    || OB_FAIL(sql.append(mem.result_))) {
-          LOG_WARN("append result literal failed", K(ret));
+          LOG_INFO("append result literal failed", K(ret));
         }
       }
       if (OB_SUCC(ret)) {
@@ -1379,12 +1387,19 @@ int ObAiColumnWorkerTask::publish_group_(MemGroup &group, const TableName &names
                                    item->result_spec_column_name_.length(),
                                    item->result_spec_column_name_.ptr(),
                                    mem.def_version_))) {
-          LOG_WARN("append state and spec failed", K(ret));
+          LOG_INFO("append state and spec failed", K(ret));
         }
       }
     }
-    // the request columns guard the publish against stale results of a
-    // replaced request
+    // the rowkey predicate opens the WHERE clause; the request columns guard
+    // the publish against stale results of a replaced request
+    if (OB_SUCC(ret) && published) {
+      if (OB_FAIL(sql.append_fmt(" WHERE %.*s",
+                                 group.rowkey_predicate_.length(),
+                                 group.rowkey_predicate_.ptr()))) {
+        LOG_INFO("append rowkey predicate failed", K(ret));
+      }
+    }
     for (int64_t i = 0; OB_SUCC(ret) && published && i < group.tasks_.count(); ++i) {
       MemTask &mem = group.tasks_.at(i);
       const ObAIColumnItem *item = find_item_(items, mem.column_id_);
@@ -1396,24 +1411,20 @@ int ObAiColumnWorkerTask::publish_group_(MemGroup &group, const TableName &names
                                  item->request_column_name_.ptr(),
                                  group.request_id_.length(),
                                  group.request_id_.ptr()))) {
-        LOG_WARN("append request guard failed", K(ret));
-      }
-    }
-    if (OB_SUCC(ret) && published) {
-      if (OB_FAIL(sql.append_fmt(" WHERE %.*s",
-                                 group.rowkey_predicate_.length(),
-                                 group.rowkey_predicate_.ptr()))) {
-        LOG_WARN("append rowkey predicate failed", K(ret));
+        LOG_INFO("append request guard failed", K(ret));
       }
     }
   }
   if (OB_FAIL(ret)) {
   } else if (OB_FAIL(trans.start(GCTX.sql_proxy_))) {
-    LOG_WARN("start trans failed", K(ret));
+    LOG_INFO("start trans failed", K(ret));
   } else {
     if (published) {
       if (OB_FAIL(trans.write(sql.ptr(), affected))) {
-        LOG_WARN("publish ai column results failed", K(ret), K(sql.ptr()));
+        LOG_INFO("publish ai column results failed", K(ret), K(sql.ptr()));
+      } else {
+        LOG_INFO("ai column publish write", K(group.table_id_), K(group.request_id_),
+                 K(affected), K(sql.ptr()));
       }
     }
     if (OB_SUCC(ret)) {
@@ -1426,9 +1437,9 @@ int ObAiColumnWorkerTask::publish_group_(MemGroup &group, const TableName &names
           "DELETE FROM %s WHERE table_id = %lu AND request_id = '%.*s'",
           OB_ALL_AI_COLUMN_TASK_TNAME, group.table_id_,
           group.request_id_.length(), group.request_id_.ptr()))) {
-        LOG_WARN("build task delete sql failed", K(ret));
+        LOG_INFO("build task delete sql failed", K(ret));
       } else if (OB_FAIL(trans.write(del_sql.ptr(), del_affected))) {
-        LOG_WARN("delete ai column task rows failed", K(ret), K(del_sql.ptr()));
+        LOG_INFO("delete ai column task rows failed", K(ret), K(del_sql.ptr()));
       } else {
         LOG_TRACE("ai column group published", K(group.table_id_), K(group.request_id_),
                   K(affected));
@@ -1438,7 +1449,7 @@ int ObAiColumnWorkerTask::publish_group_(MemGroup &group, const TableName &names
   if (trans.is_started()) {
     int tmp_ret = OB_SUCCESS;
     if (OB_SUCCESS != (tmp_ret = trans.end(OB_SUCC(ret)))) {
-      LOG_WARN("end trans failed", K(tmp_ret));
+      LOG_INFO("end trans failed", K(tmp_ret));
       ret = OB_SUCC(ret) ? tmp_ret : ret;
     }
   }
@@ -1454,24 +1465,24 @@ int ObAiColumnWorkerTask::requeue_group_(const uint64_t table_id,
   if (OB_ISNULL(GCTX.sql_proxy_)) {
     ret = OB_ERR_UNEXPECTED;
   } else if (OB_FAIL(trans.start(GCTX.sql_proxy_))) {
-    LOG_WARN("start trans failed", K(ret));
+    LOG_INFO("start trans failed", K(ret));
   } else if (OB_FAIL(sql.assign_fmt(
       "UPDATE %s SET state = %ld WHERE table_id = %lu AND request_id = '%.*s' AND state = %ld",
       OB_ALL_AI_COLUMN_TASK_TNAME,
       static_cast<int64_t>(OB_AI_TASK_STATE_PENDING),
       table_id, request_id.length(), request_id.ptr(),
       static_cast<int64_t>(OB_AI_TASK_STATE_EXECUTING)))) {
-    LOG_WARN("build requeue sql failed", K(ret));
+    LOG_INFO("build requeue sql failed", K(ret));
   } else {
     int64_t affected = 0;
     if (OB_FAIL(trans.write(sql.ptr(), affected))) {
-      LOG_WARN("requeue ai column group failed", K(ret), K(sql.ptr()));
+      LOG_INFO("requeue ai column group failed", K(ret), K(sql.ptr()));
     }
   }
   if (trans.is_started()) {
     int tmp_ret = OB_SUCCESS;
     if (OB_SUCCESS != (tmp_ret = trans.end(OB_SUCC(ret)))) {
-      LOG_WARN("end trans failed", K(tmp_ret));
+      LOG_INFO("end trans failed", K(tmp_ret));
       ret = OB_SUCC(ret) ? tmp_ret : ret;
     }
   }
@@ -1488,20 +1499,20 @@ int ObAiColumnWorkerTask::delete_group_tasks_(const uint64_t table_id,
   common::ObMySQLTransaction trans;
   if (OB_ISNULL(GCTX.sql_proxy_)) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("sql proxy is null", K(ret));
+    LOG_INFO("sql proxy is null", K(ret));
   } else if (OB_FAIL(trans.start(GCTX.sql_proxy_))) {
-    LOG_WARN("start trans failed", K(ret));
+    LOG_INFO("start trans failed", K(ret));
   } else if (OB_FAIL(sql.assign_fmt(
       "DELETE FROM %s WHERE table_id = %lu AND request_id = '%.*s'",
       OB_ALL_AI_COLUMN_TASK_TNAME, table_id, request_id.length(), request_id.ptr()))) {
-    LOG_WARN("build task delete sql failed", K(ret));
+    LOG_INFO("build task delete sql failed", K(ret));
   } else if (OB_FAIL(trans.write(sql.ptr(), affected))) {
-    LOG_WARN("delete ai column task rows failed", K(ret), K(sql.ptr()));
+    LOG_INFO("delete ai column task rows failed", K(ret), K(sql.ptr()));
   }
   if (trans.is_started()) {
     int tmp_ret = OB_SUCCESS;
     if (OB_SUCCESS != (tmp_ret = trans.end(OB_SUCC(ret)))) {
-      LOG_WARN("end trans failed", K(tmp_ret));
+      LOG_INFO("end trans failed", K(tmp_ret));
       ret = OB_SUCC(ret) ? tmp_ret : ret;
     }
   }
@@ -1592,7 +1603,7 @@ int ObAiColumnWorkerService::init()
   if (OB_UNLIKELY(inited_)) {
     ret = OB_INIT_TWICE;
   } else if (OB_FAIL(task_.init())) {
-    LOG_WARN("init ai column worker task failed", K(ret));
+    LOG_INFO("init ai column worker task failed", K(ret));
   } else {
     inited_ = true;
   }
@@ -1606,11 +1617,11 @@ int ObAiColumnWorkerService::start()
     ret = OB_NOT_INIT;
   } else if (!timer_.inited()
              && OB_FAIL(timer_.init("AiColumnWorker", common::ObMemAttr("AiColumnWorker")))) {
-    LOG_WARN("init ai column worker timer failed", K(ret));
+    LOG_INFO("init ai column worker timer failed", K(ret));
   } else if (OB_FAIL(timer_.start())) {
-    LOG_WARN("start ai column worker timer failed", K(ret));
+    LOG_INFO("start ai column worker timer failed", K(ret));
   } else if (OB_FAIL(task_.start(timer_))) {
-    LOG_WARN("start ai column worker task failed", K(ret));
+    LOG_INFO("start ai column worker task failed", K(ret));
   }
   return ret;
 }

@@ -610,6 +610,12 @@ int ObAIColumnDMLHelper::check_table_has_ai_columns(ObTableModifyOp &op, bool &h
   has_ai_columns = false;
   const ObDMLBaseCtDef *dml_ctdef = nullptr;
   int tmp_ret = op.get_spec().get_single_dml_ctdef(dml_ctdef);
+  LOG_INFO("ai column check entry", K(tmp_ret), KP(dml_ctdef),
+           "is_primary", (nullptr == dml_ctdef) ? -1 : (int64_t)dml_ctdef->is_primary_index_,
+           "no_pk", (nullptr == dml_ctdef) ? -1 : (int64_t)dml_ctdef->is_table_without_pk_,
+           "tid", (nullptr == dml_ctdef) ? 0 : (int64_t)dml_ctdef->das_base_ctdef_.table_id_,
+           "index_tid", (nullptr == dml_ctdef) ? 0 : (int64_t)dml_ctdef->das_base_ctdef_.index_tid_,
+           "ctdef_cols", (nullptr == dml_ctdef) ? 0 : (int64_t)dml_ctdef->column_ids_.count());
   if (OB_SUCCESS != tmp_ret || OB_ISNULL(dml_ctdef)) {
     // multi table DML or the spec does not support the interface: no AI
     // linkage here, and this is not an error for ordinary DML.
@@ -617,7 +623,10 @@ int ObAIColumnDMLHelper::check_table_has_ai_columns(ObTableModifyOp &op, bool &h
     // only the primary table ctdef of a table with primary key carries the
     // AI result columns
   } else {
-    const uint64_t table_id = dml_ctdef->das_base_ctdef_.table_id_;
+    // das_base_ctdef_.table_id_ is not filled for the local DML code path;
+    // index_tid_ carries the real table id of the primary index (which equals
+    // the data table id for the primary table ctdef)
+    const uint64_t table_id = dml_ctdef->das_base_ctdef_.index_tid_;
     schema::ObSchemaGetterGuard *guard = nullptr;
     int64_t schema_version = 0;
     ObArenaAllocator alloc(ObModIds::OB_MODULE_PAGE_ALLOCATOR,
@@ -631,10 +640,18 @@ int ObAIColumnDMLHelper::check_table_has_ai_columns(ObTableModifyOp &op, bool &h
       ret = OB_SUCCESS;
       LOG_WARN("get schema version for ai column check failed",
                K(ret), K(table_id));
-    } else if (OB_FAIL(load_ai_table_ctx(*guard, table_id, schema_version, alloc, table_ctx))) {
-      LOG_WARN("load ai table ctx failed", K(ret), K(table_id), K(schema_version));
     } else {
-      has_ai_columns = table_ctx.found_;
+      // never fail the DML because of the AI linkage: during bootstrap the
+      // system table may not exist yet, and a broken check must not break
+      // ordinary inserts/updates
+      int load_ret = load_ai_table_ctx(*guard, table_id, schema_version, alloc, table_ctx);
+      if (OB_SUCCESS != load_ret) {
+        LOG_WARN("load ai table ctx failed", K(load_ret), K(table_id), K(schema_version));
+      } else {
+        has_ai_columns = table_ctx.found_;
+        LOG_INFO("ai column check result", K(table_id), K(schema_version),
+                 K(has_ai_columns), K(table_ctx.items_.count()));
+      }
     }
   }
   return ret;
@@ -643,6 +660,7 @@ int ObAIColumnDMLHelper::check_table_has_ai_columns(ObTableModifyOp &op, bool &h
 int ObAIColumnDMLHelper::process_after_rows(ObTableModifyOp &op, ObDMLModifyRowsList &rows)
 {
   int ret = OB_SUCCESS;
+  LOG_INFO("ai column after rows entry", K(rows.size()), K(op.has_ai_columns_));
   if (rows.empty() || !op.has_ai_columns_) {
     // hot path: the table has no AI column (or nothing was modified)
   } else if (ObSQLUtils::is_nested_sql(&op.get_exec_ctx())) {
@@ -669,9 +687,12 @@ int ObAIColumnDMLHelper::process_after_rows(ObTableModifyOp &op, ObDMLModifyRows
           LOG_WARN("get schema guard failed", K(ret));
         } else if (OB_FAIL(guard->get_schema_version(schema_version))) {
           LOG_WARN("get schema version failed", K(ret));
-        } else if (OB_FAIL(load_ai_table_ctx(*guard, row.dml_ctdef_->das_base_ctdef_.table_id_,
-                                             schema_version, alloc, table_ctx))) {
-          LOG_WARN("load ai table ctx failed", K(ret));
+        } else {
+          int load_ret = load_ai_table_ctx(*guard, row.dml_ctdef_->das_base_ctdef_.index_tid_,
+                                           schema_version, alloc, table_ctx);
+          if (OB_SUCCESS != load_ret) {
+            LOG_WARN("load ai table ctx failed", K(load_ret));
+          }
         }
       }
     }

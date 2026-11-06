@@ -251,20 +251,36 @@ int ObAiColumnCache::load_table_items(const uint64_t table_id, const int64_t sch
             } else {
               ObAIColumnItem item;
               item.table_id_ = table_id;
-              item.schema_version_ = cur_version;
+              // tag the cached items with the schema version the caller asked
+              // for, so the entry always matches the lookup that loaded it
+              item.schema_version_ = schema_version;
               int64_t v = 0;
+              common::ObString tmp_str;
               EXTRACT_INT_FIELD_MYSQL(*result, "column_id", v, int64_t);
               item.column_id_ = v;
-              EXTRACT_VARCHAR_FIELD_MYSQL(*result, "column_name", item.column_name_);
+              // the extracted strings point into the result buffer, which is
+              // released when this read finishes: every string kept in the
+              // cache must be deep copied into the cache allocator
+              EXTRACT_VARCHAR_FIELD_MYSQL(*result, "column_name", tmp_str);
+              if (OB_SUCC(ret) && OB_FAIL(ob_write_string(*cache_alloc_, tmp_str,
+                                                          item.column_name_))) {
+                LOG_WARN("copy column name failed", K(ret));
+              }
               if (OB_SUCC(ret)) {
                 EXTRACT_INT_FIELD_MYSQL(*result, "func_type", v, int64_t);
                 item.func_type_ = v;
               }
               if (OB_SUCC(ret)) {
-                EXTRACT_VARCHAR_FIELD_MYSQL(*result, "model_name", item.model_name_);
+                EXTRACT_VARCHAR_FIELD_MYSQL(*result, "model_name", tmp_str);
+                if (OB_FAIL(ob_write_string(*cache_alloc_, tmp_str, item.model_name_))) {
+                  LOG_WARN("copy model name failed", K(ret));
+                }
               }
               if (OB_SUCC(ret)) {
-                EXTRACT_VARCHAR_FIELD_MYSQL(*result, "sync_mode", item.sync_mode_);
+                EXTRACT_VARCHAR_FIELD_MYSQL(*result, "sync_mode", tmp_str);
+                if (OB_FAIL(ob_write_string(*cache_alloc_, tmp_str, item.sync_mode_))) {
+                  LOG_WARN("copy sync mode failed", K(ret));
+                }
               }
               if (OB_SUCC(ret)) {
                 EXTRACT_INT_FIELD_MYSQL(*result, "max_retries", v, int64_t);
@@ -275,10 +291,16 @@ int ObAiColumnCache::load_table_items(const uint64_t table_id, const int64_t sch
                 item.def_version_ = v;
               }
               if (OB_SUCC(ret)) {
-                EXTRACT_VARCHAR_FIELD_MYSQL(*result, "user_expr", item.user_expr_);
+                EXTRACT_VARCHAR_FIELD_MYSQL(*result, "user_expr", tmp_str);
+                if (OB_FAIL(ob_write_string(*cache_alloc_, tmp_str, item.user_expr_))) {
+                  LOG_WARN("copy user expr failed", K(ret));
+                }
               }
               if (OB_SUCC(ret)) {
-                EXTRACT_VARCHAR_FIELD_MYSQL(*result, "normalized_expr", item.normalized_expr_);
+                EXTRACT_VARCHAR_FIELD_MYSQL(*result, "normalized_expr", tmp_str);
+                if (OB_FAIL(ob_write_string(*cache_alloc_, tmp_str, item.normalized_expr_))) {
+                  LOG_WARN("copy normalized expr failed", K(ret));
+                }
               }
               if (OB_SUCC(ret)) {
                 common::ObString dep_str;

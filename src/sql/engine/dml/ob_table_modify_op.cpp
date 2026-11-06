@@ -639,6 +639,9 @@ int ObTableModifyOp::inner_open()
 {
   int ret = OB_SUCCESS;
   ObSQLSessionInfo *my_session = GET_MY_SESSION(ctx_);
+  LOG_INFO("table modify inner open entry", "op_type", (int64_t)MY_SPEC.type_,
+           "use_dist_das", (int64_t)MY_SPEC.use_dist_das_,
+           "nested", (int64_t)MY_SPEC.plan_->has_nested_sql());
   if (OB_FAIL(init_foreign_key_operation())) {
   } else if (MY_SPEC.plan_->has_nested_sql() && OB_FAIL(open_inner_conn())) {
   } else if (OB_FAIL(calc_single_table_loc())) {
@@ -647,6 +650,7 @@ int ObTableModifyOp::inner_open()
   } else {
     init_das_dml_ctx();
   }
+  LOG_INFO("table modify inner open done", K(ret), K(has_ai_columns_));
   return ret;
 }
 
