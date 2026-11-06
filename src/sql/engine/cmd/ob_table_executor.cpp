@@ -18,6 +18,7 @@
 #include "config_bridge.h"
 #include "common/ob_timeout_ctx.h"
 #include "lib/stat/ob_diagnostic_info_guard.h"
+#include "common/mysqlclient/ob_mysql_proxy.h"
 #include "share/ob_server_struct.h"
 #include "sql/engine/cmd/ob_table_executor.h"
 #include "query/command/ob_root_command_service.h"
@@ -924,30 +925,19 @@ static int execute_ai_column_retry(ObExecContext &ctx, obcall::ObAlterTableArg &
       SQL_ENG_LOG(WARN, "build task table name failed", K(ret));
     }
   }
-  common::sqlclient::ObISQLConnectionGuard conn_guard;
-  common::sqlclient::ObISQLConnection *conn = NULL;
   ObArray<ObString> preds;  // deep copied rowkey predicates, NUL terminated
-  // mark the statements spawned below as engine maintenance SQL (same pattern
-  // as ObAIColumnDMLHelper): they are allowed to assign the AI columns
-  // directly and must not re-enter the AI DML linkage
-  const bool save_is_fk_cascading = ctx.get_das_ctx().is_fk_cascading_;
-  const bool save_in_ignore_cascading = ctx.get_das_ctx().in_ignore_cascading_;
-  ctx.get_das_ctx().is_fk_cascading_ = true;
-  ctx.get_das_ctx().in_ignore_cascading_ = false;
-  if (OB_SUCC(ret)) {
-    if (OB_FAIL(query::ObInnerSQLConnectionAccess::create_connection_with_external_session(
-            my_session, conn_guard))) {
-      SQL_ENG_LOG(WARN, "create inner connection with external session failed", K(ret));
-    } else if (OB_ISNULL(conn = conn_guard.get_ptr())) {
-      ret = OB_ERR_UNEXPECTED;
-      SQL_ENG_LOG(WARN, "inner connection is null", K(ret));
-    }
+  // 内部读写统一走 sql proxy：和 worker 的 read_user_prompt_/publish_group_ 同一套，
+  // 避免 inner connection 在 ALTER 执行器里既不是 extern-session、又拿不到读上下文
+  ObMySQLProxy *proxy = GCTX.sql_proxy_;
+  if (OB_SUCC(ret) && OB_ISNULL(proxy)) {
+    ret = OB_ERR_UNEXPECTED;
+    SQL_ENG_LOG(WARN, "sql proxy is null for ai column retry", K(ret));
   }
   if (OB_SUCC(ret)) {
-    SMART_VAR(ObISQLClient::ReadResult, res) {
+    SMART_VAR(ObMySQLProxy::MySQLResult, res) {
       common::sqlclient::ObMySQLResult *result = NULL;
       int tmp_ret = OB_SUCCESS;
-      if (OB_FAIL(conn->execute_read(select_sql.ptr(), res))) {
+      if (OB_FAIL(proxy->read(res, select_sql.ptr()))) {
         SQL_ENG_LOG(WARN, "execute ai retry select failed", K(ret), K(select_sql.ptr()));
       } else if (OB_ISNULL(result = res.get_result())) {
         ret = OB_ERR_UNEXPECTED;
@@ -1014,13 +1004,13 @@ static int execute_ai_column_retry(ObExecContext &ctx, obcall::ObAlterTableArg &
                    item->result_spec_column_name_.length(), item->result_spec_column_name_.ptr(),
                    pred.length(), pred.ptr()))) {
       SQL_ENG_LOG(WARN, "build ai retry update sql failed", K(ret));
-    } else if (OB_FAIL(conn->execute_write(upd_sql.ptr(), affected_rows))) {
+    } else if (OB_FAIL(proxy->write(upd_sql.ptr(), affected_rows))) {
       SQL_ENG_LOG(WARN, "execute ai retry update failed", K(ret), K(upd_sql.ptr()));
     } else if (OB_FAIL(del_sql.assign_fmt(
                    "delete from %s where table_id = %lu and rowkey_hash = %lu and column_id = %lu",
                    task_table_name, table_id, pred_hash, item->column_id_))) {
       SQL_ENG_LOG(WARN, "build ai retry task delete sql failed", K(ret));
-    } else if (OB_FAIL(conn->execute_write(del_sql.ptr(), affected_rows))) {
+    } else if (OB_FAIL(proxy->write(del_sql.ptr(), affected_rows))) {
       SQL_ENG_LOG(WARN, "execute ai retry task delete failed", K(ret), K(del_sql.ptr()));
     } else if (OB_FAIL(splicer.add_pk_column("table_id", item->table_id_))) {
       SQL_ENG_LOG(WARN, "add table_id failed", K(ret));
@@ -1047,14 +1037,12 @@ static int execute_ai_column_retry(ObExecContext &ctx, obcall::ObAlterTableArg &
       SQL_ENG_LOG(WARN, "add eligible_ts failed", K(ret));
     } else if (OB_FAIL(splicer.splice_insert_sql(task_table_name, ins_sql))) {
       SQL_ENG_LOG(WARN, "splice ai retry task insert sql failed", K(ret));
-    } else if (OB_FAIL(conn->execute_write(ins_sql.ptr(), affected_rows))) {
+    } else if (OB_FAIL(proxy->write(ins_sql.ptr(), affected_rows))) {
       SQL_ENG_LOG(WARN, "execute ai retry task insert failed", K(ret), K(ins_sql.ptr()));
     } else {
       SQL_ENG_LOG(TRACE, "ai column retry row processed", K(pred), K(rid_buf));
     }
   }
-  ctx.get_das_ctx().is_fk_cascading_ = save_is_fk_cascading;
-  ctx.get_das_ctx().in_ignore_cascading_ = save_in_ignore_cascading;
   return ret;
 }
 

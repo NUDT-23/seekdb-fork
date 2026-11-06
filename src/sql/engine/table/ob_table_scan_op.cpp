@@ -30,6 +30,7 @@
 #include "sql/das/iter/ob_das_iter_utils.h"
 #include "sql/engine/px/ob_granule_iterator_op.h"
 #include "sql/engine/expr/ob_expr_lob_utils.h"
+#include "common/mysqlclient/ob_mysql_proxy.h"
 #include "share/ai_column/ob_ai_column_util.h"
 #include "share/schema/ob_schema_struct.h"
 #include "share/schema/ob_schema_getter_guard.h"
@@ -165,56 +166,37 @@ static int check_ai_column_strict_read(ObExecContext &ctx, const ObTableScanSpec
                                                       item.state_column_name_.ptr()))) {
                 LOG_WARN("build ai strict check sql failed", K(ret));
               } else {
-                common::sqlclient::ObISQLConnectionGuard conn_guard;
-                ObIInnerSQLConnection *conn = NULL;
-                ObSQLSessionInfo::StmtSavedValue saved_session;
-                ObIInnerSQLConnection::SavedValue saved_conn;
-                if (OB_FAIL(query::ObInnerSQLConnectionAccess::create_connection_with_external_session(
-                        my_session, conn_guard))) {
-                  LOG_WARN("create ai strict check connection failed", K(ret));
-                } else if (OB_ISNULL(conn = sql::as_inner_sql_connection(conn_guard.get_ptr()))) {
-                  ret = OB_ERR_UNEXPECTED;
-                  LOG_WARN("ai strict check connection is null", K(ret));
-                } else if (OB_FAIL(conn->begin_nested_session(saved_session, saved_conn,
-                                                              true /*skip_cur_stmt_tables*/))) {
-                  LOG_WARN("begin nested session for ai strict check failed", K(ret));
-                } else {
-                  in_ai_strict_check = true;
-                  SMART_VAR(ObISQLClient::ReadResult, res) {
-                    common::sqlclient::ObMySQLResult *result = NULL;
-                    if (OB_FAIL(conn->execute_read(check_sql.ptr(), res))) {
-                      LOG_WARN("execute ai strict check sql failed", K(ret), K(check_sql.ptr()));
-                    } else if (OB_ISNULL(result = res.get_result())) {
-                      ret = OB_ERR_UNEXPECTED;
-                      LOG_WARN("ai strict check result is null", K(ret));
+                // 内部校验走 sql proxy：inner connection 在本执行器里不是
+                // extern-session，begin_nested_session 会直接返回 -4016
+                in_ai_strict_check = true;
+                SMART_VAR(ObMySQLProxy::MySQLResult, res) {
+                  common::sqlclient::ObMySQLResult *result = NULL;
+                  if (OB_ISNULL(GCTX.sql_proxy_)) {
+                    ret = OB_ERR_UNEXPECTED;
+                    LOG_WARN("sql proxy is null for ai strict check", K(ret));
+                  } else if (OB_FAIL(GCTX.sql_proxy_->read(res, check_sql.ptr()))) {
+                    LOG_WARN("execute ai strict check sql failed", K(ret), K(check_sql.ptr()));
+                  } else if (OB_ISNULL(result = res.get_result())) {
+                    ret = OB_ERR_UNEXPECTED;
+                    LOG_WARN("ai strict check result is null", K(ret));
+                  } else {
+                    int tmp_ret = result->next();
+                    if (OB_SUCCESS == tmp_ret) {
+                      ret = OB_ERR_AI_COLUMN_UNFINISHED_TASK;
+                      LOG_USER_ERROR(OB_ERR_AI_COLUMN_UNFINISHED_TASK,
+                                     static_cast<int64_t>(table_id),
+                                     static_cast<int64_t>(item.column_id_));
+                      LOG_WARN("ai column strict read rejected the scan",
+                               K(ret), K(table_id), K(item.column_id_));
+                    } else if (OB_ITER_END == tmp_ret) {
+                      ret = OB_SUCCESS;
                     } else {
-                      int tmp_ret = result->next();
-                      if (OB_SUCCESS == tmp_ret) {
-                        // the column has at least one unfinished row
-                        ret = OB_ERR_AI_COLUMN_UNFINISHED_TASK;
-                        LOG_USER_ERROR(OB_ERR_AI_COLUMN_UNFINISHED_TASK,
-                                       static_cast<int64_t>(table_id),
-                                       static_cast<int64_t>(item.column_id_));
-                        LOG_WARN("ai column strict read rejected the scan",
-                                 K(ret), K(table_id), K(item.column_id_));
-                      } else if (OB_ITER_END == tmp_ret) {
-                        // all rows are READY
-                        ret = OB_SUCCESS;
-                      } else {
-                        ret = tmp_ret;
-                        LOG_WARN("iterate ai strict check result failed", K(ret));
-                      }
-                    }
-                  }
-                  in_ai_strict_check = false;
-                  int end_ret = conn->end_nested_session(saved_session, saved_conn);
-                  if (OB_SUCCESS != end_ret) {
-                    LOG_WARN("end nested session for ai strict check failed", K(end_ret));
-                    if (OB_SUCCESS == ret) {
-                      ret = end_ret;
+                      ret = tmp_ret;
+                      LOG_WARN("iterate ai strict check result failed", K(ret));
                     }
                   }
                 }
+                in_ai_strict_check = false;
               }
             }
           }

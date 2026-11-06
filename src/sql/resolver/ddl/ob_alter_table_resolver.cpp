@@ -865,8 +865,10 @@ int ObAlterTableResolver::find_ai_state_column(const ObString &ai_col_name, ObSt
     if (OB_ISNULL(state_schema) || !state_schema->is_ai_state_column()) {
       ret = OB_ERR_UNEXPECTED;
       SQL_RESV_LOG(WARN, "ai state column not found", K(ret), K(ai_col_name), K(expect_name));
-    } else {
-      state_col_name = expect_name;
+    } else if (OB_FAIL(ob_write_string(*allocator_, expect_name, state_col_name, true))) {
+      // expect_name 指向栈上的 buf，函数返回后即失效：必须深拷贝到 resolver 的
+      // allocator，否则条件里的 `status` 替换成状态列名会变成乱码
+      SQL_RESV_LOG(WARN, "copy ai state column name failed", K(ret));
     }
   }
   return ret;

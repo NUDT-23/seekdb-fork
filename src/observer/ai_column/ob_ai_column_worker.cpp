@@ -32,6 +32,7 @@
 #include <unistd.h>
 
 #include "common/json_type/ob_json_parse.h"
+#include "share/json/ob_json_helper.h"
 #include "common/mysqlclient/ob_mysql_result.h"
 #include "lib/oblog/ob_log_module.h"
 #include "common/mysqlclient/ob_mysql_transaction.h"
@@ -1157,13 +1158,29 @@ int ObAiColumnWorkerTask::call_model_(common::ObIAllocator &alloc, const ObAICol
         LOG_INFO("ai embed request failed", K(ret), K(endpoint.get_url()));
       } else if (OB_FAIL(provider->parse_output(alloc, response, result_base))) {
         LOG_INFO("parse ai embed output failed", K(ret));
-      } else if (item.is_vector_ && item.vector_dim_ > 0
-                 && OB_FAIL(ObAIFuncUtils::validate_embedding_vector(result_base,
-                                                                     item.vector_dim_))) {
-        LOG_INFO("embedding vector does not match the column dimension", K(ret),
-                 K(item.vector_dim_));
-      } else if (OB_FAIL(ObAIFuncJsonUtils::print_json_to_str(alloc, result_base, output))) {
-        LOG_INFO("print ai embed output failed", K(ret));
+      } else if (OB_ISNULL(result_base)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_INFO("ai embed output is null", K(ret));
+      } else {
+        // 单条输入时服务端仍然返回 {"data":[{...}]}，parse_output 得到的是
+        // 「批量向量数组」，这里取第一个元素当作本行的向量
+        if (share::ObJsonHelper::is_array_type(result_base)) {
+          ObJsonArray *batch = static_cast<ObJsonArray *>(result_base);
+          if (1 == batch->element_count()) {
+            ObJsonNode *first = batch->get_value(0);
+            if (OB_NOT_NULL(first) && share::ObJsonHelper::is_array_type(first)) {
+              result_base = first;
+            }
+          }
+        }
+        if (item.is_vector_ && item.vector_dim_ > 0
+            && OB_FAIL(ObAIFuncUtils::validate_embedding_vector(result_base,
+                                                                item.vector_dim_))) {
+          LOG_INFO("embedding vector does not match the column dimension", K(ret),
+                   K(item.vector_dim_));
+        } else if (OB_FAIL(ObAIFuncJsonUtils::print_json_to_str(alloc, result_base, output))) {
+          LOG_INFO("print ai embed output failed", K(ret));
+        }
       }
     } else {
       ObAIFuncIComplete *provider = nullptr;
