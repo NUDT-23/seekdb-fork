@@ -984,6 +984,10 @@ static int execute_ai_column_retry(ObExecContext &ctx, obcall::ObAlterTableArg &
   for (int64_t i = 0; OB_SUCC(ret) && i < preds.count(); ++i) {
     const ObString &pred = preds.at(i);
     const uint64_t pred_hash = murmurhash64A(pred.ptr(), static_cast<int32_t>(pred.length()), 0);
+    // 任务表主键 rowkey_hash 是 signed bigint：DML 侧用 static_cast<int64_t> 后按 %ld
+    // 写入，这里若按 %lu 拼字面量，> 2^63 的值在 SQL 里变成无符号/十进制数，
+    // 与已存的负数不相等 → 旧任务删不掉，接着 insert 就撞主键
+    const int64_t signed_hash = static_cast<int64_t>(pred_hash);
     char rid_buf[64];
     ObSqlString upd_sql;
     ObSqlString del_sql;
@@ -1007,14 +1011,14 @@ static int execute_ai_column_retry(ObExecContext &ctx, obcall::ObAlterTableArg &
     } else if (OB_FAIL(proxy->write(upd_sql.ptr(), affected_rows))) {
       SQL_ENG_LOG(WARN, "execute ai retry update failed", K(ret), K(upd_sql.ptr()));
     } else if (OB_FAIL(del_sql.assign_fmt(
-                   "delete from %s where table_id = %lu and rowkey_hash = %lu and column_id = %lu",
-                   task_table_name, table_id, pred_hash, item->column_id_))) {
+                    "delete from %s where table_id = %lu and rowkey_hash = %ld and column_id = %lu",
+                    task_table_name, table_id, signed_hash, item->column_id_))) {
       SQL_ENG_LOG(WARN, "build ai retry task delete sql failed", K(ret));
     } else if (OB_FAIL(proxy->write(del_sql.ptr(), affected_rows))) {
       SQL_ENG_LOG(WARN, "execute ai retry task delete failed", K(ret), K(del_sql.ptr()));
     } else if (OB_FAIL(splicer.add_pk_column("table_id", item->table_id_))) {
       SQL_ENG_LOG(WARN, "add table_id failed", K(ret));
-    } else if (OB_FAIL(splicer.add_pk_column("rowkey_hash", pred_hash))) {
+    } else if (OB_FAIL(splicer.add_pk_column("rowkey_hash", signed_hash))) {
       SQL_ENG_LOG(WARN, "add rowkey_hash failed", K(ret));
     } else if (OB_FAIL(splicer.add_pk_column("column_id", item->column_id_))) {
       SQL_ENG_LOG(WARN, "add column_id failed", K(ret));
