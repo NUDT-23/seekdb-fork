@@ -543,7 +543,10 @@ int ObPxMultiPartSSTableInsertOp::switch_slice_if_need(
       request.tablet_id_ = tablet_id;
       request.slice_index_ = slice_idx;
       request.max_batch_size_ = 0;
-      request.append_batch_ = false;
+      // Rows still arrive one by one, but the writer buffers them and appends whole batches
+      // to the macro block writer. Building an index table writes hundreds of thousands of
+      // rows into a single slice, so batching is what makes that cheap.
+      request.append_batch_ = true;
       request.spool_factory_ = &get_temp_column_spill_spool_factory();
       if (OB_FAIL(direct_insert_session_->get_writer_factory().create(
               allocator_, request, slice_writer))) {

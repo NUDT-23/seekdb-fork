@@ -453,7 +453,11 @@ public:
                      request.autoinc_column_index_,
                      request.idempotent_tablet_autoinc_))) {
       }
-    } else if (dag_->get_ddl_table_schema().table_item_.vec_dim_ > 0) {
+    } else if (dag_->get_ddl_table_schema().table_item_.vec_dim_ > 0 || request.append_batch_) {
+      // ObBatchSliceWriter buffers the incoming rows and hands them to the macro block
+      // writer in batches, and it skips the per row storage value conversion when the table
+      // has neither a lob nor a reshape column. ObRsSliceWriter does one conversion and one
+      // macro block append per row, which dominates the cost of building a big index table.
       storage::ObBatchSliceWriter *typed_writer = nullptr;
       impl_type = ORDERED_BATCH_WRITER_IMPL;
       if (OB_ISNULL(request.spool_factory_)) {
@@ -463,7 +467,7 @@ public:
       } else if (FALSE_IT(impl = typed_writer)) {
       } else if (OB_FAIL(typed_writer->init(
                      write_param, false /* direct write macro block */,
-                     request.append_batch_, 0 /* unused max batch size */,
+                     false /* append rows, the writer does the batching */, 0 /* unused max batch size */,
                      *request.spool_factory_))) {
       }
     } else {
