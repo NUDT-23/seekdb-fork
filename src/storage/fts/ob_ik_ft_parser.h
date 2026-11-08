@@ -21,7 +21,11 @@
 #include "storage/fts/dict/ob_ft_cache_container.h"
 #include "storage/fts/dict/ob_ft_dict.h"
 #include "storage/fts/dict/ob_ft_dict_def.h"
+#include "storage/fts/ik/ob_ik_cjk_processor.h"
+#include "storage/fts/ik/ob_ik_letter_processor.h"
 #include "storage/fts/ik/ob_ik_processor.h"
+#include "storage/fts/ik/ob_ik_quantifier_processor.h"
+#include "storage/fts/ik/ob_ik_surrogate_processor.h"
 #include "data_plane/fts/ob_fts_parser.h"
 
 #include <cstdint>
@@ -41,6 +45,10 @@ public:
         ctx_(nullptr),
         hub_(hub),
         segmenters_(allocator_),
+        letter_seg_(nullptr),
+        quant_seg_(nullptr),
+        cjk_seg_(nullptr),
+        surr_seg_(nullptr),
         cache_main_(allocator),
         cache_quan_(allocator),
         cache_stop_(allocator),
@@ -98,6 +106,13 @@ private:
   TokenizeContext *ctx_;
   ObFTDictHub *hub_;
   ObList<ObIIKProcessor *, ObIAllocator> segmenters_;
+  // The same four segmenters, by concrete type, so that the per character
+  // dispatch can ask a segmenter whether it is holding a partial token without
+  // going through the vtable.
+  ObIKLetterProcessor *letter_seg_;
+  ObIKQuantifierProcessor *quant_seg_;
+  ObIKCJKProcessor *cjk_seg_;
+  ObIKSurrogateProcessor *surr_seg_;
 
   // For now there's no change of dict in one query, so we can pin dict this level.
   ObFTCacheRangeContainer cache_main_;

@@ -34,6 +34,13 @@ public:
                  const uint8_t char_len,
                  const ObFTCharUtil::CharType type) override;
 
+  // True when none of the three state machines holds a partial token, that is
+  // when a character that is not a letter cannot change anything here.
+  bool is_idle() const
+  {
+    return -1 == english_start_ && -1 == arabic_start_ && -1 == mix_start_;
+  }
+
 private:
   int process_english_letter(TokenizeContext &ctx,
                              const char *ch,

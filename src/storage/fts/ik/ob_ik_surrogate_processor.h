@@ -35,6 +35,9 @@ public:
                  const uint8_t char_len,
                  const ObFTCharUtil::CharType type) override;
 
+  // True when no high surrogate is waiting for its low half.
+  bool is_idle() const { return -1 == high_offset_; }
+
 private:
   void reset()
   {

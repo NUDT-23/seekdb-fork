@@ -33,6 +33,7 @@
 #include "storage/fts/ik/ob_ik_arbitrator.h"
 #include "storage/fts/ik/ob_ik_cjk_processor.h"
 #include "storage/fts/ik/ob_ik_letter_processor.h"
+#include "lib/atomic/ob_atomic.h"
 #include "storage/fts/ik/ob_ik_processor.h"
 #include "storage/fts/ik/ob_ik_quantifier_processor.h"
 #include "storage/fts/ik/ob_ik_surrogate_processor.h"
@@ -70,12 +71,14 @@ public:
       ret = OB_ERR_UNEXPECTED;
     } else if (OB_UNLIKELY(idx <= 0 || idx >= MAX_DICT_ITEM)) {
       ret = OB_INVALID_ARGUMENT;
+    } else if (OB_NOT_NULL(dict = ATOMIC_LOAD_ACQ(&items_[idx].dict_))) {
+      // Already built. Reading the published pointer is enough, the dictionary
+      // it points to is read only, and an index build calls this three times
+      // per document from all of its threads, so the lock is worth avoiding.
     } else {
-      // always hold the lock: it is uncontended after the first build and the
-      // reader must observe a fully initialized dictionary
       lib::ObMutexGuard guard(mutex_);
-      if (OB_NOT_NULL(items_[idx].dict_)) {
-        dict = items_[idx].dict_;
+      if (OB_NOT_NULL(dict = ATOMIC_LOAD_ACQ(&items_[idx].dict_))) {
+        // built by another thread while this one waited for the lock
       } else if (OB_ISNULL(items_[idx].container_ =
                              OB_NEWx(ObFTCacheRangeContainer, &alloc_, alloc_))) {
         ret = OB_ALLOCATE_MEMORY_FAILED;
@@ -86,10 +89,12 @@ public:
         ret = OB_ALLOCATE_MEMORY_FAILED;
       } else if (OB_FAIL(items_[idx].dict_->init())) {
       } else {
+        ATOMIC_STORE_REL(&items_[idx].dict_, items_[idx].dict_);
         dict = items_[idx].dict_;
       }
       if (OB_FAIL(ret)) {
         items_[idx].dict_ = nullptr;
+        dict = nullptr;
       }
     }
     return ret;
@@ -217,11 +222,33 @@ int ObIKFTParser::process_one_char(TokenizeContext &ctx,
                                    const ObFTCharUtil::CharType type)
 {
   int ret = OB_SUCCESS;
-  // proces by char with all segmenters
-  for (ObList<ObIIKProcessor *, ObIAllocator>::iterator iter = segmenters_.begin();
-       OB_SUCC(ret) && iter != segmenters_.end();
-       iter++) {
-    if (OB_FAIL((*iter)->process(ctx))) {
+  // A Chinese document is one unified ideograph after another. For such a
+  // character the letter segmenter and the surrogate segmenter have nothing to
+  // do unless they are holding a partial token, so walking all four of them
+  // meant two thirds of the calls were spent entering a function that returns
+  // on its first branch. Ask the two of them whether they are idle instead, and
+  // in that case call only the two that actually work on a Chinese character:
+  // the quantifier, which decides whether this is a Chinese numeral, and the
+  // CJK segmenter, which advances the trie.
+  //
+  // This also skips ObIIKProcessor::process(), which re-reads the current
+  // character and its class through the context for every segmenter.
+  //
+  // Characters of any other class, and any character that has to end a run
+  // held by the letter or the surrogate segmenter, take the general path.
+  if (OB_LIKELY(ObFTCharUtil::CharType::CHINESE == type)
+      && letter_seg_->is_idle()
+      && surr_seg_->is_idle()) {
+    if (OB_FAIL(quant_seg_->do_process(ctx, ch, char_len, type))) {
+    } else if (OB_FAIL(cjk_seg_->do_process(ctx, ch, char_len, type))) {
+    }
+  } else {
+    // proces by char with all segmenters
+    for (ObList<ObIIKProcessor *, ObIAllocator>::iterator iter = segmenters_.begin();
+         OB_SUCC(ret) && iter != segmenters_.end();
+         iter++) {
+      if (OB_FAIL((*iter)->process(ctx))) {
+      }
     }
   }
   return ret;
@@ -411,12 +438,16 @@ int ObIKFTParser::init_segmenter(const ObFTParserParam &param)
   } else if (OB_ISNULL(surrogate_seg = OB_NEWx(ObIKSurrogateProcessor, &allocator_))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
   } else if (OB_FAIL(segmenters_.push_back(letter_seg))) {
+  } else if (FALSE_IT(letter_seg_ = letter_seg)) {
   } else if (FALSE_IT(letter_seg = nullptr)) {
   } else if (OB_FAIL(segmenters_.push_back(cnqsg))) {
+  } else if (FALSE_IT(quant_seg_ = cnqsg)) {
   } else if (FALSE_IT(cnqsg = nullptr)) {
   } else if (OB_FAIL(segmenters_.push_back(cjksg))) {
+  } else if (FALSE_IT(cjk_seg_ = cjksg)) {
   } else if (FALSE_IT(cjksg = nullptr)) {
   } else if (OB_FAIL(segmenters_.push_back(surrogate_seg))) {
+  } else if (OB_FALSE_IT(surr_seg_ = surrogate_seg)) {
   } else if (OB_FALSE_IT(surrogate_seg = nullptr)) {
   }
   // push back by order, quantifier is before cjk
@@ -444,6 +475,10 @@ void ObIKFTParser::reset()
     }
   }
   segmenters_.clear();
+  letter_seg_ = nullptr;
+  quant_seg_ = nullptr;
+  cjk_seg_ = nullptr;
+  surr_seg_ = nullptr;
 
   cache_main_.reset();
   cache_quan_.reset();
