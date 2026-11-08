@@ -89,6 +89,11 @@ private:
 
   ObFTSortList token_list_;
   ObList<ObIKToken, ObIAllocator> result_list_;
+  // The document is scanned character by character, so the decode and the
+  // character class of every character are needed. Both are computed through
+  // the charset function table, which is far more expensive than the two lines
+  // of arithmetic it takes to decode an utf8mb4 character by hand.
+  bool is_utf8mb4_;
 
 private:
   DISALLOW_COPY_AND_ASSIGN(TokenizeContext);

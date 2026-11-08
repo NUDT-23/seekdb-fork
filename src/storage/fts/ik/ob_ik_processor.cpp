@@ -53,7 +53,8 @@ TokenizeContext::TokenizeContext(ObCollationType coll_type,
                                  bool is_smart)
     : coll_type_(coll_type), fulltext_(fulltext), fulltext_len_(fulltext_len), cursor_(0),
       next_char_len_(0), handle_size_(0), is_smart_(is_smart), token_list_(allocator),
-      result_list_(allocator)
+      result_list_(allocator),
+      is_utf8mb4_(common::CHARSET_UTF8MB4 == ObCharset::charset_type_by_coll(coll_type))
 {
 }
 
@@ -102,6 +103,25 @@ int TokenizeContext::current_char_type(ObFTCharUtil::CharType &type)
 int TokenizeContext::prepare_next_char()
 {
   int ret = OB_SUCCESS;
+  // Fast path: a Chinese document is mostly unified ideographs, which are three
+  // bytes long in utf8mb4 and always classified as CHINESE. Decoding them here
+  // avoids two calls through the charset function table plus the four unicode
+  // block range checks of the classifier, and those two calls were about a
+  // third of the time a document spends in the tokenizer.
+  const int64_t remain = fulltext_len_ - cursor_;
+  if (OB_LIKELY(is_utf8mb4_) && remain >= 3) {
+    const unsigned char *p = reinterpret_cast<const unsigned char *>(fulltext_ + cursor_);
+    if (0xE4 <= p[0] && p[0] <= 0xE9 && 0x80 == (p[1] & 0xC0) && 0x80 == (p[2] & 0xC0)) {
+      const uint32_t code = (static_cast<uint32_t>(p[0] & 0x0F) << 12)
+                          | (static_cast<uint32_t>(p[1] & 0x3F) << 6)
+                          | static_cast<uint32_t>(p[2] & 0x3F);
+      if (0x4E00 <= code && code <= 0x9FFF) {
+        next_char_len_ = 3;
+        next_char_type_ = ObFTCharUtil::CharType::CHINESE;
+        return OB_SUCCESS;
+      }
+    }
+  }
   if (OB_FAIL(ObCharset::first_valid_char(coll_type_,
                                           fulltext_ + cursor_,
                                           fulltext_len_ - cursor_,

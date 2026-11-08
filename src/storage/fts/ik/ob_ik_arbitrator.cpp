@@ -113,10 +113,34 @@ int ObIKArbitrator::output_result(TokenizeContext &ctx)
 
   int64_t char_len = 0;
   ObIKTokenChain *chain = nullptr;
+  const bool is_utf8mb4 = common::CHARSET_UTF8MB4 == ObCharset::charset_type_by_coll(ctx.collation());
   for (int64_t current = 0; OB_SUCC(ret) && current < ctx.fulltext_len();) {
     ObFTCharUtil::CharType type;
-    // maybe not so good to keep single, check it later
-    if (OB_FAIL(ObCharset::first_valid_char(ctx.collation(),
+    // Same fast path as TokenizeContext::prepare_next_char: this loop walks the
+    // document again, so it pays the charset decode and the classifier for every
+    // character a second time.
+    const int64_t remain = ctx.fulltext_len() - current;
+    if (OB_LIKELY(is_utf8mb4) && remain >= 3) {
+      const unsigned char *p = reinterpret_cast<const unsigned char *>(ctx.fulltext() + current);
+      if (0xE4 <= p[0] && p[0] <= 0xE9 && 0x80 == (p[1] & 0xC0) && 0x80 == (p[2] & 0xC0)) {
+        const uint32_t code = (static_cast<uint32_t>(p[0] & 0x0F) << 12)
+                            | (static_cast<uint32_t>(p[1] & 0x3F) << 6)
+                            | static_cast<uint32_t>(p[2] & 0x3F);
+        if (0x4E00 <= code && code <= 0x9FFF) {
+          char_len = 3;
+          type = ObFTCharUtil::CharType::CHINESE;
+        } else {
+          char_len = 0;
+        }
+      } else {
+        char_len = 0;
+      }
+    } else {
+      char_len = 0;
+    }
+    if (0 != char_len) {
+      // handled by the fast path
+    } else if (OB_FAIL(ObCharset::first_valid_char(ctx.collation(),
                                             ctx.fulltext() + current,
                                             ctx.fulltext_len() - current,
                                             char_len))) {
@@ -124,6 +148,8 @@ int ObIKArbitrator::output_result(TokenizeContext &ctx)
                                                          ctx.fulltext() + current,
                                                          char_len,
                                                          type))) {
+    }
+    if (OB_FAIL(ret)) {
     } else if (ObFTCharUtil::CharType::USELESS == type) {
       current += char_len; // skip useless char
     } else if (OB_FAIL(chains_.get_refactored(current, chain)) && OB_HASH_NOT_EXIST != ret) {
