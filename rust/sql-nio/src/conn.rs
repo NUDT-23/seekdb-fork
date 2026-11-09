@@ -96,6 +96,10 @@ impl ResponseWriter {
         self.captured_complete = true;
     }
 
+    pub(crate) fn capture_active(&self) -> bool {
+        self.capture_enabled && self.captured_complete
+    }
+
     pub(crate) fn capture_frames(&mut self, frames: &[u8]) {
         if !self.capture_enabled || !self.captured_complete || frames.is_empty() {
             return;

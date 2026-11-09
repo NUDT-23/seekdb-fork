@@ -171,8 +171,11 @@ where
             return -1;
         }
         g.response.next_mysql_seq = next_seq;
-        g.response
-            .capture_frames(&g.response.batch[old_len..new_len]);
+        if g.response.capture_active() {
+            let encoded_usize = encoded as usize;
+            let frames: Vec<u8> = g.response.batch[old_len..old_len + encoded_usize].to_vec();
+            g.response.capture_frames(&frames);
+        }
         unsafe { framed_len.write(encoded) };
         return 0;
     }
@@ -255,8 +258,10 @@ pub(crate) unsafe fn append_fixed_response(
         ]);
         g.response.batch.extend_from_slice(payload);
         g.response.next_mysql_seq = seq.wrapping_add(1);
-        g.response
-            .capture_frames(&g.response.batch[old_len..old_len + frame_len]);
+        if g.response.capture_active() {
+            let frames: Vec<u8> = g.response.batch[old_len..old_len + frame_len].to_vec();
+            g.response.capture_frames(&frames);
+        }
         unsafe { framed_len.write(frame_len_i64) };
         return 0;
     }
@@ -424,7 +429,10 @@ pub(crate) unsafe fn append_single_field_metadata(
         }
     };
     response_writer.next_mysql_seq = next_seq;
-    response_writer.capture_frames(&response_writer.batch[old_len..new_len]);
+    if response_writer.capture_active() {
+        let frames: Vec<u8> = response_writer.batch[old_len..new_len].to_vec();
+        response_writer.capture_frames(&frames);
+    }
     unsafe {
         packet_count.write(semantic_packet_count);
         framed_len.write(framed_len_i64);
@@ -570,8 +578,10 @@ pub unsafe extern "C" fn nio_response_append_resultset_metadata(
         }
     };
     g.response.next_mysql_seq = next_seq;
-    g.response
-        .capture_frames(&g.response.batch[old_len..new_len]);
+    if g.response.capture_active() {
+        let frames: Vec<u8> = g.response.batch[old_len..new_len].to_vec();
+        g.response.capture_frames(&frames);
+    }
     unsafe {
         packet_count.write(semantic_packet_count);
         framed_len.write(framed_len_i64);
