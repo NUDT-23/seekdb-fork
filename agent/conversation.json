@@ -1,7 +1,7 @@
 {
   "schema": "minivectordb-learning-material-v1",
   "synthetic": false,
-  "materials_scope": "Actual user prompts and implementation/verification records from the 2026-11-09 MiniVectorDB work session. Agent explanations are labeled as agent output, not as student understanding. No hidden reasoning, credentials or external test data are included.",
+  "materials_scope": "Actual user prompts and implementation/verification records from the 2026-11-09 MiniVectorDB work sessions (initial implementation, first platform submission, protocol root-cause analysis, and performance work). Agent explanations are labeled as agent output, not as student understanding. No hidden reasoning, credentials or external test data are included.",
   "user_prompts": [
     {
       "id": "user-1",
@@ -12,6 +12,36 @@
       "id": "user-2",
       "source": "student",
       "content": "继续"
+    },
+    {
+      "id": "user-3",
+      "source": "student",
+      "content": "他这个指的是官方的评测运行环境吧测试驱动好像是官方的，就是他们在我们提测之后，他们的官方那个体测吧"
+    },
+    {
+      "id": "user-4",
+      "source": "student",
+      "content": "反正今天的机会不用白不用，你先做呗，做的时候派一个子代理并行调研这些有没有发布"
+    },
+    {
+      "id": "user-5",
+      "source": "student",
+      "content": "不用发，我们怎么只剩一次机会了？提测了一次吗"
+    },
+    {
+      "id": "user-6",
+      "source": "student",
+      "content": "目前官方还没发驱动的情况下，我们能做哪些充分的准备，能想到的都开始做"
+    },
+    {
+      "id": "user-7",
+      "source": "student",
+      "content": "能继续准备吗，这个的目标是什么，对性能有要求吗，有的话继续优化"
+    },
+    {
+      "id": "user-8",
+      "source": "student",
+      "content": "注意一下你的准备方向一定要对，或者不知道对不对就全面准备，一定要确保开赛之后迅速做出来"
     }
   ],
   "conversations": [
@@ -23,12 +53,32 @@
     {
       "id": "context-2",
       "source": "agent",
-      "content": "The public package does not contain the official stdin/stdout driver. Two OceanBase forum threads created on 2026-11-09 (topics 35653823 and 35653825) ask for the same ready marker, result format, statement boundary, error mapping, exact/ann switch and precheck entry. No official protocol answer was present when checked. A one-line JSON transport was isolated as an interim local adapter rather than represented as the official protocol."
+      "content": "The public package does not contain the official stdin/stdout driver. Two OceanBase forum threads created on 2026-11-09 (topics 35653823 and 35653825) ask for the same ready marker, result format, statement boundary, error mapping, exact/ann switch and precheck entry. No official protocol answer was present when checked."
+    },
+    {
+      "id": "context-3",
+      "source": "agent",
+      "content": "First platform submission (commit c16e51651, one-line ok-wrapped JSON with a leading {\"ready\":true} line): the evaluation pipeline built the image and started the container, but all MySQL cases failed (0 passed, 1 failed) with no failure logs. This is consistent with a protocol mismatch rather than an engine defect: local public cases were 20/20 at that commit."
+    },
+    {
+      "id": "context-4",
+      "source": "agent",
+      "content": "Protocol root-cause (after the student authorized spending the attempt and requested parallel research): a subagent surveyed 1295 forks, cloned 31, and found 21 teams with implementations, none passing. Two platform observations mattered: another team's one-line wrapped JSON submission also failed, while their TSV + 'OK n' framing with no stdout ready marker ran to completion; an admin confirmed the official driver was not yet deployed that day. Re-reading mysqltest/README.md (official commit 9f6df2ba5) then showed the decisive facts: .result files are JSON arrays with exactly one entry per SQL statement, driver directives occupy no assertion slot, --restart means the driver cleanly stops and restarts the process, and the earlier example-style JSON wrapping was dropped. The failed submission therefore had three mismatches at once: an extra ready line desyncing positional comparison, the ok-wrapper on every response, and the wrong error shape."
+    },
+    {
+      "id": "context-5",
+      "source": "agent",
+      "content": "Performance target derived from the statement (section 3.3): E = (E_write + 2*E_query)/3 with each E = 0.6*f(R_T) + 0.2*f(R_B) + 0.2*f(R_M) against a fixed baseline; Recall@10 >= 0.95 on both filtered and unfiltered query groups is a hard gate; B (data-device bytes) and M (container peak memory incl. page cache) are measured from startup through load, index preparation and warmup. So query time carries the largest weight, and index build costs count even when untimed. Student confirmed direction and asked to keep optimizing."
     },
     {
       "id": "design-1",
       "source": "agent",
-      "content": "Implementation chosen: dependency-free Rust; CRC32-framed WAL with fsync before success; atomic meta rename for checkpoints; private transaction overlays for statement atomicity and rollback; float32 vector storage; exact filtered TopK with primary-key tie breaking; bounded vector cache with durable reload."
+      "content": "Implementation chosen: dependency-free Rust; CRC32-framed WAL with fdatasync before success; atomic meta rename for checkpoints; private transaction overlays for statement atomicity and rollback; float32 vector storage; exact filtered TopK with primary-key tie breaking; bounded vector cache with durable reload."
+    },
+    {
+      "id": "design-2",
+      "source": "agent",
+      "content": "Protocol layer redesigned per the root cause: default MINIVEC_PROTOCOL=jsonl emits exactly the four official .result shapes ({} for DDL/transaction, {\"affected_rows\":n} for DML, {\"columns\":[...],\"rows\":[[...]]} for queries, {\"error\":\"name\"} for errors), no ready line, driver directives consumed silently (--mode ann/exact switch mode; --restart/--shutdown/exit/quit/\\q perform clean shutdown with rollback and exit 0), BOM stripping, comment swallowing, quote-aware semicolon splitting. Four fallback transports stay one environment variable away: tsv (READY + TSV + OK n consensus framing, the shape with independent platform evidence), json (former ok-wrapped interim), json-noready, miniob. All five variants are smoke-tested by tools/check_protocols.py so switching after the official driver publishes is a verified one-line change."
     }
   ],
   "experiments": [
@@ -36,7 +86,7 @@
       "id": "experiment-public-baseline",
       "source": "tool_result",
       "command": "python3 -I tools/run_public_tests.py --binary target/debug/minivectordb --manifest mysqltest/manifest.json",
-      "output": "PASS sql_crud; PASS sql_comparisons; PASS sql_ordering; PASS sql_empty; PASS sql_primary_key; PASS sql_unicode; PASS sql_bigint; PASS sql_unsupported; PASS storage_restart; PASS vector_euclidean; PASS transaction_commit; PASS transaction_rollback; PASS storage_mutations; PASS storage_multiple_tables; PASS vector_ties_and_filter; PASS vector_float32; PASS vector_index_maintenance; PASS transaction_failed_insert; PASS transaction_autocommit_atomic; PASS transaction_shutdown_rollback. 20/20 public cases passed."
+      "output": "PASS all 20 cases (sql_crud ... transaction_shutdown_rollback). 20/20 public cases passed."
     },
     {
       "id": "experiment-forced-checkpoint",
@@ -47,20 +97,44 @@
     {
       "id": "experiment-extended",
       "source": "tool_result",
-      "command": "python3 -I tools/run_extended_tests.py --binary target/debug/minivectordb",
-      "output": "PASS validation_test; PASS transaction_test; PASS crash_test; PASS random_topk_test. 4/4 extended test groups passed. The tests reject NaN/Infinity/float32 overflow/wrong dimensions, verify i64::MIN, transactional DDL rollback, SIGKILL and repeated recovery, torn WAL truncation, and random exact/ANN filtered TopK against independently computed Python brute-force truth."
+      "command": "python3 -I tools/run_extended_tests.py --binary target/release/minivectordb",
+      "output": "PASS validation_test; transaction_test; crash_test; random_topk_test; boundaries_test; ivf_recall_test. 6/6 extended test groups passed (NaN/Infinity/overflow/dimension rejection, i64::MIN, transactional DDL rollback, SIGKILL and repeated recovery, torn WAL tail, zero-arena reload, random filtered TopK against Python brute-force truth, IVF recall >= 0.95 on 5000x16 gaussian data with restart rebuild and incremental maintenance)."
     },
     {
-      "id": "experiment-benchmark-exact",
+      "id": "experiment-protocol-matrix",
       "source": "tool_result",
-      "command": "cargo build --release && python3 -I tools/benchmark.py --binary target/release/minivectordb --mode exact",
-      "output": "10000 rows, 128 dimensions, 1000 queries, K=10: write_seconds=1.166611, query_seconds=1.057261, queries_per_second=945.84, sample_recall_at_10=1.0, data_file_bytes=5516704. This is a local WSL measurement, not an official score."
+      "command": "python3 -I tools/check_protocols.py",
+      "output": "jsonl ok; tsv ok; json ok; json-noready ok; miniob ok. Each variant exercised DDL/DML/query/error/directives/comments/semicolon handling, and the jsonl check verified --restart: uncommitted INSERT rolled back after restart while committed data survived, exit code 0."
     },
     {
-      "id": "experiment-benchmark-ann",
+      "id": "experiment-perf-trajectory",
+      "source": "tool_result",
+      "command": "python3 -I tools/benchmark.py --binary target/release/minivectordb --mode exact (10000 rows x 128 dim, 1000 queries, K=10)",
+      "output": "Query phase wall time across the session (recall_at_10 = 1.0 throughout, full Python-computed truth for all 1000 queries): baseline commit c16e51651 1.186 s (843 qps); +AVX2 f64 distance kernel, filter pre-binding, no presort for TopK: 0.598 s (1674 qps); +flat contiguous scan cache with per-row vector eviction and squared-distance comparison with early abandon: 0.359 s (2784 qps); +four-accumulator kernel breaking the FMA latency chain: 0.325 s (3078 qps). Write phase ~1.19 s throughout; database VmHWM ~12-17 MiB; WAL on disk 5,516,704 bytes for 5.12 MB of vector payload. Local WSL measurements, not official scores."
+    },
+    {
+      "id": "experiment-avx2-regression",
+      "source": "tool_result",
+      "command": "cargo build --release && python3 -I tools/benchmark.py --binary target/release/minivectordb --mode exact (first AVX2 attempt)",
+      "output": "The first AVX2 f64 kernel (transmuting __m256 to [f32;8] and reloading halves) measured 2.90 s (345 qps) versus the 1.19 s scalar baseline - a 2.5x REGRESSION from an 'optimization'. Bisecting by stashing the working tree isolated the kernel as the sole cause (engine-side changes alone measured 1.16 s). Rewriting it as a #[target_feature(enable=\"avx2,fma\")] function using _mm256_extractf128_ps reached 0.598 s. Lesson recorded: verify every optimization against a measured baseline; intrinsics do not imply speed."
+    },
+    {
+      "id": "experiment-threads",
+      "source": "tool_result",
+      "command": "MINIVEC_SCAN_THREADS=1|2|3|4|8 python3 -I tools/benchmark.py --binary target/release/minivectordb --mode exact",
+      "output": "Per-query scoped-thread parallel scan (identical recall 1.0 at all widths): threads=1 0.325 s (3078 qps); 2 0.443 s (2256 qps); 3 0.460 s; 8 0.817 s (1224 qps). Thread spawn/join per query costs more than the parallel scan saves at this workload size. Decision: default serial; MINIVEC_SCAN_THREADS kept as a tuning knob with the parallel path already implemented and correctness-verified, so it can be enabled if the platform discloses a multi-core quota with cheaper spawning."
+    },
+    {
+      "id": "experiment-crc-known-vector",
+      "source": "tool_result",
+      "command": "cargo test --release crc",
+      "output": "Slice-by-8 CRC32 table (writes previously paid a bitwise loop) verified against the CRC-32/ISO-HDLC known vector crc32(\"123456789\") == 0xCBF43926 and against a 10,000-byte bitwise reference cross-check. First table generation attempt was wrong (folded against the previous table instead of the base table) and the known-vector test caught it before any WAL was written - the reason a wrong-but-self-consistent checksum must be tested against an external constant."
+    },
+    {
+      "id": "experiment-ann-recall-limit",
       "source": "tool_result",
       "command": "python3 -I tools/benchmark.py --binary target/release/minivectordb --mode ann",
-      "output": "10000 rows, 128 dimensions, 1000 queries, K=10: write_seconds=1.117449, query_seconds=0.931152, queries_per_second=1073.938, sample_recall_at_10=1.0, data_file_bytes=5516704. This is a local WSL measurement, not an official score."
+      "output": "IVF-Flat (deterministic k-means, sqrt(n) lists, nprobe = nlist/2) on 128-dim uniform data: recall_at_10 unfiltered 0.84, filtered 0.8318 - below the hard 0.95 gate. Decision: exact scanning is the submission mode; IVF remains for --mode ann on clusterable data; the benchmark's ann mode fails its own >= 0.95 assertion there by design."
     }
   ],
   "retrospective": [
@@ -73,11 +147,21 @@
       "id": "iteration-2",
       "source": "agent",
       "content": "A memory review found that checkpointing initially materialized every evicted vector before writing. Checkpoint serialization was changed to materialize one row at a time, and checkpoint startup chooses uncached vector loading when the generation exceeds the arena budget. Forced-checkpoint and zero-arena tests passed after this correction."
+    },
+    {
+      "id": "iteration-3",
+      "source": "agent",
+      "content": "The failed first submission was treated as a measurement, not a loss: its all-cases failure with a working local suite pointed at transport, and the follow-up evidence gathering (fork archaeology plus re-reading the official README) converted a guess into a root cause with three specific mismatches. The protocol layer now defaults to the evidence-backed shape and keeps four verified fallbacks switchable by one environment variable, so reacting to the official driver when it publishes is a configuration change, not a rewrite."
+    },
+    {
+      "id": "iteration-4",
+      "source": "agent",
+      "content": "Performance work followed weights from the scoring formula (query time 40%, write 20%, I/O 20%, memory 20% of the composite index): the flat scan cache adds one contiguous vector buffer and evicts per-row copies after the build so steady-state memory stays flat; exact mode no longer materializes IVF indexes it never probes, which removes index-build I/O and memory from the measured window; the transient build peak (~5 MiB) was accepted after estimating it is cheaper than re-reading vectors from the WAL, which would trade measured read bytes for memory."
     }
   ],
   "limitations": [
-    "The official evaluation wire protocol and frozen resource/error mapping were not available in the public branch when this material was recorded. The local JSON transport is not claimed to be official; formal submission requires adapting it to the published driver.",
-    "ANN currently scans all visible candidates with float32 distance accumulation and does not use IVF/HNSW pruning. Recall is favored over index speedup; no platform rank or score is claimed.",
-    "Only the two short student prompts above are present. Agent design explanations and test output are not represented as independent student understanding or student-originated verification."
+    "The official evaluation wire protocol and frozen resource/error mapping were still unpublished when this material was recorded. The default jsonl transport mirrors the official .result assertion vocabulary and is the best-evidence choice, not a confirmed one; four verified fallbacks exist for the same reason. The remaining daily submission attempt is deliberately held until the official driver or a precheck entry is available.",
+    "IVF-Flat recall on 128-dim uniform benchmark data is ~0.84, so the submission mode is exact scanning; ANN with the index remains available for smaller or clusterable datasets. No platform rank or score is claimed.",
+    "Most technical work in this material was performed by the agent under the student's direction, verification requests and quota decisions; agent output is labeled as such and is not claimed as independent student understanding. Only the quoted prompts are the student's own words."
   ]
 }

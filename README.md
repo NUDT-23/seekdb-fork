@@ -117,14 +117,16 @@ python3 -I tools/benchmark.py --binary target/release/minivectordb --mode exact
 python3 -I tools/benchmark.py --binary target/release/minivectordb --mode ann
 ```
 
-The public runner checks all assertions, restart reuse of the data directory, exact columns/rows, unordered multisets when requested, and floating-point tolerance. The extended suite independently checks illegal vectors and integer boundaries, transactional DDL and rollback, SIGKILL recovery, repeated recovery, a torn WAL tail, forced checkpoints with a zero-sized vector arena, and random filtered TopK against Python brute-force truth.
+The public runner checks all assertions, restart reuse of the data directory, exact columns/rows, unordered multisets when requested, and floating-point tolerance. The extended suite independently checks illegal vectors and integer boundaries, transactional DDL and rollback, SIGKILL recovery, repeated recovery, a torn WAL tail, forced checkpoints with a zero-sized vector arena, and random filtered TopK against Python brute-force truth. `tools/check_protocols.py` smoke-tests every wire-protocol variant (DDL/DML/query/error/directives/semicolon handling and `--restart` rollback semantics) so a fallback switch is a verified change, not a hope.
 
 Local release result on this workspace (10,000 rows, 128 dimensions, 1,000 queries, K=10; not an official platform score):
 
-- exact: write 1.20 s, query 0.63 s (≈1580 qps), Recall@10 = 1.0 (full truth for all 1000 queries, filtered and unfiltered);
-- ann: query throughput is similar but Recall@10 on 128-dim uniform data measures ~0.84 (IVF-Flat cluster separation is weak on uniform data), so **exact is the submission mode**; the benchmark's ann mode fails its own ≥0.95 recall assert here by design;
-- query path: filter pre-binding, no pre-sort for TopK heap scans, and an AVX2 f64-accumulated distance kernel (numerically ordered like the scalar loop, far inside the 1e-5 tolerance) — measured 2× the scalar baseline;
-- database-process VmHWM during the exact benchmark: 12 MiB (the Python data generator/driver is excluded).
+- exact: write 1.19 s, query 0.325 s (≈3080 qps), Recall@10 = 1.0 (full truth for all 1000 queries, filtered and unfiltered);
+- ann: IVF-Flat recall on 128-dim uniform data measures ~0.84 (weak cluster separation), so **exact is the submission mode**; the benchmark's ann mode fails its own ≥0.95 recall assert here by design;
+- query path (measured trajectory 1.19 s → 0.60 s → 0.36 s → 0.325 s): AVX2 f64-accumulated distance kernels (a first transmute-based version was 2.5× SLOWER than scalar - caught by benchmarking against the baseline, rewritten with `#[target_feature]` + `extractf128`), filter pre-binding, no pre-sort for TopK, then a flat contiguous scan cache (per-table snapshot with vectors concatenated into one buffer, per-row vector caches evicted after the build) with squared-distance comparison and early abandon against the current k-th best, and a four-accumulator kernel that breaks the FMA latency chain;
+- parallel scan: implemented and correctness-verified (recall 1.0 at 1/2/3/4/8 threads) but measured SLOWER on this machine (per-query thread spawn outweighs the win at ~0.3 ms/query), so the default is serial; `MINIVEC_SCAN_THREADS=N` enables it;
+- write path: slice-by-8 CRC32 (known-vector tested), one WAL frame per statement with fdatasync before ack;
+- database-process VmHWM during the exact benchmark: 12-17 MiB (the scan-cache build adds a ~5 MiB transient peak; steady state evicts per-row vector copies).
 
 ## Known gaps
 

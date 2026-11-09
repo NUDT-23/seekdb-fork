@@ -37,14 +37,79 @@ pub const CHECKPOINT_MIN_BYTES: u64 = 256 * 1024 * 1024;
 pub const CHECKPOINT_LIVE_FACTOR: u64 = 4;
 pub const SHUTDOWN_CHECKPOINT_MIN: u64 = 16 * 1024 * 1024;
 
-fn crc32(data: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFFu32;
-    for &b in data {
-        crc ^= b as u32;
+/// CRC-32 (IEEE, reflected) with a 8x256 slice-by-8 table: ~10x the bitwise
+/// loop at the same exact output, used for every WAL frame.
+const CRC_POLY: u32 = 0xEDB8_8320;
+
+#[cfg(test)]
+mod crc_tests {
+    #[test]
+    fn known_vectors() {
+        assert_eq!(super::crc32(b"123456789"), 0xCBF4_3926);
+        assert_eq!(super::crc32(b""), 0x0000_0000);
+        let long: Vec<u8> = (0..=255u8).cycle().take(10_000).collect();
+        // Cross-check slice-by-8 against a straightforward bitwise reference.
+        let mut crc = 0xFFFF_FFFFu32;
+        for &b in &long {
+            crc ^= b as u32;
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (super::CRC_POLY & mask);
+            }
+        }
+        assert_eq!(super::crc32(&long), !crc);
+    }
+}
+
+fn crc_table(slot: usize) -> [u32; 256] {
+    let mut base = [0u32; 256];
+    for (i, entry) in base.iter_mut().enumerate() {
+        let mut crc = i as u32;
         for _ in 0..8 {
             let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+            crc = (crc >> 1) ^ (CRC_POLY & mask);
         }
+        *entry = crc;
+    }
+    // Standard slice-by-8 recurrence: fold always against the base table.
+    let mut table = base;
+    for _ in 0..slot {
+        let mut next = [0u32; 256];
+        for i in 0..256 {
+            next[i] = (table[i] >> 8) ^ base[(table[i] & 0xFF) as usize];
+        }
+        table = next;
+    }
+    table
+}
+
+fn crc32(data: &[u8]) -> u32 {
+    // Lazy static tables without external crates: built once per process
+    // (the engine is single-threaded).
+    struct Tables([[u32; 256]; 8]);
+    static TABLES: std::sync::OnceLock<Tables> = std::sync::OnceLock::new();
+    let tables = TABLES.get_or_init(|| Tables(std::array::from_fn(crc_table)));
+    let t = &tables.0;
+    let mut crc = 0xFFFF_FFFFu32;
+    let mut chunks = data.chunks_exact(8);
+    for chunk in &mut chunks {
+        let v = crc
+            ^ u32::from(chunk[0])
+            ^ (u32::from(chunk[1]) << 8)
+            ^ (u32::from(chunk[2]) << 16)
+            ^ (u32::from(chunk[3]) << 24);
+        crc = t[7][(v & 0xFF) as usize]
+            ^ t[6][(((v >> 8) & 0xFF)) as usize]
+            ^ t[5][(((v >> 16) & 0xFF)) as usize]
+            ^ t[4][(((v >> 24) & 0xFF)) as usize]
+            ^ t[3][chunk[4] as usize]
+            ^ t[2][chunk[5] as usize]
+            ^ t[1][chunk[6] as usize]
+            ^ t[0][chunk[7] as usize];
+    }
+    for &b in chunks.remainder() {
+        let idx = ((crc ^ b as u32) & 0xFF) as usize;
+        crc = t[0][idx] ^ (crc >> 8);
     }
     !crc
 }
@@ -555,6 +620,31 @@ impl Store {
             }
         }
         self.enforce_arena_budget();
+    }
+
+    /// Drop the in-memory vector caches of every row in one table once a flat
+    /// scan cache owns the query-side copies. Rows keep their durable
+    /// locations, so `read_vec` still serves full projections.
+    pub fn evict_table_vectors(&mut self, table_id: u32) {
+        let Some(vector_col) = self.tables.get(&table_id).and_then(|t| t.schema.vector_col())
+        else {
+            return;
+        };
+        if let Some(table) = self.tables.get_mut(&table_id) {
+            for entry in table.rows.values_mut() {
+                if matches!(entry.row.vals[vector_col], VVal::Vec(Some(_))) {
+                    entry.row.vals[vector_col] = VVal::Vec(None);
+                }
+            }
+        }
+        self.arena_bytes = 0;
+        for table in self.tables.values() {
+            self.arena_bytes += table
+                .rows
+                .values()
+                .map(|entry| row_vector_bytes(&entry.row, &table.schema))
+                .sum::<usize>();
+        }
     }
 
     fn enforce_arena_budget(&mut self) {

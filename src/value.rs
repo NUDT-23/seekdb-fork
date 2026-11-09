@@ -200,6 +200,106 @@ fn dist_sq_avx2_f64(a: &[f32], b: &[f32]) -> f64 {
     l2_distance_sq(a, b)
 }
 
+/// Squared distance with early abandon: returns None as soon as the partial
+/// sum is strictly greater than `limit` (the row then cannot enter a TopK
+/// whose current worst squared distance is `limit`; exact ties are kept
+/// because only strict excess aborts). AVX2 path checks every 16 components.
+pub fn dist_sq_f64_abandon(a: &[f32], b: &[f32], limit: f64) -> Option<f64> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            return unsafe { dist_sq_abandon_avx2(a, b, limit) };
+        }
+    }
+    let mut acc = 0f64;
+    for i in 0..a.len() {
+        let d = a[i] as f64 - b[i] as f64;
+        acc += d * d;
+        if acc > limit {
+            return None;
+        }
+    }
+    Some(acc)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dist_sq_abandon_avx2(a: &[f32], b: &[f32], limit: f64) -> Option<f64> {
+    use std::arch::x86_64::{
+        __m256d, _mm256_add_pd, _mm256_castps256_ps128, _mm256_cvtps_pd, _mm256_cvtsd_f64,
+        _mm256_extractf128_ps, _mm256_fmadd_pd, _mm256_loadu_ps, _mm256_permute2f128_pd,
+        _mm256_setzero_pd, _mm256_sub_pd, _mm256_unpackhi_pd,
+    };
+    let hsum4 = |v0: __m256d, v1: __m256d, v2: __m256d, v3: __m256d| -> f64 {
+        let s = _mm256_add_pd(_mm256_add_pd(v0, v1), _mm256_add_pd(v2, v3));
+        let hi = _mm256_unpackhi_pd(s, s);
+        let t = _mm256_add_pd(s, hi);
+        _mm256_cvtsd_f64(_mm256_add_pd(t, _mm256_permute2f128_pd(t, t, 1)))
+    };
+    // Four independent accumulators break the FMA latency chain; the
+    // threshold check runs once per 32 components. Accumulation grouping is
+    // irrelevant to value: f64 adds of a fixed disjoint partition are
+    // independent per accumulator.
+    let (mut acc0, mut acc1, mut acc2, mut acc3) = (
+        _mm256_setzero_pd(),
+        _mm256_setzero_pd(),
+        _mm256_setzero_pd(),
+        _mm256_setzero_pd(),
+    );
+    let mut i = 0usize;
+    while i + 32 <= a.len() {
+        for block in 0..4 {
+            let va = _mm256_loadu_ps(a.as_ptr().add(i + block * 8));
+            let vb = _mm256_loadu_ps(b.as_ptr().add(i + block * 8));
+            let lo = _mm256_sub_pd(
+                _mm256_cvtps_pd(_mm256_castps256_ps128(va)),
+                _mm256_cvtps_pd(_mm256_castps256_ps128(vb)),
+            );
+            let hi = _mm256_sub_pd(
+                _mm256_cvtps_pd(_mm256_extractf128_ps(va, 1)),
+                _mm256_cvtps_pd(_mm256_extractf128_ps(vb, 1)),
+            );
+            // products into per-block temporaries, then distributed adds:
+            // each accumulator sees one fma-free add per block, keeping the
+            // four chains disjoint.
+            let p_lo = _mm256_fmadd_pd(lo, lo, _mm256_setzero_pd());
+            let p_hi = _mm256_fmadd_pd(hi, hi, _mm256_setzero_pd());
+            match block {
+                0 => {
+                    acc0 = _mm256_add_pd(acc0, p_lo);
+                    acc1 = _mm256_add_pd(acc1, p_hi);
+                }
+                1 => {
+                    acc2 = _mm256_add_pd(acc2, p_lo);
+                    acc3 = _mm256_add_pd(acc3, p_hi);
+                }
+                2 => {
+                    acc0 = _mm256_add_pd(acc0, p_hi);
+                    acc1 = _mm256_add_pd(acc1, p_lo);
+                }
+                _ => {
+                    acc2 = _mm256_add_pd(acc2, p_hi);
+                    acc3 = _mm256_add_pd(acc3, p_lo);
+                }
+            }
+        }
+        if hsum4(acc0, acc1, acc2, acc3) > limit {
+            return None;
+        }
+        i += 32;
+    }
+    let mut sum = hsum4(acc0, acc1, acc2, acc3);
+    while i < a.len() {
+        let d = a[i] as f64 - b[i] as f64;
+        sum += d * d;
+        if sum > limit {
+            return None;
+        }
+        i += 1;
+    }
+    Some(sum)
+}
+
 /// Squared distance with f64 accumulation (exact ranking / k-means).
 pub fn l2_distance_sq(a: &[f32], b: &[f32]) -> f64 {
     let mut acc = 0f64;

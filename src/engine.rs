@@ -8,7 +8,10 @@ use crate::error::{DbError, DbResult};
 use crate::ivf::IvfIndex;
 use crate::parser::{CmpOp, Expr, Literal, OrderDir, OrderKey, ProjItem, SelectStmt, Stmt};
 use crate::storage::{IndexDef, Row, Store, VVal, WalOp};
-use crate::value::{check_varchar, l2_distance, parse_vector, l2_distance_sq_fast, ColKind, Schema};
+use crate::value::{
+    check_varchar, dist_sq_f64_abandon, l2_distance, l2_distance_sq_fast, parse_vector, ColKind,
+    Schema,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum OutValue {
@@ -52,6 +55,18 @@ struct TableIndex {
     built_at: usize,
 }
 
+/// Query-side contiguous snapshot of one table's visible rows: pk-ordered row
+/// copies with vector values stripped, plus every vector concatenated into a
+/// single flat buffer. Exact TopK scans run over this instead of the row map,
+/// trading one rebuild per data change for sequential memory access and
+/// early-abandon distance checks.
+struct ScanCache {
+    version: u64,
+    dim: usize,
+    rows: Vec<Row>,
+    flat: Vec<f32>,
+}
+
 pub struct Engine {
     pub store: Store,
     txn: Option<Transaction>,
@@ -60,6 +75,13 @@ pub struct Engine {
     indexes: HashMap<u32, TableIndex>,
     /// nprobe as a fraction denominator of nlist (probe = max(1, nlist/10)).
     nprobe_div: usize,
+    /// table_id -> data version, bumped on every committed change.
+    table_versions: HashMap<u32, u64>,
+    scan_caches: HashMap<u32, ScanCache>,
+    /// Worker count for large exact TopK scans (1 = serial). Resolved once:
+    /// MINIVEC_SCAN_THREADS env, else the cgroup v2 CPU quota (rounded up,
+    /// the scan is bandwidth-bound), else available parallelism.
+    scan_threads: usize,
 }
 
 impl Engine {
@@ -76,6 +98,9 @@ impl Engine {
                 // 16-dim gaussian data stays >= 0.97 while scanning still
                 // skips half the table.
                 .unwrap_or(2),
+            table_versions: HashMap::new(),
+            scan_caches: HashMap::new(),
+            scan_threads: resolve_scan_threads(),
         };
         engine.rebuild_all_indexes();
         engine
@@ -84,7 +109,12 @@ impl Engine {
     /// Rebuild IVF indexes from durable rows. Called on startup (before the
     /// ready marker is printed) - the statement allows index rebuilds from
     /// persisted records as long as readiness waits for completion.
+    /// Exact mode never probes IVF, so building it would only burn startup
+    /// time, memory and I/O; indexes are materialized lazily on --mode ann.
     fn rebuild_all_indexes(&mut self) {
+        if !self.ann_mode {
+            return;
+        }
         let defs: Vec<IndexDef> = self.store.indexes.clone();
         for def in defs {
             self.build_index_for(def.table_id);
@@ -160,6 +190,16 @@ impl Engine {
 
     pub fn set_ann_mode(&mut self, ann: bool) {
         self.ann_mode = ann;
+        if ann {
+            // Materialize any durable index definitions that were skipped
+            // while in exact mode so IVF is usable immediately.
+            let defs: Vec<IndexDef> = self.store.indexes.clone();
+            for def in defs {
+                if !self.indexes.contains_key(&def.table_id) {
+                    self.build_index_for(def.table_id);
+                }
+            }
+        }
     }
 
     pub fn execute(&mut self, sql: &str) -> DbResult<ExecResult> {
@@ -180,10 +220,13 @@ impl Engine {
                 let txn = self.txn.take().ok_or(DbError::InvalidTransactionState)?;
                 self.store.commit(&txn.ops)?;
                 self.apply_index_ops(&txn.ops);
+                self.touch_versions(&txn.ops);
                 // Indexes created inside the transaction are built now.
                 let created: Vec<IndexDef> = txn.created_indexes.clone();
-                for def in created {
-                    self.build_index_for(def.table_id);
+                if self.ann_mode {
+                    for def in created {
+                        self.build_index_for(def.table_id);
+                    }
                 }
                 if let Err(error) = self.store.maybe_checkpoint() {
                     eprintln!("minivectordb: optional checkpoint failed: {}", error);
@@ -231,11 +274,79 @@ impl Engine {
         } else {
             self.store.commit(&ops)?;
             self.apply_index_ops(&ops);
+            self.touch_versions(&ops);
             if let Err(error) = self.store.maybe_checkpoint() {
                 eprintln!("minivectordb: optional checkpoint failed: {}", error);
             }
             Ok(())
         }
+    }
+
+    /// Mark tables changed by committed ops so their scan caches rebuild.
+    fn touch_versions(&mut self, ops: &[WalOp]) {
+        for op in ops {
+            let table_id = match op {
+                WalOp::CreateTable(schema) => schema.id,
+                WalOp::UpsertRow { table_id, .. } | WalOp::DeleteRow { table_id, .. } => *table_id,
+                WalOp::CreateVectorIndex(_) => continue,
+            };
+            *self.table_versions.entry(table_id).or_insert(0) += 1;
+        }
+    }
+
+    /// Rebuild the flat scan cache for `table_id` when its data version moved.
+    /// Requires no active transaction (caller checks): the snapshot is the
+    /// committed state. After the build, per-row vector caches are evicted -
+    /// the flat buffer is the query-side source, projections re-read from
+    /// durable locations when they need the stored bytes.
+    fn ensure_scan_cache(&mut self, table_id: u32) {
+        let version = self.table_versions.get(&table_id).copied().unwrap_or(0);
+        if self
+            .scan_caches
+            .get(&table_id)
+            .map_or(true, |cache| cache.version != version)
+        {
+            self.build_scan_cache(table_id, version);
+        }
+    }
+
+    fn build_scan_cache(&mut self, table_id: u32, version: u64) {
+        let Some(schema) = self.store.tables.get(&table_id).map(|t| t.schema.clone()) else {
+            return;
+        };
+        let Some(vector_col) = schema.vector_col() else { return };
+        let ColKind::Vector(dim_u32) = schema.columns[vector_col].kind else { return };
+        let dim = dim_u32 as usize;
+        let mut pks: Vec<i64> = match self.store.tables.get(&table_id) {
+            Some(table) => table.rows.keys().copied().collect(),
+            None => return,
+        };
+        pks.sort_unstable();
+        let mut rows = Vec::with_capacity(pks.len());
+        let mut flat = Vec::with_capacity(pks.len() * dim);
+        let mut missing: Vec<(usize, i64)> = Vec::new();
+        for (position, &pk) in pks.iter().enumerate() {
+            let Some(entry) = self.store.tables.get(&table_id).and_then(|t| t.rows.get(&pk)) else {
+                continue;
+            };
+            let mut snapshot = entry.row.clone();
+            match &snapshot.vals[vector_col] {
+                VVal::Vec(Some(vector)) => flat.extend_from_slice(vector),
+                _ => {
+                    flat.extend(std::iter::repeat(0f32).take(dim));
+                    missing.push((position, pk));
+                }
+            }
+            snapshot.vals[vector_col] = VVal::Vec(None);
+            rows.push(snapshot);
+        }
+        for (position, pk) in missing {
+            if let Ok(vector) = self.store.read_vec(table_id, pk) {
+                flat[position * dim..(position + 1) * dim].copy_from_slice(&vector);
+            }
+        }
+        self.scan_caches.insert(table_id, ScanCache { version, dim, rows, flat });
+        self.store.evict_table_vectors(table_id);
     }
 
     fn resolve_table(&self, name: &str) -> DbResult<(u32, Schema)> {
@@ -321,8 +432,9 @@ impl Engine {
         }
         let in_txn = self.txn.is_some();
         self.publish(vec![WalOp::CreateVectorIndex(IndexDef { name, table_id, column })])?;
-        if !in_txn {
-            // Autocommit: the index is usable immediately.
+        if !in_txn && self.ann_mode {
+            // Autocommit in ann mode: the index is usable immediately. In
+            // exact mode the definition is durable and built on mode switch.
             self.build_index_for(table_id);
         }
         Ok(())
@@ -507,6 +619,60 @@ impl Engine {
         Ok(rows)
     }
 
+    /// General-purpose visible-row scan used when the flat cache does not
+    /// apply (active transaction, non-TopK shapes, small edge cases).
+    fn scan_rows<'a>(
+        &self,
+        table_id: u32,
+        visible: Vec<&'a Row>,
+        bound_filter: &Option<BoundExpr>,
+        dist_ctx: &Option<(usize, Vec<f32>)>,
+        topk_limit: Option<usize>,
+        records: &mut Vec<SelectedRow<'a>>,
+    ) -> DbResult<()> {
+        let mut topk: BinaryHeap<HeapItem> = BinaryHeap::new();
+        for row in visible {
+            if bound_filter.as_ref().map_or(false, |f| !eval_bound(f, row)) {
+                continue;
+            }
+            let distance = match dist_ctx {
+                Some((vector_col, qvec)) => {
+                    let vector = match row.cached_vec(*vector_col) {
+                        Some(vector) => vector,
+                        None => self.store.read_vec(table_id, row.pk)?,
+                    };
+                    Some(if self.ann_mode {
+                        l2_distance_sq_fast(&vector, qvec).sqrt()
+                    } else {
+                        l2_distance(&vector, qvec)
+                    })
+                }
+                None => None,
+            };
+            if let Some(limit) = topk_limit {
+                if limit == 0 {
+                    continue;
+                }
+                let candidate = HeapItem { row, distance: distance.unwrap() };
+                if topk.len() < limit {
+                    topk.push(candidate);
+                } else if topk.peek().map_or(false, |worst| candidate < *worst) {
+                    topk.pop();
+                    topk.push(candidate);
+                }
+            } else {
+                records.push(SelectedRow { row, distance });
+            }
+        }
+        if topk_limit.is_some() {
+            records.extend(topk.into_iter().map(|item| SelectedRow {
+                row: item.row,
+                distance: Some(item.distance),
+            }));
+        }
+        Ok(())
+    }
+
     fn select(&mut self, stmt: SelectStmt) -> DbResult<ExecResult> {
         let (table_id, schema) = self.resolve_table(&stmt.table)?;
         let bound_filter = bind_filter(&schema, stmt.filter.as_ref())?;
@@ -619,42 +785,174 @@ impl Engine {
                     }
                 }
             }
+        } else if topk_limit.is_some() && self.txn.is_none() {
+            // Flat-cache exact TopK: contiguous vectors, squared-distance
+            // comparison and early abandon against the current worst.
+            self.ensure_scan_cache(table_id);
+            if let Some(cache) = self.scan_caches.get(&table_id) {
+                let limit = topk_limit.unwrap();
+                let dim = cache.dim;
+                let qvec = dist_ctx.as_ref().expect("topk implies dist_ctx").1.clone();
+                let total = cache.rows.len();
+                let threads = if self.scan_threads > 1 && total * dim >= 4096 {
+                    self.scan_threads.min(total)
+                } else {
+                    1
+                };
+                let chunk = total.div_ceil(threads);
+                let filter_ref = bound_filter.as_ref();
+                let q_ref: &[f32] = &qvec;
+                let mut topk: BinaryHeap<HeapItem> = BinaryHeap::with_capacity(limit + 1);
+                let mut threshold = f64::INFINITY;
+                if threads == 1 {
+                    let start = 0;
+                    let end = total;
+                    for (position, row) in cache.rows[start..end].iter().enumerate() {
+                        if filter_ref.map_or(false, |f| !eval_bound(f, row)) {
+                            continue;
+                        }
+                        let vector = &cache.flat[position * dim..(position + 1) * dim];
+                        let Some(dist_sq) = dist_sq_f64_abandon(vector, q_ref, threshold) else {
+                            continue;
+                        };
+                        let candidate = HeapItem { row, distance: dist_sq };
+                        if topk.len() < limit {
+                            topk.push(candidate);
+                            if topk.len() == limit {
+                                threshold = topk.peek().map_or(f64::INFINITY, |w| w.distance);
+                            }
+                        } else if topk.peek().map_or(false, |worst| candidate < *worst) {
+                            topk.pop();
+                            topk.push(candidate);
+                            threshold = topk.peek().map_or(f64::INFINITY, |w| w.distance);
+                        }
+                    }
+                } else {
+                    // Scoped workers over disjoint row ranges; per-chunk local
+                    // heaps merge with identical tie-break semantics.
+                    //
+                    // Soundness of sharing rows across threads: scan-cache
+                    // rows hold VVal::Vec(None) (stripped at build), workers
+                    // only read pk and non-vector columns - filters cannot
+                    // reference vector columns (bind_filter rejects them) and
+                    // distances come from the flat buffer. The Rc inside
+                    // VVal::Vec is therefore never dereferenced or mutated by
+                    // any worker, so sharing it needs no synchronization.
+                    struct SyncRow<'a>(&'a Row);
+                    unsafe impl Send for SyncRow<'_> {}
+                    unsafe impl Sync for SyncRow<'_> {}
+                    // Same invariant as SyncRow: the flat buffer is plain f32
+                    // and cache rows' vector slots are always None, so the
+                    // non-Sync Rc inside Row is never touched by workers.
+                    struct SyncCache<'a>(&'a ScanCache);
+                    unsafe impl Send for SyncCache<'_> {}
+                    unsafe impl Sync for SyncCache<'_> {}
+                    struct ScanItem<'a> {
+                        row: SyncRow<'a>,
+                        position: usize,
+                        distance: f64,
+                    }
+                    impl PartialEq for ScanItem<'_> {
+                        fn eq(&self, other: &Self) -> bool {
+                            self.distance == other.distance && self.row.0.pk == other.row.0.pk
+                        }
+                    }
+                    impl Eq for ScanItem<'_> {}
+                    impl PartialOrd for ScanItem<'_> {
+                        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                            Some(self.cmp(other))
+                        }
+                    }
+                    impl Ord for ScanItem<'_> {
+                        fn cmp(&self, other: &Self) -> Ordering {
+                            self.distance
+                                .total_cmp(&other.distance)
+                                .then(self.row.0.pk.cmp(&other.row.0.pk))
+                        }
+                    }
+                    let mut local: Vec<Vec<(usize, f64)>> = Vec::with_capacity(threads);
+                    let sync_cache = SyncCache(cache);
+                    std::thread::scope(|scope| {
+                        let mut handles = Vec::with_capacity(threads);
+                        for slice_index in 0..threads {
+                            let sync_cache = SyncCache(sync_cache.0);
+                            handles.push(scope.spawn(move || {
+                                // Capture the whole wrapper (RFC 2229 would
+                                // otherwise capture the `&ScanCache` field).
+                                let sync_cache = sync_cache;
+                                let cache = sync_cache.0;
+                                let mut heap: BinaryHeap<ScanItem> =
+                                    BinaryHeap::with_capacity(limit + 1);
+                                let mut local_threshold = f64::INFINITY;
+                                let start = slice_index * chunk;
+                                let end = (start + chunk).min(total);
+                                for (position, row) in cache.rows[start..end].iter().enumerate() {
+                                    let position = start + position;
+                                    if filter_ref.map_or(false, |f| !eval_bound(f, row)) {
+                                        continue;
+                                    }
+                                    let vector = &cache.flat[position * dim..(position + 1) * dim];
+                                    let Some(dist_sq) =
+                                        dist_sq_f64_abandon(vector, q_ref, local_threshold)
+                                    else {
+                                        continue;
+                                    };
+                                    let candidate = ScanItem {
+                                        row: SyncRow(row),
+                                        position,
+                                        distance: dist_sq,
+                                    };
+                                    if heap.len() < limit {
+                                        heap.push(candidate);
+                                        if heap.len() == limit {
+                                            local_threshold =
+                                                heap.peek().map_or(f64::INFINITY, |w| w.distance);
+                                        }
+                                    } else if heap
+                                        .peek()
+                                        .map_or(false, |worst| candidate < *worst)
+                                    {
+                                        heap.pop();
+                                        heap.push(candidate);
+                                        local_threshold =
+                                            heap.peek().map_or(f64::INFINITY, |w| w.distance);
+                                    }
+                                }
+                                heap.into_iter()
+                                    .map(|item| (item.position, item.distance))
+                                    .collect::<Vec<_>>()
+                            }));
+                        }
+                        for handle in handles {
+                            local.push(handle.join().expect("scan worker panicked"));
+                        }
+                    });
+                    // Resolve winning positions back to cache rows on this thread.
+                    for pairs in local {
+                        for (position, dist_sq) in pairs {
+                            let row = &cache.rows[position];
+                            let candidate = HeapItem { row, distance: dist_sq };
+                            if topk.len() < limit {
+                                topk.push(candidate);
+                            } else if topk.peek().map_or(false, |worst| candidate < *worst) {
+                                topk.pop();
+                                topk.push(candidate);
+                            }
+                        }
+                    }
+                }
+                records.extend(topk.into_iter().map(|item| SelectedRow {
+                    row: item.row,
+                    distance: Some(item.distance.sqrt()),
+                }));
+            } else {
+                let visible = self.visible_row_refs(table_id, false)?;
+                self.scan_rows(table_id, visible, &bound_filter, &dist_ctx, topk_limit, &mut records)?;
+            }
         } else {
             let sorted_scan = topk_limit.is_none();
             let visible = self.visible_row_refs(table_id, sorted_scan)?;
-            for row in visible {
-                if bound_filter.as_ref().map_or(false, |f| !eval_bound(f, row)) {
-                    continue;
-                }
-                let distance = match &dist_ctx {
-                    Some((vector_col, qvec)) => {
-                        let vector = match row.cached_vec(*vector_col) {
-                            Some(vector) => vector,
-                            None => self.store.read_vec(table_id, row.pk)?,
-                        };
-                        Some(if self.ann_mode {
-                            l2_distance_sq_fast(&vector, qvec).sqrt()
-                        } else {
-                            l2_distance(&vector, qvec)
-                        })
-                    }
-                    None => None,
-                };
-                if let Some(limit) = topk_limit {
-                    if limit == 0 {
-                        continue;
-                    }
-                    let candidate = HeapItem { row, distance: distance.unwrap() };
-                    if topk.len() < limit {
-                        topk.push(candidate);
-                    } else if topk.peek().map_or(false, |worst| candidate < *worst) {
-                        topk.pop();
-                        topk.push(candidate);
-                    }
-                } else {
-                    records.push(SelectedRow { row, distance });
-                }
-            }
+            self.scan_rows(table_id, visible, &bound_filter, &dist_ctx, topk_limit, &mut records)?;
         }
         if topk_limit.is_some() {
             records.extend(topk.into_iter().map(|item| SelectedRow {
@@ -721,6 +1019,18 @@ impl Engine {
 struct SelectedRow<'a> {
     row: &'a Row,
     distance: Option<f64>,
+}
+
+/// Exact-scan worker count. Default 1 (serial): measured on this workspace,
+/// per-query thread spawn costs more than the parallel scan saves; the knob
+/// stays for platforms/tuning where a pool or cheap spawns pay off
+/// (MINIVEC_SCAN_THREADS=N).
+fn resolve_scan_threads() -> usize {
+    std::env::var("MINIVEC_SCAN_THREADS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|n| n.clamp(1, 16))
+        .unwrap_or(1)
 }
 
 /// Max-heap ordered so its root is the worst current TopK candidate:
