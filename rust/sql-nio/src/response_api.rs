@@ -118,6 +118,8 @@ where
             };
             g.response.batch.truncate(old_len + actual_usize);
             g.response.next_mysql_seq = next_seq;
+            g.response
+                .capture_frames(&g.response.batch[old_len..old_len + actual_usize]);
             unsafe { framed_len.write(actual) };
             return 0;
         }
@@ -169,6 +171,8 @@ where
             return -1;
         }
         g.response.next_mysql_seq = next_seq;
+        g.response
+            .capture_frames(&g.response.batch[old_len..new_len]);
         unsafe { framed_len.write(encoded) };
         return 0;
     }
@@ -251,6 +255,8 @@ pub(crate) unsafe fn append_fixed_response(
         ]);
         g.response.batch.extend_from_slice(payload);
         g.response.next_mysql_seq = seq.wrapping_add(1);
+        g.response
+            .capture_frames(&g.response.batch[old_len..old_len + frame_len]);
         unsafe { framed_len.write(frame_len_i64) };
         return 0;
     }
@@ -418,6 +424,7 @@ pub(crate) unsafe fn append_single_field_metadata(
         }
     };
     response_writer.next_mysql_seq = next_seq;
+    response_writer.capture_frames(&response_writer.batch[old_len..new_len]);
     unsafe {
         packet_count.write(semantic_packet_count);
         framed_len.write(framed_len_i64);
@@ -563,6 +570,8 @@ pub unsafe extern "C" fn nio_response_append_resultset_metadata(
         }
     };
     g.response.next_mysql_seq = next_seq;
+    g.response
+        .capture_frames(&g.response.batch[old_len..new_len]);
     unsafe {
         packet_count.write(semantic_packet_count);
         framed_len.write(framed_len_i64);
@@ -963,4 +972,160 @@ pub unsafe extern "C" fn nio_response_flush(
     } else {
         drain_blocking_response(conn, generation)
     }
+}
+
+/// # Safety
+/// `connection_handle` is null or is a live acquired handle and must not be
+/// released until this call returns; `response` has `response_len` writable
+/// bytes and `captured_len` is writable.
+#[no_mangle]
+pub unsafe extern "C" fn nio_response_capture(
+    connection_handle: *mut NioConnectionHandle,
+    generation: u64,
+    response: *mut c_char,
+    response_len: i64,
+    captured_len: *mut i64,
+) -> c_int {
+    if response.is_null() || captured_len.is_null() || response_len < 0 {
+        return -1;
+    }
+    let capacity = match usize::try_from(response_len) {
+        Ok(capacity) => capacity,
+        Err(_) => return -1,
+    };
+    let conn = match unsafe { connection_handle.as_ref() } {
+        Some(handle) if !handle.conn.close_notified.load(Ordering::Acquire) => &handle.conn,
+        None => return -1,
+        Some(_) => return -1,
+    };
+    let g = conn.mu.lock().unwrap();
+    unsafe { captured_len.write(0) };
+    if !valid_request_generation(conn, generation)
+        || !g.response.is_active(generation)
+        || g.final_response != FinalResponseState::Idle
+        || conn.err.load(Ordering::Acquire)
+    {
+        return -1;
+    }
+    let captured = &g.response.captured;
+    if captured.is_empty() || !g.response.captured_complete || captured.len() > capacity {
+        return -1;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(captured.as_ptr(), response.cast::<u8>(), captured.len());
+        captured_len.write(captured.len() as i64);
+    }
+    0
+}
+
+/// # Safety
+/// `connection_handle` is null or is a live acquired handle and must not be
+/// released until this call returns.
+#[no_mangle]
+pub unsafe extern "C" fn nio_response_capture_start(
+    connection_handle: *mut NioConnectionHandle,
+    generation: u64,
+) -> c_int {
+    let conn = match unsafe { connection_handle.as_ref() } {
+        Some(handle) if !handle.conn.close_notified.load(Ordering::Acquire) => &handle.conn,
+        None => return -1,
+        Some(_) => return -1,
+    };
+    let mut g = conn.mu.lock().unwrap();
+    if !valid_request_generation(conn, generation)
+        || !g.response.is_active(generation)
+        || g.final_response != FinalResponseState::Idle
+        || conn.err.load(Ordering::Acquire)
+        || !g.response.captured_complete
+        || !g.response.captured.is_empty()
+    {
+        return -1;
+    }
+    g.response.capture_enabled = true;
+    0
+}
+
+/// # Safety
+/// `connection_handle` is null or is a live acquired handle and must not be
+/// released until this call returns; `response` has `response_len` readable
+/// bytes for the duration of this call.
+#[no_mangle]
+pub unsafe extern "C" fn nio_response_replay(
+    connection_handle: *mut NioConnectionHandle,
+    generation: u64,
+    response: *const c_char,
+    response_len: i64,
+) -> c_int {
+    if response.is_null() || response_len <= 0 {
+        return -1;
+    }
+    let response_len = match usize::try_from(response_len) {
+        Ok(response_len) => response_len,
+        Err(_) => return -1,
+    };
+    let conn = match unsafe { connection_handle.as_ref() } {
+        Some(handle) if !handle.conn.close_notified.load(Ordering::Acquire) => &handle.conn,
+        None => return -1,
+        Some(_) => return -1,
+    };
+    let mut g = conn.mu.lock().unwrap();
+    if !valid_request_generation(conn, generation)
+        || !g.response.is_active(generation)
+        || g.final_response != FinalResponseState::Idle
+        || conn.err.load(Ordering::Acquire)
+    {
+        return -1;
+    }
+    if !g.response.batch.is_empty() {
+        drop(g);
+        if !publish_response_batch(conn, generation, false) {
+            return -1;
+        }
+        g = conn.mu.lock().unwrap();
+        if !valid_request_generation(conn, generation)
+            || !g.response.is_active(generation)
+            || g.final_response != FinalResponseState::Idle
+            || conn.err.load(Ordering::Acquire)
+        {
+            return -1;
+        }
+    }
+
+    let first_sequence = g.response.next_mysql_seq;
+    let old_len = g.response.batch.len();
+    if reserve_response_output(&mut g.response.batch, response_len).is_err() {
+        return -1;
+    }
+    g.response.batch.resize(old_len + response_len, 0);
+    let output = &mut g.response.batch[old_len..];
+    unsafe {
+        std::ptr::copy_nonoverlapping(response.cast::<u8>(), output.as_mut_ptr(), response_len);
+    }
+    let mut sequence = first_sequence;
+    let mut at = 0usize;
+    while at < output.len() {
+        let Some(frame_len) = at.checked_add(3).and_then(|end| output.get(at..end)) else {
+            g.response.batch.truncate(old_len);
+            return -1;
+        };
+        let payload_len = usize::from(frame_len[0])
+            | (usize::from(frame_len[1]) << 8)
+            | (usize::from(frame_len[2]) << 16);
+        let Some(end) = at
+            .checked_add(4)
+            .and_then(|end| end.checked_add(payload_len))
+        else {
+            g.response.batch.truncate(old_len);
+            return -1;
+        };
+        if end > output.len() {
+            g.response.batch.truncate(old_len);
+            return -1;
+        }
+        output[at + 3] = sequence;
+        sequence = sequence.wrapping_add(1);
+        at = end;
+    }
+    g.response.next_mysql_seq = sequence;
+    0
 }

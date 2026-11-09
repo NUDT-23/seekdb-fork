@@ -511,6 +511,20 @@ int nio_response_flush(struct NioConnectionHandle *connection_handle,
                        uint64_t generation,
                        int is_final);
 
+int nio_response_capture(struct NioConnectionHandle *connection_handle,
+                         uint64_t generation,
+                         char *response,
+                         int64_t response_len,
+                         int64_t *captured_len);
+
+int nio_response_replay(struct NioConnectionHandle *connection_handle,
+                        uint64_t generation,
+                        const char *response,
+                        int64_t response_len);
+
+int nio_response_capture_start(struct NioConnectionHandle *connection_handle,
+                               uint64_t generation);
+
 int nio_encode_mysql_packed_row_blob(char *buffer,
                                      int64_t buffer_len,
                                      const struct NioMysqlRowView *row_view,

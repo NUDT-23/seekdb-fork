@@ -130,6 +130,10 @@ public:
                               const ObMySQLResultSet &result,
                               ObOKPParam *ok_param = NULL) override;
   virtual int flush_buffer(const bool is_last) override;
+  int capture_response(char *response, const int64_t response_len,
+                       int64_t &captured_len);
+  int start_response_capture();
+  int replay_response(const char *response, const int64_t response_len);
   int snapshot_from(ObMPPacketSender &that);
   int handoff_request_to(ObMPPacketSender &target);
   int init(rpc::ObRequest *req);
