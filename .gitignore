@@ -61,6 +61,7 @@ app.info
 autom4te.cache/
 build
 build/
+/target/
 build_*/
 build_version.c
 build_version.cpp

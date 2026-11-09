@@ -1,0 +1,83 @@
+{
+  "schema": "minivectordb-learning-material-v1",
+  "synthetic": false,
+  "materials_scope": "Actual user prompts and implementation/verification records from the 2026-11-09 MiniVectorDB work session. Agent explanations are labeled as agent output, not as student understanding. No hidden reasoning, credentials or external test data are included.",
+  "user_prompts": [
+    {
+      "id": "user-1",
+      "source": "student",
+      "content": "你来做最新的轻向量数据库的第一题，分支应该还是2026-competition那个分支，题包你自己找找"
+    },
+    {
+      "id": "user-2",
+      "source": "student",
+      "content": "继续"
+    }
+  ],
+  "conversations": [
+    {
+      "id": "context-1",
+      "source": "agent",
+      "content": "The public Yuque statement and the oceanbase/seekdb 2026-competition-round2 branch were located. The branch contains mysqltest/README.md, manifest.json and 20 public cases; Dockerfile and conversation.json were empty placeholders. The submission branch is 2026-competition-round2, not the earlier 2026-competition baseline."
+    },
+    {
+      "id": "context-2",
+      "source": "agent",
+      "content": "The public package does not contain the official stdin/stdout driver. Two OceanBase forum threads created on 2026-11-09 (topics 35653823 and 35653825) ask for the same ready marker, result format, statement boundary, error mapping, exact/ann switch and precheck entry. No official protocol answer was present when checked. A one-line JSON transport was isolated as an interim local adapter rather than represented as the official protocol."
+    },
+    {
+      "id": "design-1",
+      "source": "agent",
+      "content": "Implementation chosen: dependency-free Rust; CRC32-framed WAL with fsync before success; atomic meta rename for checkpoints; private transaction overlays for statement atomicity and rollback; float32 vector storage; exact filtered TopK with primary-key tie breaking; bounded vector cache with durable reload."
+    }
+  ],
+  "experiments": [
+    {
+      "id": "experiment-public-baseline",
+      "source": "tool_result",
+      "command": "python3 -I tools/run_public_tests.py --binary target/debug/minivectordb --manifest mysqltest/manifest.json",
+      "output": "PASS sql_crud; PASS sql_comparisons; PASS sql_ordering; PASS sql_empty; PASS sql_primary_key; PASS sql_unicode; PASS sql_bigint; PASS sql_unsupported; PASS storage_restart; PASS vector_euclidean; PASS transaction_commit; PASS transaction_rollback; PASS storage_mutations; PASS storage_multiple_tables; PASS vector_ties_and_filter; PASS vector_float32; PASS vector_index_maintenance; PASS transaction_failed_insert; PASS transaction_autocommit_atomic; PASS transaction_shutdown_rollback. 20/20 public cases passed."
+    },
+    {
+      "id": "experiment-forced-checkpoint",
+      "source": "tool_result",
+      "command": "MINIVEC_CHECKPOINT_MIN_BYTES=1 MINIVEC_CHECKPOINT_LIVE_FACTOR=0 MINIVEC_VECTOR_ARENA_MB=0 python3 -I tools/run_public_tests.py --binary target/debug/minivectordb --manifest mysqltest/manifest.json",
+      "output": "20/20 public cases passed with checkpoints forced after commits and all cached vectors evicted. This exercised durable vector reload, checkpoint generation changes and restart recovery rather than only the in-memory path."
+    },
+    {
+      "id": "experiment-extended",
+      "source": "tool_result",
+      "command": "python3 -I tools/run_extended_tests.py --binary target/debug/minivectordb",
+      "output": "PASS validation_test; PASS transaction_test; PASS crash_test; PASS random_topk_test. 4/4 extended test groups passed. The tests reject NaN/Infinity/float32 overflow/wrong dimensions, verify i64::MIN, transactional DDL rollback, SIGKILL and repeated recovery, torn WAL truncation, and random exact/ANN filtered TopK against independently computed Python brute-force truth."
+    },
+    {
+      "id": "experiment-benchmark-exact",
+      "source": "tool_result",
+      "command": "cargo build --release && python3 -I tools/benchmark.py --binary target/release/minivectordb --mode exact",
+      "output": "10000 rows, 128 dimensions, 1000 queries, K=10: write_seconds=1.166611, query_seconds=1.057261, queries_per_second=945.84, sample_recall_at_10=1.0, data_file_bytes=5516704. This is a local WSL measurement, not an official score."
+    },
+    {
+      "id": "experiment-benchmark-ann",
+      "source": "tool_result",
+      "command": "python3 -I tools/benchmark.py --binary target/release/minivectordb --mode ann",
+      "output": "10000 rows, 128 dimensions, 1000 queries, K=10: write_seconds=1.117449, query_seconds=0.931152, queries_per_second=1073.938, sample_recall_at_10=1.0, data_file_bytes=5516704. This is a local WSL measurement, not an official score."
+    }
+  ],
+  "retrospective": [
+    {
+      "id": "iteration-1",
+      "source": "agent",
+      "content": "The initial exact query implementation cloned every visible row and fully sorted candidates. It was changed to borrowed row visibility plus a bounded max-heap for ascending distance TopK. All public and extended tests were rerun after the change. The later float32 accumulator is restricted to ANN mode; exact mode retains float64 accumulation."
+    },
+    {
+      "id": "iteration-2",
+      "source": "agent",
+      "content": "A memory review found that checkpointing initially materialized every evicted vector before writing. Checkpoint serialization was changed to materialize one row at a time, and checkpoint startup chooses uncached vector loading when the generation exceeds the arena budget. Forced-checkpoint and zero-arena tests passed after this correction."
+    }
+  ],
+  "limitations": [
+    "The official evaluation wire protocol and frozen resource/error mapping were not available in the public branch when this material was recorded. The local JSON transport is not claimed to be official; formal submission requires adapting it to the published driver.",
+    "ANN currently scans all visible candidates with float32 distance accumulation and does not use IVF/HNSW pruning. Recall is favored over index speedup; no platform rank or score is claimed.",
+    "Only the two short student prompts above are present. Agent design explanations and test output are not represented as independent student understanding or student-originated verification."
+  ]
+}

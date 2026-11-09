@@ -1,0 +1,20 @@
+[package]
+name = "minivectordb"
+version = "0.1.0"
+edition = "2021"
+description = "MiniVectorDB - lightweight vector database with SQL, persistence, transactions and crash recovery (OceanBase 2026 competition round2)"
+license = "Apache-2.0"
+
+# Zero third-party dependencies by design: storage engine, SQL parsing,
+# transaction core and vector index are all implemented from scratch.
+
+[[bin]]
+name = "minivectordb"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
