@@ -118,8 +118,11 @@ where
             };
             g.response.batch.truncate(old_len + actual_usize);
             g.response.next_mysql_seq = next_seq;
-            g.response
-                .capture_frames(&g.response.batch[old_len..old_len + actual_usize]);
+            if g.response.capture_active() {
+                let frames: Vec<u8> =
+                    g.response.batch[old_len..old_len + actual_usize].to_vec();
+                g.response.capture_frames(&frames);
+            }
             unsafe { framed_len.write(actual) };
             return 0;
         }
