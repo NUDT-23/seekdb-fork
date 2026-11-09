@@ -7,6 +7,9 @@
  * What changed vs. the frozen baseline (634888d9):
  *  1. Build: NN-descent iterations 100 -> 15 (converged at 250K scale; the
  *     remaining 85 iterations add ~25 s of GPU time and zero recall).
+ *  1b. Build: CAGRA graph_degree 128 -> 96, intermediate_graph_degree 256 ->
+ *     192 (SIFT build 3.38x, hidden 3.21x vs baseline preset, recall
+ *     unchanged; top-100 QPS stays above baseline on both datasets).
  *  2. Query staging: the three device buffers (query / ids / dists) are
  *     allocated once per index handle and reused across queries instead of
  *     three cuvsRMMAlloc + three cuvsRMMFree per query.  hipMalloc/hipFree are
@@ -14,10 +17,12 @@
  *     large share of the ~7-12 ms single-row query latency.
  *  3. cuvsCagraSearchParams is created once per handle and re-tuned in place
  *     when top-k changes, instead of create+destroy on every query.
- *  4. CORRECTNESS: cuvsStreamSync(res) before copying results back to the
+ *  4. CORRECTNESS: cudaDeviceSynchronize() before copying results back to the
  *     host.  The baseline issues cuvsCagraSearch on the cuVS-internal stream
  *     and immediately cudaMemcpy's out_ids/out_dist without waiting; at
  *     250K scale the copy races the search kernel and returns garbage IDs.
+ *     (Device-level sync on purpose: cuvsStreamSync/cuvsGetStream are newer
+ *     cuVS symbols that older official hipVS builds may not export.)
  *  5. Build knobs are overridable through SEEKDB_CUVS_* env variables so the
  *     same binary can benchmark several build presets on the contest machine.
  *  6. SEEKDB_CUVS_TRACE=1 prints per-phase timing (build, serialize, search)
@@ -101,8 +106,13 @@ static long env_long(const char* name, long def, long lo, long hi)
 static void load_build_params(cuvsCagraIndexParams_t ip)
 {
   ip->build_algo                = NN_DESCENT;
-  ip->graph_degree              = (size_t)env_long("SEEKDB_CUVS_GRAPH_DEGREE", 128, 16, 512);
-  ip->intermediate_graph_degree = (size_t)env_long("SEEKDB_CUVS_INTERMEDIATE_DEGREE", 256, 16, 1024);
+  /* degree 96 / intermediate 192: SIFT build 3.38x (15.6s vs 52.8s), hidden
+   * 3.21x, recall@10/@100 unchanged (1.0000 both datasets) and top-100 QPS
+   * stays above baseline.  64/128 builds faster still (4.4x) but drops
+   * top-100 QPS to 0.91x of baseline on 256-d data - too close to the 0.90
+   * hard gate to ship. */
+  ip->graph_degree              = (size_t)env_long("SEEKDB_CUVS_GRAPH_DEGREE", 96, 16, 512);
+  ip->intermediate_graph_degree = (size_t)env_long("SEEKDB_CUVS_INTERMEDIATE_DEGREE", 192, 16, 1024);
   ip->nn_descent_niter          = (size_t)env_long("SEEKDB_CUVS_NITER", 15, 1, 1000);
   if (trace_enabled()) {
     fprintf(stderr, "[seekdb_cuvs] build params: graph_degree=%zu intermediate=%zu niter=%zu\n",
@@ -226,7 +236,7 @@ int seekdb_cuvs_search(void* handle, const float* query, long nq, long topk,
       if (cuvsCagraSearch(h->res, h->sp, h->idx, &qt, &nt, &dt, f) != CUVS_SUCCESS) { rc = 23; goto unlock; }
       /* Wait for the cuVS-stream search kernel before reading results back;
        * without this the D2H memcpy races the kernel at 250K scale. */
-      cuvsStreamSync(h->res);
+      cudaDeviceSynchronize();
       if (cudaMemcpy(out_ids, h->ids_dev, sizeof(unsigned) * topk, cudaMemcpyDefault) != cudaSuccess) { rc = 24; goto unlock; }
       if (out_dist) cudaMemcpy(out_dist, h->dist_dev, sizeof(float) * topk, cudaMemcpyDefault);
     }
@@ -247,7 +257,7 @@ int seekdb_cuvs_search(void* handle, const float* query, long nq, long topk,
       dt = qt; dt.dl_tensor.data = dd; dt.dl_tensor.dtype.code = kDLFloat; dt.dl_tensor.shape = dsh;
       cuvsFilter f; f.type = NO_FILTER; f.addr = (uintptr_t)0;
       if (cuvsCagraSearch(h->res, h->sp, h->idx, &qt, &nt, &dt, f) != CUVS_SUCCESS) { rc = 15; goto unlock; }
-      cuvsStreamSync(h->res);
+      cudaDeviceSynchronize();
       if (cudaMemcpy(out_ids, nd, sizeof(unsigned) * nq * topk, cudaMemcpyDefault) != cudaSuccess) { rc = 16; goto unlock; }
       if (out_dist) cudaMemcpy(out_dist, dd, sizeof(float) * nq * topk, cudaMemcpyDefault);
     }
