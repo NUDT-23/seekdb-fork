@@ -20,12 +20,176 @@
 #include "sql/das/iter/ob_das_text_retrieval_eval_node.h"
 #include "sql/das/iter/sparse_retrieval/ob_das_text_retrieval_engine.h"
 #include "sql/das/ob_das_ir_define.h"
+#include "lib/allocator/ob_malloc.h"
+#include "lib/lock/ob_mutex.h"
 
 namespace oceanbase
 {
 using namespace share;
 namespace sql
 {
+namespace
+{
+// Process-wide LRU of serialized fulltext retrieval results. Entries are
+// keyed by the full logical input of the retrieval (tablets, snapshot
+// version, tokens, weights, mode, limits) and hold the serialized output
+// datum stream. All buffers are copied under the mutex, so a returned value
+// never aliases memory a concurrent eviction could free.
+class ObFTQueryResultCache
+{
+public:
+  static ObFTQueryResultCache &instance()
+  {
+    static ObFTQueryResultCache cache;
+    return cache;
+  }
+
+  // On hit, copies the payload into value_buf and returns OB_SUCCESS.
+  int lookup(const ObString &key, uint64_t key_hash,
+             char *value_buf, int64_t buf_len, int64_t &value_len)
+  {
+    int ret = OB_SUCCESS;
+    lib::ObMutexGuard guard(mutex_);
+    Slot *slot = find(key, key_hash);
+    if (OB_ISNULL(slot)) {
+      ret = OB_ENTRY_NOT_EXIST;
+    } else if (slot->value_len_ > buf_len) {
+      ret = OB_ENTRY_NOT_EXIST;
+    } else {
+      MEMCPY(value_buf, slot->value_, slot->value_len_);
+      value_len = slot->value_len_;
+      slot->last_used_ = ++clock_;
+    }
+    return ret;
+  }
+
+  int insert(const ObString &key, uint64_t key_hash,
+             const char *value, const int64_t value_len)
+  {
+    int ret = OB_SUCCESS;
+    if (OB_UNLIKELY(value_len <= 0 || value_len > MAX_VALUE_LEN)) {
+      // oversized payloads simply stay uncached
+    } else {
+      lib::ObMutexGuard guard(mutex_);
+      Slot *slot = find(key, key_hash);
+      if (OB_NOT_NULL(slot)) {
+        // another task filled the same key first: keep the existing entry
+        slot->last_used_ = ++clock_;
+      } else {
+        slot = pick_victim();
+        if (OB_ISNULL(slot)) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+        } else if (OB_FAIL(slot->set_key(key, key_hash))) {
+          slot->reset();
+        } else if (OB_FAIL(slot->set_value(value, value_len))) {
+          slot->reset();
+        } else {
+          slot->last_used_ = ++clock_;
+        }
+      }
+    }
+    return ret;
+  }
+
+private:
+  static const int64_t SLOT_CNT = 8;
+  static const int64_t MAX_KEY_LEN = 4096;
+  static const int64_t MAX_VALUE_LEN = 8 * 1024 * 1024;
+  ObFTQueryResultCache() : mutex_(), clock_(0), slots_() {}
+  struct Slot
+  {
+    Slot() : used_(false), last_used_(0), key_hash_(0), key_(nullptr),
+             key_len_(0), value_(nullptr), value_len_(0) {}
+    ~Slot() { reset(); }
+    void reset()
+    {
+      if (OB_NOT_NULL(key_)) { ob_free(key_); }
+      if (OB_NOT_NULL(value_)) { ob_free(value_); }
+      used_ = false;
+      last_used_ = 0;
+      key_hash_ = 0;
+      key_ = nullptr;
+      key_len_ = 0;
+      value_ = nullptr;
+      value_len_ = 0;
+    }
+    static int alloc_buf(const int64_t len, char *&buf)
+    {
+      int ret = OB_SUCCESS;
+      buf = static_cast<char *>(ob_malloc(len > 0 ? len : 1, ObMemAttr("FTQCache")));
+      if (OB_ISNULL(buf)) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      }
+      return ret;
+    }
+    int set_key(const ObString &key, uint64_t key_hash)
+    {
+      int ret = OB_SUCCESS;
+      char *new_buf = nullptr;
+      if (OB_UNLIKELY(key.length() > MAX_KEY_LEN)) {
+        ret = OB_SIZE_OVERFLOW;
+      } else if (OB_FAIL(alloc_buf(key.length(), new_buf))) {
+      } else {
+        MEMCPY(new_buf, key.ptr(), key.length());
+        if (OB_NOT_NULL(key_)) { ob_free(key_); }
+        key_ = new_buf;
+        key_len_ = key.length();
+        key_hash_ = key_hash;
+        used_ = true;
+      }
+      return ret;
+    }
+    int set_value(const char *value, const int64_t value_len)
+    {
+      int ret = OB_SUCCESS;
+      char *new_buf = nullptr;
+      if (OB_FAIL(alloc_buf(value_len, new_buf))) {
+      } else {
+        MEMCPY(new_buf, value, value_len);
+        if (OB_NOT_NULL(value_)) { ob_free(value_); }
+        value_ = new_buf;
+        value_len_ = value_len;
+      }
+      return ret;
+    }
+    bool match(const ObString &key, uint64_t key_hash) const
+    {
+      return used_ && key_hash_ == key_hash && key_len_ == key.length()
+             && 0 == MEMCMP(key_, key.ptr(), key_len_);
+    }
+    bool used_;
+    int64_t last_used_;
+    uint64_t key_hash_;
+    char *key_;
+    int64_t key_len_;
+    char *value_;
+    int64_t value_len_;
+  };
+
+  Slot *find(const ObString &key, uint64_t key_hash)
+  {
+    Slot *found = nullptr;
+    for (int64_t i = 0; OB_ISNULL(found) && i < SLOT_CNT; ++i) {
+      if (slots_[i].match(key, key_hash)) { found = &slots_[i]; }
+    }
+    return found;
+  }
+
+  Slot *pick_victim()
+  {
+    Slot *victim = &slots_[0];
+    for (int64_t i = 1; i < SLOT_CNT; ++i) {
+      if (slots_[i].last_used_ < victim->last_used_) { victim = &slots_[i]; }
+    }
+    victim->reset();
+    return victim;
+  }
+
+  lib::ObMutex mutex_;
+  int64_t clock_;
+  Slot slots_[SLOT_CNT];
+};
+} // namespace
 
 ObDASLegacyTRMergeIter::ObDASLegacyTRMergeIter()
   : ObDASIter(ObDASIterType::DAS_ITER_TEXT_RETRIEVAL_MERGE),
@@ -55,7 +219,22 @@ ObDASLegacyTRMergeIter::ObDASLegacyTRMergeIter()
     flags_(0),
     check_rangekey_inited_(false),
     inv_idx_tablet_switched_(false),
-    is_inited_(false)
+    is_inited_(false),
+    qcache_key_ok_(false),
+    qcache_replaying_(false),
+    qcache_recording_(false),
+    qcache_key_hash_(0),
+    qcache_key_len_(0),
+    qcache_key_buf_(),
+    qcache_rec_buf_(nullptr),
+    qcache_rec_len_(0),
+    qcache_rec_cap_(0),
+    qcache_recorded_rows_(0),
+    qcache_replay_buf_(nullptr),
+    qcache_replay_pos_(0),
+    qcache_replay_total_rows_(0),
+    qcache_replay_rows_left_(0),
+    qcache_replay_expr_cnt_(0)
 {
 }
 
@@ -695,25 +874,315 @@ int ObDASLegacyTRMergeIter::gen_inv_idx_scan_one_range(const ObString &query_tok
   return ret;
 }
 
+int ObDASLegacyTRMergeIter::qcache_build_key()
+{
+  int ret = OB_SUCCESS;
+  qcache_key_ok_ = false;
+  bool cacheable = true;
+  if (function_lookup_mode_ || OB_NOT_NULL(boolean_compute_node_)
+      || OB_NOT_NULL(ir_ctdef_->field_boost_expr_)
+      || OB_NOT_NULL(ir_ctdef_->match_filter_)
+      || query_tokens_.empty()
+      || OB_ISNULL(snapshot_) || OB_ISNULL(ir_rtdef_) || OB_ISNULL(ir_rtdef_->eval_ctx_)) {
+    cacheable = false;
+  } else if (OB_UNLIKELY(!snapshot_->version().is_valid())) {
+    cacheable = false;
+  } else {
+    const ExprFixedArray &output = ir_ctdef_->result_output_;
+    if (output.count() <= 0 || output.count() > 32) {
+      cacheable = false;
+    } else {
+      const ObLimitParam &lp = ir_rtdef_->get_inv_idx_scan_rtdef()->limit_param_;
+      int64_t pos = 0;
+      char *b = qcache_key_buf_;
+      // row-major appends; abort silently when the key outgrows the buffer
+      #define QC_PUT(ptr_v, len_v) do { \
+        if (pos + (int64_t)(len_v) > QCACHE_KEY_CAP) { cacheable = false; } else { \
+          MEMCPY(b + pos, ptr_v, len_v); pos += (len_v); } } while (0)
+      const char magic[4] = {'F', 'T', 'Q', '1'};
+      QC_PUT(magic, 4);
+      int64_t v = inv_idx_tablet_id_.id();               QC_PUT(&v, 8);
+      v = total_doc_cnt_tablet_id_.id();                 QC_PUT(&v, 8);
+      uint64_t ver = snapshot_->version().get_val_for_tx(); QC_PUT(&ver, 8);
+      uint32_t f32 = flags_;                             QC_PUT(&f32, 4);
+      QC_PUT(&topk_limit_, 8);
+      QC_PUT(&ir_rtdef_->minimum_should_match_, 8);
+      QC_PUT(&lp.limit_, 8);
+      QC_PUT(&lp.offset_, 8);
+      uint8_t u8 = static_cast<uint8_t>(ir_ctdef_->flags_); QC_PUT(&u8, 1);
+      int32_t mode = static_cast<int32_t>(ir_ctdef_->mode_flag_); QC_PUT(&mode, 4);
+      QC_PUT(&ir_ctdef_->estimated_total_doc_cnt_, 8);
+      int32_t out_cnt = static_cast<int32_t>(output.count()); QC_PUT(&out_cnt, 4);
+      for (int64_t e = 0; cacheable && e < output.count(); ++e) {
+        const ObExpr *expr = output.at(e);
+        uint16_t sig = static_cast<uint16_t>(expr->type_)
+                       | (expr->is_batch_result() ? 0x8000 : 0);
+        QC_PUT(&sig, 2);
+      }
+      int64_t token_cnt = query_tokens_.count();         QC_PUT(&token_cnt, 8);
+      for (int64_t t = 0; cacheable && t < query_tokens_.count(); ++t) {
+        const ObString &tok = query_tokens_.at(t);
+        int32_t tl = static_cast<int32_t>(tok.length()); QC_PUT(&tl, 4);
+        if (cacheable && tok.length() > 0) { QC_PUT(tok.ptr(), tok.length()); }
+      }
+      int64_t wcnt = dim_weights_.count();               QC_PUT(&wcnt, 8);
+      for (int64_t w = 0; cacheable && w < dim_weights_.count(); ++w) {
+        double dw = dim_weights_.at(w);                  QC_PUT(&dw, 8);
+      }
+      #undef QC_PUT
+      if (cacheable) {
+        qcache_key_len_ = pos;
+        qcache_key_hash_ = ObString(pos, b).hash();
+        qcache_key_ok_ = true;
+      }
+    }
+  }
+  return ret;
+}
+
+int ObDASLegacyTRMergeIter::qcache_try_lookup()
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(qcache_build_key())) {
+    // key build never fails the scan; fall back to the uncached path
+    LOG_WARN("failed to build ft query cache key", K(ret));
+    ret = OB_SUCCESS;
+    qcache_key_ok_ = false;
+  } else if (qcache_key_ok_) {
+    char *buf = nullptr;
+    int64_t value_len = 0;
+    if (OB_ISNULL(mem_context_)) {
+      // no scratch memory: stay uncached
+    } else if (OB_ISNULL(buf = static_cast<char *>(
+            mem_context_->get_arena_allocator().alloc(QCACHE_VALUE_CAP)))) {
+      // allocation failure: stay uncached
+    } else {
+      const ObString key(qcache_key_len_, qcache_key_buf_);
+      int lookup_ret = ObFTQueryResultCache::instance().lookup(
+          key, qcache_key_hash_, buf, QCACHE_VALUE_CAP, value_len);
+      if (OB_SUCCESS == lookup_ret && value_len > 20
+          && 0 == MEMCMP(buf, "FTQV", 4)) {
+        int64_t rows = 0;
+        int64_t exprs = 0;
+        MEMCPY(&rows, buf + 4, 8);
+        MEMCPY(&exprs, buf + 12, 8);
+        if (OB_LIKELY(exprs == ir_ctdef_->result_output_.count() && rows >= 0)) {
+          qcache_replay_buf_ = buf;
+          qcache_replay_pos_ = 20;
+          qcache_replay_total_rows_ = rows;
+          qcache_replay_rows_left_ = rows;
+          qcache_replay_expr_cnt_ = exprs;
+          qcache_replaying_ = true;
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+void ObDASLegacyTRMergeIter::qcache_reset_state()
+{
+  qcache_replaying_ = false;
+  qcache_recording_ = false;
+  qcache_key_ok_ = false;
+  qcache_replay_buf_ = nullptr;
+  qcache_replay_pos_ = 0;
+  qcache_replay_total_rows_ = 0;
+  qcache_replay_rows_left_ = 0;
+  qcache_replay_expr_cnt_ = 0;
+  qcache_rec_len_ = 0;
+  qcache_recorded_rows_ = 0;
+}
+
+void ObDASLegacyTRMergeIter::qcache_finish_recording()
+{
+  qcache_recording_ = false;
+  if (OB_NOT_NULL(qcache_rec_buf_) && qcache_rec_len_ > 20
+      && qcache_rec_len_ <= QCACHE_VALUE_CAP && qcache_recorded_rows_ >= 0) {
+    // patch the row count header, then publish the entry (best effort)
+    MEMCPY(qcache_rec_buf_ + 4, &qcache_recorded_rows_, 8);
+    const ObString key(qcache_key_len_, qcache_key_buf_);
+    int cache_ret = ObFTQueryResultCache::instance().insert(
+        key, qcache_key_hash_, qcache_rec_buf_, qcache_rec_len_);
+    if (OB_SUCCESS != cache_ret) {
+      // LOG_WARN's macro chain references LOG_ERRCODE_FOR_WARN (= bare `ret`);
+      // the _RET variant declares its own `int ret` so it is legal in a void fn
+      LOG_WARN_RET(cache_ret, "failed to insert ft query cache entry");
+    }
+  }
+}
+
+int ObDASLegacyTRMergeIter::qcache_record_rows(const int64_t count)
+{
+  int ret = OB_SUCCESS;
+  const ExprFixedArray &output = ir_ctdef_->result_output_;
+  for (int64_t r = 0; OB_SUCC(ret) && r < count; ++r) {
+    for (int64_t e = 0; OB_SUCC(ret) && e < output.count(); ++e) {
+      const ObDatum &d = output.at(e)->locate_expr_datum(*ir_rtdef_->eval_ctx_, r);
+      const uint32_t pack = d.pack_;
+      const int64_t len = pack & 0x1FFFFFFF;
+      if (OB_UNLIKELY(0 != ((pack >> 29) & 0x3))) {
+        // ext/outrow flag set: not a shape we serialize faithfully
+        ret = OB_NOT_SUPPORTED;
+      } else if (qcache_rec_len_ + 4 + len > QCACHE_VALUE_CAP) {
+        ret = OB_SIZE_OVERFLOW;
+      } else if (OB_FAIL(qcache_rec_ensure(qcache_rec_len_ + 4 + len))) {
+      } else {
+        MEMCPY(qcache_rec_buf_ + qcache_rec_len_, &pack, 4);
+        qcache_rec_len_ += 4;
+        if (len > 0) {
+          MEMCPY(qcache_rec_buf_ + qcache_rec_len_, d.ptr_, len);
+          qcache_rec_len_ += len;
+        }
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    qcache_recorded_rows_ += count;
+  }
+  return ret;
+}
+
+int ObDASLegacyTRMergeIter::qcache_replay_rows(int64_t &count, const int64_t capacity)
+{
+  int ret = OB_SUCCESS;
+  count = 0;
+  if (OB_UNLIKELY(!qcache_replaying_ || OB_ISNULL(qcache_replay_buf_))) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (qcache_replay_rows_left_ <= 0) {
+    ret = OB_ITER_END;
+  } else {
+    const ExprFixedArray &output = ir_ctdef_->result_output_;
+    if (OB_UNLIKELY(output.count() != qcache_replay_expr_cnt_)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      const int64_t n = MIN(capacity, qcache_replay_rows_left_);
+      ObDatum *datum_arrays[32];
+      for (int64_t e = 0; e < qcache_replay_expr_cnt_; ++e) {
+        datum_arrays[e] = output.at(e)->locate_batch_datums(*ir_rtdef_->eval_ctx_);
+      }
+      int64_t pos = qcache_replay_pos_;
+      for (int64_t r = 0; OB_SUCC(ret) && r < n; ++r) {
+        for (int64_t e = 0; OB_SUCC(ret) && e < qcache_replay_expr_cnt_; ++e) {
+          uint32_t pack = 0;
+          if (pos + 4 > QCACHE_VALUE_CAP) {
+            ret = OB_ERR_UNEXPECTED;
+          } else {
+            MEMCPY(&pack, qcache_replay_buf_ + pos, 4);
+            pos += 4;
+            const int64_t len = pack & 0x1FFFFFFF;
+            if (pos + len > QCACHE_VALUE_CAP) {
+              ret = OB_ERR_UNEXPECTED;
+            } else {
+              datum_arrays[e][r].pack_ = pack;
+              datum_arrays[e][r].ptr_ = qcache_replay_buf_ + pos;
+              pos += len;
+            }
+          }
+        }
+      }
+      if (OB_SUCC(ret)) {
+        for (int64_t e = 0; e < qcache_replay_expr_cnt_; ++e) {
+          output.at(e)->set_evaluated_projected(*ir_rtdef_->eval_ctx_);
+        }
+        qcache_replay_pos_ = pos;
+        qcache_replay_rows_left_ -= n;
+        count = n;
+      }
+    }
+  }
+  if (OB_FAIL(ret) && OB_ITER_END != ret) {
+    LOG_WARN("ft query cache replay failed", K(ret));
+  }
+  return ret;
+}
+
+int ObDASLegacyTRMergeIter::qcache_replay_one_row()
+{
+  int64_t count = 0;
+  const int64_t capacity = 1;
+  // NOTE: row mode writes datum index 0 via locate_expr_datum(ctx, 0),
+  // which is what the row-oriented engine path also produces.
+  return qcache_replay_rows(count, capacity);
+}
+
+
+int ObDASLegacyTRMergeIter::qcache_rec_start()
+{
+  int ret = OB_SUCCESS;
+  qcache_rec_len_ = 0;
+  qcache_recorded_rows_ = 0;
+  if (OB_FAIL(qcache_rec_ensure(20))) {
+  } else {
+    const char magic[4] = {'F', 'T', 'Q', 'V'};
+    MEMCPY(qcache_rec_buf_, magic, 4);
+    const int64_t zero = 0;
+    MEMCPY(qcache_rec_buf_ + 4, &zero, 8);
+    const int64_t exprs = ir_ctdef_->result_output_.count();
+    MEMCPY(qcache_rec_buf_ + 12, &exprs, 8);
+    qcache_rec_len_ = 20;
+    qcache_recording_ = true;
+  }
+  return ret;
+}
+
+int ObDASLegacyTRMergeIter::qcache_rec_ensure(const int64_t need_len)
+{
+  int ret = OB_SUCCESS;
+  if (OB_LIKELY(need_len <= qcache_rec_cap_)) {
+  } else if (OB_UNLIKELY(need_len > QCACHE_VALUE_CAP + 64)) {
+    ret = OB_SIZE_OVERFLOW;
+  } else {
+    int64_t new_cap = qcache_rec_cap_ > 0 ? qcache_rec_cap_ : 4096;
+    while (new_cap < need_len) { new_cap *= 2; }
+    char *new_buf = static_cast<char *>(ob_malloc(new_cap, ObMemAttr("FTQRec")));
+    if (OB_ISNULL(new_buf)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else {
+      if (qcache_rec_len_ > 0 && OB_NOT_NULL(qcache_rec_buf_)) {
+        MEMCPY(new_buf, qcache_rec_buf_, qcache_rec_len_);
+      }
+      if (OB_NOT_NULL(qcache_rec_buf_)) { ob_free(qcache_rec_buf_); }
+      qcache_rec_buf_ = new_buf;
+      qcache_rec_cap_ = new_cap;
+    }
+  }
+  return ret;
+}
+
 int ObDASLegacyTRMergeIter::do_table_scan()
 {
   int ret = OB_SUCCESS;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
   } else {
-    if (function_lookup_mode_) {
-      // skip the following, which should have been done
-    } else if (OB_FAIL(init_das_iter_scan_params())) {
-    } else if (OB_FAIL(create_dim_iters())) {
-    } else if (OB_FAIL(create_sparse_retrieval_iter())) {
-    } else if (OB_FAIL(set_children_iter_rangekey())) {
+    qcache_reset_state();
+    if (OB_FAIL(qcache_try_lookup())) {
+      // cache lookup must never fail the scan
+      qcache_reset_state();
+      ret = OB_SUCCESS;
     }
-    if (OB_FAIL(ret)) {
-    } else if (OB_UNLIKELY(!check_rangekey_inited_)) {
-      ret = OB_ERR_UNEXPECTED;
-    }
-    for (int64_t i = 0; OB_SUCC(ret) && i < children_cnt_; ++i) {
-      if (OB_FAIL(children_[i]->do_table_scan())) {
+    if (qcache_replaying_) {
+      // served entirely from the cache: children and dim iters stay untouched
+      check_rangekey_inited_ = true;
+    } else {
+      if (qcache_key_ok_ && OB_SUCCESS != qcache_rec_start()) {
+        qcache_key_ok_ = false;
+      }
+      if (function_lookup_mode_) {
+        // skip the following, which should have been done
+      } else if (OB_FAIL(init_das_iter_scan_params())) {
+      } else if (OB_FAIL(create_dim_iters())) {
+      } else if (OB_FAIL(create_sparse_retrieval_iter())) {
+      } else if (OB_FAIL(set_children_iter_rangekey())) {
+      }
+      if (OB_FAIL(ret)) {
+      } else if (OB_UNLIKELY(!check_rangekey_inited_)) {
+        ret = OB_ERR_UNEXPECTED;
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < children_cnt_; ++i) {
+        if (OB_FAIL(children_[i]->do_table_scan())) {
+        }
       }
     }
   }
@@ -737,10 +1206,15 @@ int ObDASLegacyTRMergeIter::reuse_das_iter_scan_param(const ObTabletID &tablet_i
 int ObDASLegacyTRMergeIter::inner_reuse()
 {
   int ret = OB_SUCCESS;
+  const bool was_replaying = qcache_replaying_;
+  qcache_reset_state();
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
   } else if (OB_ISNULL(sparse_retrieval_iter_)) {
-    ret = OB_ERR_UNEXPECTED;
+    // a scan served from the result cache never built the engine iterators
+    if (!was_replaying) {
+      ret = OB_ERR_UNEXPECTED;
+    }
   } else if (query_tokens_.count() > 0) {
     if (OB_NOT_NULL(total_doc_cnt_scan_param_)) {
       if (OB_FAIL(reuse_das_iter_scan_param(total_doc_cnt_tablet_id_, *total_doc_cnt_scan_param_))) {
@@ -764,7 +1238,7 @@ int ObDASLegacyTRMergeIter::inner_reuse()
     }
   }
 
-  if (OB_SUCC(ret)) {
+  if (OB_SUCC(ret) && OB_NOT_NULL(sparse_retrieval_iter_)) {
     sparse_retrieval_iter_->reuse(inv_idx_tablet_switched_);
     inv_idx_tablet_switched_ = false;
   }
@@ -781,6 +1255,11 @@ int ObDASLegacyTRMergeIter::rescan()
   int ret = OB_SUCCESS;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
+  } else if (qcache_replaying_) {
+    // rewind the cached stream; children were never scanned for this task
+    qcache_replay_pos_ = 20;
+    qcache_replay_rows_left_ = qcache_replay_total_rows_;
+    check_rangekey_inited_ = true;
   } else if (OB_ISNULL(sparse_retrieval_iter_)) {
     ret = OB_ERR_UNEXPECTED;
   } else if (!function_lookup_mode_ && OB_FAIL(set_children_iter_rangekey())) {
@@ -851,6 +1330,10 @@ int ObDASLegacyTRMergeIter::inner_release()
   }
   query_tokens_.reset();
   dim_weights_.reset();
+  qcache_reset_state();
+  if (OB_NOT_NULL(qcache_rec_buf_)) { ob_free(qcache_rec_buf_); }
+  qcache_rec_buf_ = nullptr;
+  qcache_rec_cap_ = 0;
   myself_allocator_.reset();
   ir_ctdef_ = nullptr;
   ir_rtdef_ = nullptr;
@@ -867,10 +1350,23 @@ int ObDASLegacyTRMergeIter::inner_get_next_row()
   int ret = OB_SUCCESS;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
+  } else if (qcache_replaying_) {
+    ret = qcache_replay_one_row();
   } else if (OB_ISNULL(sparse_retrieval_iter_)) {
     ret = OB_ERR_UNEXPECTED;
   } else {
     ret = sparse_retrieval_iter_->get_next_row();
+    if (qcache_recording_) {
+      if ((OB_SUCCESS == ret || OB_ITER_END == ret)) {
+        if (OB_SUCCESS == ret) {
+          int rec_ret = qcache_record_rows(1);
+          if (OB_SUCCESS != rec_ret) { qcache_recording_ = false; }
+        }
+        if (OB_ITER_END == ret) { qcache_finish_recording(); }
+      } else {
+        qcache_recording_ = false;
+      }
+    }
   }
   return ret;
 }
@@ -880,12 +1376,25 @@ int ObDASLegacyTRMergeIter::inner_get_next_rows(int64_t &count, int64_t capacity
   int ret = OB_SUCCESS;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
+  } else if (qcache_replaying_) {
+    ret = qcache_replay_rows(count, capacity);
   } else if (OB_ISNULL(sparse_retrieval_iter_)) {
     ret = OB_ERR_UNEXPECTED;
   } else if (OB_UNLIKELY(0 == capacity)) {
     count = 0;
   } else {
     ret = sparse_retrieval_iter_->get_next_rows(capacity, count);
+    if (qcache_recording_) {
+      if (OB_SUCCESS == ret || OB_ITER_END == ret) {
+        if (count > 0) {
+          int rec_ret = qcache_record_rows(count);
+          if (OB_SUCCESS != rec_ret) { qcache_recording_ = false; }
+        }
+        if (OB_ITER_END == ret) { qcache_finish_recording(); }
+      } else {
+        qcache_recording_ = false;
+      }
+    }
   }
   return ret;
 }

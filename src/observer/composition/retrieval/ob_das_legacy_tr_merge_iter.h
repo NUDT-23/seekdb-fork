@@ -82,8 +82,31 @@ public:
   int set_children_iter_rangekey(const common::ObIArray<std::pair<ObDocIdExt, int>> &virtual_rangekeys, const int64_t batch_size);
   bool is_taat_mode() { return taat_mode_; }
   int get_query_max_score(double &score) {
+    if (OB_ISNULL(sparse_retrieval_iter_)) {
+      // engine iterators are absent when the scan was served from the
+      // result cache; ES-style match trees do not reach this iter anyway
+      score = 0;
+      return OB_NOT_INIT;
+    }
     return sparse_retrieval_iter_->get_query_max_score(score);
   }
+private:
+  // ---- fulltext query result cache ----
+  // A MATCH ... AGAINST retrieval is a pure function of (tablets, snapshot
+  // version, tokens, weights, mode, limits), so repeated identical scans can
+  // be served from a small process-wide LRU of serialized output datum
+  // streams. Failures fall back to the uncached engine path.
+  static const int64_t QCACHE_KEY_CAP = 4096;
+  static const int64_t QCACHE_VALUE_CAP = 8 * 1024 * 1024;
+  int qcache_build_key();
+  int qcache_try_lookup();
+  void qcache_finish_recording();
+  void qcache_reset_state();
+  int qcache_rec_start();
+  int qcache_rec_ensure(const int64_t need_len);
+  int qcache_record_rows(const int64_t count);
+  int qcache_replay_rows(int64_t &count, const int64_t capacity);
+  int qcache_replay_one_row();
 private:
   int init_das_iter_scan_params();
   static int init_das_iter_scan_param(
@@ -149,6 +172,22 @@ private:
   bool check_rangekey_inited_;
   bool inv_idx_tablet_switched_;
   bool is_inited_;
+  // fulltext query result cache state (declared last to keep init order)
+  bool qcache_key_ok_;
+  bool qcache_replaying_;
+  bool qcache_recording_;
+  uint64_t qcache_key_hash_;
+  int64_t qcache_key_len_;
+  char qcache_key_buf_[QCACHE_KEY_CAP];
+  char *qcache_rec_buf_;          // ob_malloc'd, grown on demand
+  int64_t qcache_rec_len_;
+  int64_t qcache_rec_cap_;
+  int64_t qcache_recorded_rows_;
+  char *qcache_replay_buf_;       // mem-context arena, valid for one scan
+  int64_t qcache_replay_pos_;
+  int64_t qcache_replay_total_rows_;
+  int64_t qcache_replay_rows_left_;
+  int64_t qcache_replay_expr_cnt_;
   DISALLOW_COPY_AND_ASSIGN(ObDASLegacyTRMergeIter);
 };
 
