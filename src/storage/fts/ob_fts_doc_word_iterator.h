@@ -19,6 +19,8 @@
 
 #include "lib/allocator/page_arena.h"
 #include "common/datum/ob_datum.h"
+#include "common/ob_searray.h"
+#include "storage/blocksstable/ob_datum_row.h"
 #include "data_plane/fts/ob_doc_id.h"
 #include "storage/access/ob_table_param.h"
 #include "storage/access/ob_dml_param.h"
@@ -62,8 +64,28 @@ private:
   int do_table_scan();
   int do_table_rescan();
   int reuse();
+  // v3: sequential streaming mode. The doc word table is scanned once over the
+  // whole range and consumed in primary key order, one document at a time, so
+  // the per-document range rescan (iterator reuse + access service round trip
+  // for every document of the data table) disappears from the FTS index build.
+  // A document id that regresses below the last served one (data table scan
+  // order is not guaranteed) breaks the stream and falls back to the legacy
+  // per-document rescan path for correctness.
+  int open_seq_scan(const uint64_t table_id);
+  int drain_to_doc(const ObDatum &doc_id_datum);
+  int serve_doc_by_rescan(const uint64_t table_id, const ObDatum &doc_id_datum);
+  static int cmp_doc_id(const ObDatum &l, const ObDatum &r);
 
 private:
+  struct SeqWordRow
+  {
+    SeqWordRow() : cnt_(0), doc_len_(0) {}
+    ObDatum doc_id_;
+    ObDatum word_;
+    uint64_t cnt_;
+    uint64_t doc_len_;
+  };
+
   common::ObArenaAllocator allocator_;
   common::ObArenaAllocator scan_allocator_;
   share::schema::ObTableParam table_param_;
@@ -71,6 +93,22 @@ private:
   common::ObNewRowIterator *doc_word_iter_;
   ObDocIDType docid_type_;
   bool is_inited_;
+  // sequential streaming state
+  bool seq_opened_;
+  bool seq_broken_;
+  bool seq_stream_end_;
+  bool pending_valid_;
+  SeqWordRow pending_row_;
+  common::ObArenaAllocator doc_alloc_;
+  common::ObArenaAllocator pending_alloc_;
+  common::ObSEArray<SeqWordRow, 64> seq_rows_;
+  int64_t seq_idx_;
+  int64_t seq_serving_; // 0: none, 1: sequential buffer, 2: rescan iterator
+  char last_doc_buf_[64];
+  int64_t last_doc_len_;
+  bool last_doc_valid_;
+  blocksstable::ObDatumRow seq_out_row_;
+  bool seq_out_row_inited_;
 
   DISALLOW_COPY_AND_ASSIGN(ObFTDocWordScanIterator);
 };
