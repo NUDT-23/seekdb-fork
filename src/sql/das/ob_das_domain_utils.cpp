@@ -1073,8 +1073,9 @@ int ObFTDMLIterator::scan_ft_word_rows(const ObChunkDatumStore::StoredRow *store
     } else if (OB_FAIL(data_plane::scan_ft_doc_words(
                    ft_doc_word_iter_, doc_word_info_->doc_word_table_id_, doc_id_datum))) {
     } else {
-      // gather ft word rows
-      ObDomainIndexRow tmp_rows;
+      // gather ft word rows; v3: rows are already allocated from the task
+      // arena in stream order, the previous tmp buffer plus a second
+      // shallow-copy pass into a contiguous array was pure overhead.
       do {
         blocksstable::ObDatumRow *row = nullptr;
         blocksstable::ObDatumRow *ft_word_row = nullptr;
@@ -1082,32 +1083,12 @@ int ObFTDMLIterator::scan_ft_word_rows(const ObChunkDatumStore::StoredRow *store
           if (OB_ITER_END != ret) {
           }
         } else if (OB_FAIL(build_ft_word_row(row, ft_word_row))) {
-        } else if (OB_FAIL(tmp_rows.push_back(ft_word_row))) {
+        } else if (OB_FAIL(rows_.push_back(ft_word_row))) {
         } else {
         }
       } while (OB_SUCC(ret));
-
-      // make it sequential
       if (OB_ITER_END == ret) {
         ret = OB_SUCCESS;
-        blocksstable::ObDatumRow *row_array = nullptr;
-        if (0 == tmp_rows.count()) {
-          // do nothing
-        } else if (OB_ISNULL(row_array = OB_NEW_ARRAY(blocksstable::ObDatumRow, &allocator_, tmp_rows.count()))) {
-          ret = OB_ALLOCATE_MEMORY_FAILED;
-        } else {
-          for (int i = 0; OB_SUCC(ret) && i < tmp_rows.count(); ++i) {
-            if (OB_ISNULL(tmp_rows[i])) {
-              ret = OB_ERR_UNEXPECTED;
-            } else if (OB_FAIL(row_array[i].shallow_copy(*(tmp_rows[i])))) {
-            } else if (OB_FAIL(rows_.push_back(&row_array[i]))) {
-            }
-          }
-
-          if (OB_SUCC(ret)) {
-            LOG_TRACE("succeed to scan ft word rows", K(rows_.count()));
-          }
-        }
       }
     }
   }

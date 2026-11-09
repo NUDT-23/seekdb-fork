@@ -72,6 +72,8 @@ private:
   // order is not guaranteed) breaks the stream and falls back to the legacy
   // per-document rescan path for correctness.
   int open_seq_scan(const uint64_t table_id);
+  int build_whole_range(const uint64_t table_id,
+                        common::ObIArray<common::ObNewRange> &rowkey_range);
   int drain_to_doc(const ObDatum &doc_id_datum);
   int serve_doc_by_rescan(const uint64_t table_id, const ObDatum &doc_id_datum);
   static int cmp_doc_id(const ObDatum &l, const ObDatum &r);
