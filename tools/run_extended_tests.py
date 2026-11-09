@@ -37,8 +37,8 @@ class Db:
             bufsize=1,
             env=env,
         )
-        ready = json.loads(self.proc.stdout.readline())
-        assert ready.get("ready") is True, ready
+        # jsonl protocol: no ready marker, first response follows the first
+        # SQL statement.
         return self
 
     def sql(self, text):
@@ -48,19 +48,24 @@ class Db:
         assert line, (text, self.proc.poll())
         return json.loads(line)
 
+    def directive(self, text):
+        """Send a driver directive; the database consumes it silently, so the
+        next response line belongs to the following statement."""
+        self.proc.stdin.write(text + "\n")
+        self.proc.stdin.flush()
+
     def ok(self, text, affected=None):
         result = self.sql(text)
-        assert result.get("ok") is True, (text, result)
+        assert "error" not in result, (text, result)
         if affected is not None:
             assert result.get("affected_rows") == affected, (text, result)
         return result
 
     def error(self, text, code=None):
         result = self.sql(text)
-        assert result.get("ok") is False, (text, result)
-        assert result.get("error") or result.get("code"), (text, result)
+        assert "error" in result, (text, result)
         if code is not None:
-            assert result.get("error") == code, (text, result)
+            assert result["error"] == code, (text, result)
         return result
 
     def rows(self, text):
@@ -75,9 +80,16 @@ class Db:
         if self.proc and self.proc.poll() is None:
             if kill:
                 self.proc.kill()
+                self.proc.wait(timeout=10)
             else:
-                self.proc.terminate()
-            self.proc.wait(timeout=10)
+                # Clean shutdown: close stdin, let the process roll back and
+                # checkpoint; force-kill only if it hangs.
+                self.proc.stdin.close()
+                try:
+                    self.proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    self.proc.kill()
+                    self.proc.wait(timeout=10)
         if self.proc:
             if self.proc.stdin:
                 self.proc.stdin.close()
@@ -226,9 +238,133 @@ def random_topk_test(binary, root):
                     assert math.isclose(actual_row[1], expected_distance, rel_tol=1e-5, abs_tol=1e-5)
 
         check_queries()
-        db.ok("--mode ann")
+        db.directive("--mode ann")
         check_queries()
-        db.ok("--mode exact")
+        db.directive("--mode exact")
+    finally:
+        db.stop()
+
+
+def boundaries_test(binary, root):
+    db = Db(binary, root / "boundaries").start()
+    try:
+        db.ok("CREATE TABLE t (id BIGINT PRIMARY KEY, category VARCHAR(4), v VECTOR(2))")
+        db.ok("INSERT INTO t VALUES (-5,'甲','[5,0]'),(1,'乙','[1,0]'),(2,'乙','[2,0]')", 3)
+        # SELECT of the vector column itself (rendered as a numeric array).
+        raw = db.sql("SELECT v FROM t WHERE id=1")
+        assert isinstance(raw["rows"][0][0], list) and len(raw["rows"][0][0]) == 2
+        # LIMIT edge cases.
+        assert db.rows("SELECT id FROM t ORDER BY id LIMIT 0") == []
+        assert len(db.rows("SELECT id FROM t ORDER BY id LIMIT 99")) == 3
+        # Zero-match mutations still report affected_rows 0 and succeed.
+        db.ok("UPDATE t SET category='x' WHERE id=999", 0)
+        db.ok("DELETE FROM t WHERE id=999", 0)
+        # OR filters.
+        assert db.rows("SELECT id FROM t WHERE id=-5 OR category='乙' ORDER BY id") == [[-5], [1], [2]]
+        # Distance DESC ordering with pk tie-break.
+        assert db.rows("SELECT id, L2_DISTANCE(v,'[0,0]') AS distance FROM t ORDER BY distance DESC LIMIT 2") == [
+            [-5, 5.0], [2, 2.0]
+        ]
+        # VARCHAR exactly at the limit is accepted; one over is rejected.
+        db.ok("INSERT INTO t VALUES (3,'四字测试','[0,1]')", 1)
+        db.error("INSERT INTO t VALUES (4,'五个字符串','[0,1]')", "string_too_long")
+        # DDL edge cases: second vector column, missing primary key,
+        # non-BIGINT primary key, duplicate table.
+        db.error("CREATE TABLE bad1 (id BIGINT PRIMARY KEY, a VECTOR(2), b VECTOR(2))", "unsupported_sql")
+        db.error("CREATE TABLE bad2 (id BIGINT)", "unsupported_sql")
+        db.error("CREATE TABLE bad3 (s VARCHAR(4) PRIMARY KEY)", "unsupported_sql")
+        db.error("CREATE TABLE t (id BIGINT PRIMARY KEY)", "table_exists")
+        # Primary key column cannot be updated.
+        db.error("UPDATE t SET id=9 WHERE id=1", "unsupported_sql")
+        # Nested transactions are rejected, and a failed BEGIN leaves the
+        # outer transaction usable.
+        db.ok("BEGIN")
+        db.error("BEGIN", "invalid_transaction_state")
+        db.ok("UPDATE t SET category='内' WHERE id=1", 1)
+        db.ok("ROLLBACK")
+        assert db.rows("SELECT category FROM t WHERE id=1") == [["乙"]]
+        # Errors keep the session usable afterwards.
+        db.error("SELECT id FROM missing", "table_not_found")
+        assert db.rows("SELECT id FROM t WHERE id=1") == [[1]]
+    finally:
+        db.stop()
+
+
+def ivf_recall_test(binary, root):
+    """IVF path coverage on a table large enough to trigger clustering.
+
+    Checks ann-mode results against brute-force truth for recall, ID
+    validity, no duplicates and filter correctness, including incremental
+    maintenance after update/delete/insert and a restart rebuild.
+    """
+    rng = random.Random(600081)
+    n = 5000
+    dim = 16
+    rows = {}
+    db = Db(binary, root / "ivf-recall").start()
+    try:
+        db.ok("CREATE TABLE t (id BIGINT PRIMARY KEY, category VARCHAR(4), v VECTOR(%d))" % dim)
+        for base in range(0, n, 250):
+            values = []
+            for pk in range(base, base + 250):
+                vector = [f32(rng.gauss(0, 1)) for _ in range(dim)]
+                rows[pk] = ("even" if pk % 2 == 0 else "odd", vector)
+                values.append("(%d,'%s','%s')" % (pk, rows[pk][0], "[" + ",".join(repr(x) for x in vector) + "]"))
+            db.ok("INSERT INTO t VALUES " + ",".join(values), 250)
+        db.ok("CREATE VECTOR INDEX t_v ON t(v)")
+        # incremental maintenance before querying
+        db.ok("UPDATE t SET v='[%s]' WHERE id=10" % ",".join(repr(f32(rng.gauss(5, 1))) for _ in range(dim)), 1)
+        db.ok("DELETE FROM t WHERE id >= 20 AND id < 40", 20)
+        for pk in range(20, 40):
+            rows.pop(pk)
+        db.directive("--mode ann")
+
+        def truth(query, filtered):
+            candidates = [item for item in rows.items() if not filtered or item[1][0] == "even"]
+            ranked = sorted(
+                ((distance(vector, query), pk) for pk, (_, vector) in candidates),
+                key=lambda item: (item[0], item[1]),
+            )
+            return ranked[:10]
+
+        recalls = []
+        for index in range(30):
+            query = [f32(rng.gauss(0, 1)) for _ in range(dim)]
+            literal = "[" + ",".join(repr(x) for x in query) + "]"
+            filtered = index % 2 == 1
+            where = " WHERE category='even'" if filtered else ""
+            result = db.rows(
+                "SELECT id, L2_DISTANCE(v,'%s') AS distance FROM t%s ORDER BY distance LIMIT 10"
+                % (literal, where)
+            )
+            ids = [row[0] for row in result]
+            assert len(ids) == 10, (index, ids)
+            assert len(set(ids)) == 10, (index, ids)
+            assert all(pk in rows for pk in ids), (index, ids)
+            if filtered:
+                assert all(pk % 2 == 0 for pk in ids), (index, ids)
+            expected = truth(query, filtered)
+            recalls.append(len(set(ids) & {pk for _, pk in expected}) / 10)
+            # Distances must match truth for any overlapping id.
+            by_pk = {pk: dist for dist, pk in expected}
+            for pk, dist in zip(ids, (row[1] for row in result)):
+                if pk in by_pk:
+                    assert math.isclose(dist, by_pk[pk], rel_tol=5e-4, abs_tol=5e-4), (index, pk, dist, by_pk[pk])
+        overall = sum(recalls) / len(recalls)
+        assert overall >= 0.95, ("recall below 0.95", overall, recalls)
+        # restart rebuilds the index before ready; results stay correct
+        db.restart(kill=True)
+        hits = []
+        for _ in range(10):
+            query = [f32(rng.gauss(0, 1)) for _ in range(dim)]
+            result = db.rows(
+                "SELECT id FROM t ORDER BY L2_DISTANCE(v,'%s') ASC LIMIT 10"
+                % ("[" + ",".join(repr(x) for x in query) + "]")
+            )
+            expected = {pk for _, pk in truth(query, False)}
+            hits.append(len({row[0] for row in result} & expected) / 10)
+        assert sum(hits) / len(hits) >= 0.9, ("post-restart recall", hits)
+        return overall
     finally:
         db.stop()
 
@@ -239,7 +375,7 @@ def main():
     args = parser.parse_args()
     binary = args.binary.resolve()
     root = Path(tempfile.mkdtemp(prefix="minivectordb-extended-"))
-    tests = [validation_test, transaction_test, crash_test, random_topk_test]
+    tests = [validation_test, transaction_test, crash_test, random_topk_test, boundaries_test, ivf_recall_test]
     try:
         for test in tests:
             test(binary, root)

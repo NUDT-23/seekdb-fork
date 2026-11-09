@@ -8,9 +8,27 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+
+// Positioned reads: unix and windows name them differently.
+trait ReadAt {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize>;
+}
+
+#[cfg(unix)]
+impl ReadAt for File {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        std::os::unix::fs::FileExt::read_at(self, buf, offset)
+    }
+}
+
+#[cfg(windows)]
+impl ReadAt for File {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        std::os::windows::fs::FileExt::seek_read(self, buf, offset)
+    }
+}
 
 use crate::error::{DbError, DbResult};
 use crate::value::{ColKind, Column, Schema};

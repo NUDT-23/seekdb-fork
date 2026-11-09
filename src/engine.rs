@@ -5,11 +5,10 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::error::{DbError, DbResult};
+use crate::ivf::IvfIndex;
 use crate::parser::{CmpOp, Expr, Literal, OrderDir, OrderKey, ProjItem, SelectStmt, Stmt};
 use crate::storage::{IndexDef, Row, Store, VVal, WalOp};
-use crate::value::{
-    check_varchar, l2_distance, l2_distance_ann, parse_vector, ColKind, Schema,
-};
+use crate::value::{check_varchar, l2_distance, parse_vector, l2_distance_sq_fast, ColKind, Schema};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum OutValue {
@@ -48,15 +47,115 @@ struct Transaction {
     created_indexes: Vec<IndexDef>,
 }
 
+struct TableIndex {
+    ivf: IvfIndex,
+    built_at: usize,
+}
+
 pub struct Engine {
     pub store: Store,
     txn: Option<Transaction>,
     pub ann_mode: bool,
+    /// table_id -> in-memory IVF index over committed rows.
+    indexes: HashMap<u32, TableIndex>,
+    /// nprobe as a fraction denominator of nlist (probe = max(1, nlist/10)).
+    nprobe_div: usize,
 }
 
 impl Engine {
     pub fn new(store: Store) -> Self {
-        Self { store, txn: None, ann_mode: false }
+        let mut engine = Self {
+            store,
+            txn: None,
+            ann_mode: false,
+            indexes: HashMap::new(),
+            nprobe_div: std::env::var("MINIVEC_NPROBE_DIV")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                // Probe half the lists by default: measured recall on
+                // 16-dim gaussian data stays >= 0.97 while scanning still
+                // skips half the table.
+                .unwrap_or(2),
+        };
+        engine.rebuild_all_indexes();
+        engine
+    }
+
+    /// Rebuild IVF indexes from durable rows. Called on startup (before the
+    /// ready marker is printed) - the statement allows index rebuilds from
+    /// persisted records as long as readiness waits for completion.
+    fn rebuild_all_indexes(&mut self) {
+        let defs: Vec<IndexDef> = self.store.indexes.clone();
+        for def in defs {
+            self.build_index_for(def.table_id);
+        }
+    }
+
+    fn build_index_for(&mut self, table_id: u32) {
+        let Some(schema) = self.store.tables.get(&table_id).map(|t| t.schema.clone()) else {
+            return;
+        };
+        let Some(vector_col) = schema.vector_col() else { return };
+        let mut rows = Vec::new();
+        for entry in self.store.tables.get(&table_id).unwrap().rows.values() {
+            let vec = match entry.row.cached_vec(vector_col) {
+                Some(v) => v,
+                None => match self.store.read_vec(table_id, entry.row.pk) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                },
+            };
+            rows.push((entry.row.pk, vec));
+        }
+        // Deterministic build order: stable centroids across restarts.
+        rows.sort_by_key(|(pk, _)| *pk);
+        let dim = rows.first().map(|(_, v)| v.len()).unwrap_or(0);
+        let built_at = rows.len();
+        let ivf = IvfIndex::build(dim, rows);
+        self.indexes.insert(table_id, TableIndex { ivf, built_at });
+    }
+
+    /// Apply committed ops to the in-memory indexes (insert/update/delete).
+    fn apply_index_ops(&mut self, ops: &[WalOp]) {
+        for op in ops {
+            match op {
+                WalOp::UpsertRow { table_id, row } => {
+                    if let Some(index) = self.indexes.get_mut(table_id) {
+                        if let (Some(schema), Some(VVal::Vec(Some(vec)))) =
+                            (self.store.tables.get(table_id).map(|t| &t.schema), row.vals.iter().find(|v| matches!(v, VVal::Vec(Some(_)))))
+                        {
+                            let _ = schema;
+                            index.ivf.insert(row.pk, Rc::clone(vec));
+                        }
+                    }
+                }
+                WalOp::DeleteRow { table_id, pk } => {
+                    if let Some(index) = self.indexes.get_mut(table_id) {
+                        index.ivf.remove(*pk);
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Rebuild when the table has doubled since the last build.
+        let rebuild: Vec<u32> = self
+            .indexes
+            .iter()
+            .filter(|(table_id, index)| {
+                index.ivf.should_rebuild(index.built_at)
+                    && self
+                        .store
+                        .tables
+                        .get(*table_id)
+                        .map(|t| t.rows.len())
+                        .unwrap_or(0)
+                        > index.built_at
+            })
+            .map(|(table_id, _)| *table_id)
+            .collect();
+        for table_id in rebuild {
+            self.build_index_for(table_id);
+        }
     }
 
     pub fn set_ann_mode(&mut self, ann: bool) {
@@ -80,6 +179,12 @@ impl Engine {
             Stmt::Commit => {
                 let txn = self.txn.take().ok_or(DbError::InvalidTransactionState)?;
                 self.store.commit(&txn.ops)?;
+                self.apply_index_ops(&txn.ops);
+                // Indexes created inside the transaction are built now.
+                let created: Vec<IndexDef> = txn.created_indexes.clone();
+                for def in created {
+                    self.build_index_for(def.table_id);
+                }
                 if let Err(error) = self.store.maybe_checkpoint() {
                     eprintln!("minivectordb: optional checkpoint failed: {}", error);
                 }
@@ -125,6 +230,7 @@ impl Engine {
             Ok(())
         } else {
             self.store.commit(&ops)?;
+            self.apply_index_ops(&ops);
             if let Err(error) = self.store.maybe_checkpoint() {
                 eprintln!("minivectordb: optional checkpoint failed: {}", error);
             }
@@ -213,7 +319,13 @@ impl Engine {
         if duplicate {
             return Err(DbError::IndexExists);
         }
-        self.publish(vec![WalOp::CreateVectorIndex(IndexDef { name, table_id, column })])
+        let in_txn = self.txn.is_some();
+        self.publish(vec![WalOp::CreateVectorIndex(IndexDef { name, table_id, column })])?;
+        if !in_txn {
+            // Autocommit: the index is usable immediately.
+            self.build_index_for(table_id);
+        }
+        Ok(())
     }
 
     fn insert(
@@ -372,7 +484,10 @@ impl Engine {
         Ok(rows)
     }
 
-    fn visible_row_refs(&self, table_id: u32) -> DbResult<Vec<&Row>> {
+    /// Visible committed rows plus transaction overlay rows.
+    /// `sorted` keeps a deterministic pk order for result output; the TopK
+    /// heap path passes false since it imposes its own final ordering.
+    fn visible_row_refs(&self, table_id: u32, sorted: bool) -> DbResult<Vec<&Row>> {
         let overlay = self.txn.as_ref().and_then(|txn| txn.tables.get(&table_id));
         let mut rows = Vec::new();
         if let Some(table) = self.store.tables.get(&table_id) {
@@ -386,13 +501,15 @@ impl Engine {
         if let Some(overlay) = overlay {
             rows.extend(overlay.upserts.values());
         }
-        rows.sort_by_key(|row| row.pk);
+        if sorted {
+            rows.sort_by_key(|row| row.pk);
+        }
         Ok(rows)
     }
 
     fn select(&mut self, stmt: SelectStmt) -> DbResult<ExecResult> {
         let (table_id, schema) = self.resolve_table(&stmt.table)?;
-        validate_filter(&schema, stmt.filter.as_ref())?;
+        let bound_filter = bind_filter(&schema, stmt.filter.as_ref())?;
         let items = bind_projection(&schema, &stmt.items)?;
         let l2_index = items.iter().position(|item| matches!(item, BoundProj::L2 { .. }));
         if items.iter().filter(|item| matches!(item, BoundProj::L2 { .. })).count() > 1 {
@@ -408,44 +525,135 @@ impl Engine {
             }
         }
         let order = bind_order(&schema, &items, &stmt.order)?;
-        let topk_limit = match (l2_index, order.as_slice(), stmt.limit) {
-            (Some(_), [BoundOrder::L2 { desc: false }], Some(limit)) => Some(limit as usize),
+        // Distance context: the projection's L2 when present, otherwise an
+        // L2 written directly inside ORDER BY (computed but not projected).
+        let mut dist_ctx: Option<(usize, Vec<f32>)> = l2_index.map(|i| match &items[i] {
+            BoundProj::L2 { vector_col, qvec, .. } => (*vector_col, qvec.clone()),
+            _ => unreachable!(),
+        });
+        if dist_ctx.is_none() {
+            if let Some(OrderKey::L2 { col, qvec, .. }) =
+                stmt.order.iter().find(|k| matches!(k, OrderKey::L2 { .. }))
+            {
+                let vector_col = schema.col_index(col).ok_or(DbError::ColumnNotFound)?;
+                if !matches!(schema.columns[vector_col].kind, ColKind::Vector(_)) {
+                    return Err(DbError::TypeMismatch);
+                }
+                let dim = match schema.columns[vector_col].kind {
+                    ColKind::Vector(dim) => dim,
+                    _ => unreachable!(),
+                };
+                if qvec.len() as u32 != dim {
+                    return Err(DbError::DimensionMismatch);
+                }
+                dist_ctx = Some((vector_col, qvec.clone()));
+            }
+        }
+        let topk_limit = match (dist_ctx.is_some(), order.as_slice(), stmt.limit) {
+            (true, [BoundOrder::L2 { desc: false }], Some(limit)) => Some(limit as usize),
             _ => None,
         };
-        let visible = self.visible_row_refs(table_id)?;
+        // ANN path: IVF probing is used only in ann mode, for ascending
+        // distance TopK, on a table whose index exists and is large enough
+        // for clustering to pay off. Small tables and exact mode always
+        // scan, which keeps results exact where IVF could lose recall.
+        let min_ivf_rows = std::env::var("MINIVEC_MIN_IVF_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4096);
+        let use_ivf = self.ann_mode
+            && matches!(topk_limit, Some(limit) if limit > 0)
+            && self
+                .indexes
+                .get(&table_id)
+                .map_or(false, |index| index.ivf.len() >= min_ivf_rows)
+            && self.txn.as_ref().map_or(true, |t| !t.created_tables.contains_key(&table_id));
         let mut records = Vec::new();
         let mut topk = BinaryHeap::new();
-        for row in visible {
-            if !eval_filter(&schema, row, stmt.filter.as_ref())? {
-                continue;
-            }
-            let distance = match l2_index.map(|i| &items[i]) {
-                Some(BoundProj::L2 { vector_col, qvec, .. }) => {
-                    let vector = match row.cached_vec(*vector_col) {
-                        Some(vector) => vector,
-                        None => self.store.read_vec(table_id, row.pk)?,
-                    };
-                    Some(if self.ann_mode {
-                        l2_distance_ann(&vector, qvec)
-                    } else {
-                        l2_distance(&vector, qvec)
-                    })
-                }
-                _ => None,
-            };
-            if let Some(limit) = topk_limit {
-                if limit == 0 {
-                    continue;
-                }
-                let candidate = HeapItem { row, distance: distance.unwrap() };
+        if use_ivf {
+            let limit = topk_limit.unwrap();
+            let (vector_col, qvec) = dist_ctx.clone().expect("topk implies dist_ctx");
+            let _ = vector_col; // filter/visibility only need pk + stored row
+            let nlist = self.indexes[&table_id].ivf.list_count();
+            let nprobe = (nlist / self.nprobe_div).max(1);
+            let (entries, boundary) = self.indexes[&table_id].ivf.candidates(&qvec, nprobe);
+            let overlay = self.txn.as_ref().and_then(|txn| txn.tables.get(&table_id));
+            let table = self.store.tables.get(&table_id).ok_or(DbError::TableNotFound)?;
+            fn push_item<'a>(
+                topk: &mut BinaryHeap<HeapItem<'a>>,
+                limit: usize,
+                row: &'a Row,
+                dist: f64,
+            ) {
+                let candidate = HeapItem { row, distance: dist };
                 if topk.len() < limit {
                     topk.push(candidate);
                 } else if topk.peek().map_or(false, |worst| candidate < *worst) {
                     topk.pop();
                     topk.push(candidate);
                 }
-            } else {
-                records.push(SelectedRow { row, distance });
+            }
+            for (position, entry) in entries.iter().enumerate() {
+                if position == boundary && topk.len() >= limit {
+                    break; // probed lists already filled K: skip the tail
+                }
+                if overlay.map_or(false, |o| o.deletes.contains(&entry.pk) || o.upserts.contains_key(&entry.pk)) {
+                    continue; // transaction overlay decides visibility
+                }
+                let Some(stored) = table.rows.get(&entry.pk) else { continue };
+                if bound_filter.as_ref().map_or(false, |f| !eval_bound(f, &stored.row)) {
+                    continue;
+                }
+                let distance = l2_distance_sq_fast(&entry.vec, &qvec).sqrt();
+                push_item(&mut topk, limit, &stored.row, distance);
+            }
+            if let Some(overlay) = overlay {
+                for row in overlay.upserts.values() {
+                    if bound_filter.as_ref().map_or(false, |f| !eval_bound(f, row)) {
+                        continue;
+                    }
+                    let (vector_col, _) = dist_ctx.clone().expect("ivf implies dist_ctx");
+                    if let Some(vector) = row.cached_vec(vector_col) {
+                        let distance = l2_distance_sq_fast(&vector, &qvec).sqrt();
+                        push_item(&mut topk, limit, row, distance);
+                    }
+                }
+            }
+        } else {
+            let sorted_scan = topk_limit.is_none();
+            let visible = self.visible_row_refs(table_id, sorted_scan)?;
+            for row in visible {
+                if bound_filter.as_ref().map_or(false, |f| !eval_bound(f, row)) {
+                    continue;
+                }
+                let distance = match &dist_ctx {
+                    Some((vector_col, qvec)) => {
+                        let vector = match row.cached_vec(*vector_col) {
+                            Some(vector) => vector,
+                            None => self.store.read_vec(table_id, row.pk)?,
+                        };
+                        Some(if self.ann_mode {
+                            l2_distance_sq_fast(&vector, qvec).sqrt()
+                        } else {
+                            l2_distance(&vector, qvec)
+                        })
+                    }
+                    None => None,
+                };
+                if let Some(limit) = topk_limit {
+                    if limit == 0 {
+                        continue;
+                    }
+                    let candidate = HeapItem { row, distance: distance.unwrap() };
+                    if topk.len() < limit {
+                        topk.push(candidate);
+                    } else if topk.peek().map_or(false, |worst| candidate < *worst) {
+                        topk.pop();
+                        topk.push(candidate);
+                    }
+                } else {
+                    records.push(SelectedRow { row, distance });
+                }
             }
         }
         if topk_limit.is_some() {
@@ -599,8 +807,63 @@ fn bind_order(schema: &Schema, items: &[BoundProj], order: &[OrderKey]) -> DbRes
                 }
                 Ok(BoundOrder::Column { index, desc })
             }
+            OrderKey::L2 { dir, .. } => Ok(BoundOrder::L2 { desc: *dir == OrderDir::Desc }),
         })
         .collect()
+}
+
+/// Filter pre-bound to column indexes so per-row evaluation does no name
+/// lookups on the scan path.
+enum BoundExpr {
+    Cmp { col: usize, op: CmpOp, lit: Literal },
+    And(Box<BoundExpr>, Box<BoundExpr>),
+    Or(Box<BoundExpr>, Box<BoundExpr>),
+}
+
+fn bind_filter(schema: &Schema, expr: Option<&Expr>) -> DbResult<Option<BoundExpr>> {
+    match expr {
+        None => Ok(None),
+        Some(Expr::And(left, right)) => Ok(Some(BoundExpr::And(
+            Box::new(bind_filter(schema, Some(left))?.ok_or(DbError::Internal)?),
+            Box::new(bind_filter(schema, Some(right))?.ok_or(DbError::Internal)?),
+        ))),
+        Some(Expr::Or(left, right)) => Ok(Some(BoundExpr::Or(
+            Box::new(bind_filter(schema, Some(left))?.ok_or(DbError::Internal)?),
+            Box::new(bind_filter(schema, Some(right))?.ok_or(DbError::Internal)?),
+        ))),
+        Some(Expr::Cmp { col, op, lit }) => {
+            let index = schema.col_index(col).ok_or(DbError::ColumnNotFound)?;
+            match (&schema.columns[index].kind, lit) {
+                (ColKind::BigInt, Literal::Int(_)) | (ColKind::Varchar(_), Literal::Str(_)) => {
+                    Ok(Some(BoundExpr::Cmp { col: index, op: *op, lit: lit.clone() }))
+                }
+                (ColKind::Vector(_), _) => Err(DbError::UnsupportedSql),
+                _ => Err(DbError::TypeMismatch),
+            }
+        }
+    }
+}
+
+fn eval_bound(expr: &BoundExpr, row: &Row) -> bool {
+    match expr {
+        BoundExpr::And(left, right) => eval_bound(left, row) && eval_bound(right, row),
+        BoundExpr::Or(left, right) => eval_bound(left, row) || eval_bound(right, row),
+        BoundExpr::Cmp { col, op, lit } => {
+            let ordering = match (&row.vals[*col], lit) {
+                (VVal::Int(left), Literal::Int(right)) => left.cmp(right),
+                (VVal::Str(left), Literal::Str(right)) => left.cmp(right),
+                _ => Ordering::Equal,
+            };
+            match op {
+                CmpOp::Eq => ordering == Ordering::Equal,
+                CmpOp::Ne => ordering != Ordering::Equal,
+                CmpOp::Lt => ordering == Ordering::Less,
+                CmpOp::Le => ordering != Ordering::Greater,
+                CmpOp::Gt => ordering == Ordering::Greater,
+                CmpOp::Ge => ordering != Ordering::Less,
+            }
+        }
+    }
 }
 
 fn bind_literal(kind: &ColKind, literal: Literal) -> DbResult<VVal> {

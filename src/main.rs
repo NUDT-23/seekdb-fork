@@ -1,81 +1,18 @@
 mod engine;
 mod error;
+mod ivf;
 mod lexer;
 mod parser;
+mod protocol;
 mod storage;
 mod value;
 
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
-use engine::{Engine, ExecResult, OutValue};
-use error::DbError;
+use engine::Engine;
+use protocol::{ProtoKind, Protocol};
 use storage::Store;
-use value::{fmt_f32, fmt_f64};
-
-fn json_string(text: &str) -> String {
-    let mut out = String::with_capacity(text.len() + 2);
-    out.push('"');
-    for ch in text.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{08}' => out.push_str("\\b"),
-            '\u{0c}' => out.push_str("\\f"),
-            c if c < '\u{20}' => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
-fn render_value(value: &OutValue) -> String {
-    match value {
-        OutValue::Int(v) => v.to_string(),
-        OutValue::Str(v) => json_string(v),
-        OutValue::Float(v) => fmt_f64(*v),
-        OutValue::Vector(v) => format!(
-            "[{}]",
-            v.iter().map(|f| fmt_f32(*f)).collect::<Vec<_>>().join(",")
-        ),
-    }
-}
-
-fn render_result(result: Result<ExecResult, DbError>) -> String {
-    match result {
-        Err(error) => format!(
-            "{{\"ok\":false,\"error\":{},\"code\":{}}}",
-            json_string(error.code()),
-            json_string(error.code())
-        ),
-        Ok(ExecResult::Ok { affected_rows }) => match affected_rows {
-            Some(n) => format!("{{\"ok\":true,\"affected_rows\":{}}}", n),
-            None => "{\"ok\":true}".to_string(),
-        },
-        Ok(ExecResult::Query { columns, rows }) => {
-            let columns = columns
-                .iter()
-                .map(|name| json_string(name))
-                .collect::<Vec<_>>()
-                .join(",");
-            let rows = rows
-                .iter()
-                .map(|row| {
-                    format!(
-                        "[{}]",
-                        row.iter().map(render_value).collect::<Vec<_>>().join(",")
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(",");
-            format!("{{\"ok\":true,\"columns\":[{}],\"rows\":[{}]}}", columns, rows)
-        }
-    }
-}
 
 fn data_dir() -> PathBuf {
     let mut args = std::env::args().skip(1);
@@ -88,7 +25,38 @@ fn data_dir() -> PathBuf {
             return PathBuf::from(arg);
         }
     }
-    std::env::var_os("MINIVEC_DATA_DIR").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/data"))
+    std::env::var_os("MINIVEC_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/data"))
+}
+
+/// Split one input line into complete SQL statements on quote-unaware-safe
+/// semicolons: single-quoted strings (with '' escapes) are never split.
+fn split_statements(line: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let bytes = line.as_bytes();
+    let mut start = 0usize;
+    let mut in_string = false;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' => {
+                if in_string && i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    i += 2; // escaped quote inside the literal
+                    continue;
+                }
+                in_string = !in_string;
+            }
+            b';' if !in_string => {
+                parts.push(&line[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    parts.push(&line[start..]);
+    parts.into_iter().map(str::trim).filter(|p| !p.is_empty()).collect()
 }
 
 fn main() {
@@ -105,48 +73,73 @@ fn main() {
         }
     };
     let mut engine = Engine::new(store);
+    let proto = Protocol::new(ProtoKind::from_env());
+    eprintln!(
+        "minivectordb: data={} protocol={}",
+        dir.display(),
+        proto.kind.name()
+    );
+
     let stdout = io::stdout();
     let mut out = stdout.lock();
-    let _ = writeln!(out, "{{\"ready\":true}}");
-    let _ = out.flush();
+    if let Some(ready) = proto.ready_line() {
+        let _ = writeln!(out, "{}", ready);
+        let _ = out.flush();
+    }
 
     let stdin = io::stdin();
+    let mut first_line = true;
     for line in stdin.lock().lines() {
-        let line = match line {
+        let mut line = match line {
             Ok(line) => line,
             Err(error) => {
                 eprintln!("minivectordb: stdin error: {}", error);
                 break;
             }
         };
-        let sql = line.trim();
-        if sql.is_empty() {
+        if first_line {
+            first_line = false;
+            if line.starts_with('\u{feff}') {
+                line.remove(0);
+            }
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
             continue;
         }
-        if sql.eq_ignore_ascii_case("--mode ann") {
-            engine.set_ann_mode(true);
-            let _ = writeln!(out, "{{\"ok\":true}}");
-            let _ = out.flush();
+
+        // Driver directives and exit spellings occupy no assertion slot:
+        // they are consumed silently (official README: "驱动指令不占断言位置").
+        let directive = trimmed.to_ascii_lowercase();
+        let directive = directive.trim_end_matches(';').trim();
+        match directive {
+            "--mode ann" => {
+                engine.set_ann_mode(true);
+                continue;
+            }
+            "--mode exact" => {
+                engine.set_ann_mode(false);
+                continue;
+            }
+            // The driver closes and restarts us with the same data dir; our
+            // side of the contract is a clean shutdown (rollback uncommitted
+            // transactions, durable checkpoint) and exit 0.
+            "--restart" | "--shutdown" | "shutdown" | "exit" | "quit" | "bye" | "\\q" => {
+                break;
+            }
+            _ => {}
+        }
+        // SQL line comments: swallow silently.
+        if trimmed.starts_with("--") || trimmed.starts_with('#') {
             continue;
         }
-        if sql.eq_ignore_ascii_case("--mode exact") {
-            engine.set_ann_mode(false);
-            let _ = writeln!(out, "{{\"ok\":true}}");
-            let _ = out.flush();
-            continue;
-        }
-        if sql.eq_ignore_ascii_case("--shutdown") || sql.eq_ignore_ascii_case("SHUTDOWN") {
-            let _ = writeln!(out, "{{\"ok\":true}}");
-            let _ = out.flush();
-            break;
-        }
-        let response = render_result(engine.execute(sql));
-        if writeln!(out, "{}", response).and_then(|_| out.flush()).is_err() {
-            break;
+        for sql in split_statements(trimmed) {
+            let response = proto.render(&engine.execute(sql));
+            if writeln!(out, "{}", response).and_then(|_| out.flush()).is_err() {
+                break;
+            }
         }
     }
-    if let Err(error) = engine.store.shutdown() {
-        eprintln!("minivectordb: shutdown checkpoint failed: {}", error);
-    }
+    let _ = engine.store.shutdown();
     let _ = out.flush();
 }

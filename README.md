@@ -23,41 +23,43 @@ cargo build --release
 
 The data directory defaults to `/data` or `MINIVEC_DATA_DIR`. `--data-dir` takes precedence.
 
-## Current local wire protocol
+## Wire protocol
 
-**Protocol status (2026-11-09):** the public package contains cases and assertions but not the official stdin/stdout driver. Its README explicitly says process communication is defined by the separate driver. The transport below is therefore an isolated interim adapter for local validation; it must be matched to the official driver when that specification is published. SQL execution and result comparison are independent of this adapter.
+**Protocol status (2026-11-09, updated after fork archaeology + first submission failure):** the official driver is still unpublished, but the strongest evidence now points to a bare one-line-JSON-per-statement transport that mirrors the `.result` assertion vocabulary exactly:
 
-On startup:
+1. The official `mysqltest/README.md` states assertions are a JSON array with **exactly one entry per SQL statement**, that **driver directives occupy no assertion slot** (so they must produce no response), that `--restart` means *the driver* cleanly stops and restarts the process with the same data directory, and that the earlier example-style JSON *wrapping* is gone.
+2. Our first submission (ok-wrapped JSON plus a leading `{"ready":true}` line) failed **all** MySQL cases with no error logs — consistent with a positionally comparing driver being desynced by the extra line and rejecting every wrapped object.
+3. Independent platform evidence from another team: a TSV + `OK <n>` framing with **no** stdout ready marker ran to completion, while their one-line wrapped JSON also failed.
 
-```json
-{"ready":true}
-```
+The default transport (`MINIVEC_PROTOCOL=jsonl`) is therefore:
 
 Successful DDL / transaction command:
 
 ```json
-{"ok":true}
+{}
 ```
 
 Successful INSERT / UPDATE / DELETE:
 
 ```json
-{"ok":true,"affected_rows":3}
+{"affected_rows":3}
 ```
 
 Query:
 
 ```json
-{"ok":true,"columns":["id","distance"],"rows":[[1,5.0]]}
+{"columns":["id","distance"],"rows":[[1,5.0]]}
 ```
 
 Error:
 
 ```json
-{"ok":false,"error":"duplicate_key","code":"duplicate_key"}
+{"error":"duplicate_key"}
 ```
 
-Local driver directives are `--restart` (implemented by the test process), `--mode exact`, `--mode ann`, and `--shutdown`. Every response is one UTF-8 JSON line and stdout is flushed immediately. BIGINT values are emitted as integer tokens, not rounded through floating point.
+No ready line is printed (any extra line would desync positional comparison; stderr carries a diagnostic instead). Statements are read line-by-line; trailing `;` is accepted, quote-aware multi-statement lines produce one response per statement, `--`/`#` comment lines are swallowed silently, and a UTF-8 BOM on the first line is stripped. Driver directives are consumed silently: `--mode ann` / `--mode exact` switch the vector query mode, and `--restart` / `--shutdown` / `exit` / `quit` / `\q` trigger a clean shutdown (rollback of uncommitted transactions, durable checkpoint) and exit 0 — the driver restarts the process itself. Every response is one UTF-8 line and stdout is flushed immediately. BIGINT values are emitted as exact integer tokens, not rounded through floating point.
+
+Fallback transports, selectable with `MINIVEC_PROTOCOL`: `tsv` (READY marker + tab-separated header/rows + `OK <n>` status line + `ERROR <name>: <msg>`, the framing with independent platform evidence), `json` (the earlier ok-wrapped interim format with a ready line), `json-noready`, and `miniob` (SUCCESS/FAILURE lines). When the official driver is published, the shipped default can be switched with one env knob without touching SQL execution.
 
 ## Supported SQL
 
@@ -119,12 +121,13 @@ The public runner checks all assertions, restart reuse of the data directory, ex
 
 Local release result on this workspace (10,000 rows, 128 dimensions, 1,000 queries, K=10; not an official platform score):
 
-- exact: write 1.12 s, query 1.07 s, sampled Recall@10 = 1.0;
-- ann: write 1.12 s, query 0.93 s, sampled Recall@10 = 1.0;
-- database-process VmHWM during the exact benchmark: 11 MiB (the Python data generator/driver is excluded).
+- exact: write 1.20 s, query 0.63 s (≈1580 qps), Recall@10 = 1.0 (full truth for all 1000 queries, filtered and unfiltered);
+- ann: query throughput is similar but Recall@10 on 128-dim uniform data measures ~0.84 (IVF-Flat cluster separation is weak on uniform data), so **exact is the submission mode**; the benchmark's ann mode fails its own ≥0.95 recall assert here by design;
+- query path: filter pre-binding, no pre-sort for TopK heap scans, and an AVX2 f64-accumulated distance kernel (numerically ordered like the scalar loop, far inside the 1e-5 tolerance) — measured 2× the scalar baseline;
+- database-process VmHWM during the exact benchmark: 12 MiB (the Python data generator/driver is excluded).
 
 ## Known gaps
 
-1. The official evaluation wire format, resource limits and frozen error mapping have not been published in the branch's public package; the interim transport must be adapted before formal submission.
-2. ANN currently uses exact candidate scanning rather than IVF/HNSW pruning. This favors recall and update correctness; further query-time indexing is an optimization, not a claim of platform performance.
+1. The official evaluation wire format, resource limits and frozen error mapping are still unpublished; the default `jsonl` transport mirrors the official `.result` assertion vocabulary (strongest current evidence), with `tsv` and other fallbacks one env knob away. Must be re-verified once the official driver is published.
+2. IVF-Flat ANN is implemented (deterministic k-means, inverted lists, incremental maintenance, restart rebuild) but recall on 128-dim uniform benchmark data is ~0.84, below the 0.95 bar, so submission mode is exact scanning. IVF remains enabled for `--mode ann` on smaller/clusterable datasets.
 3. Single-client and single-transaction limits are intentional. No network protocol, NULL, joins, aggregates, distributed execution or concurrent transaction support is provided.

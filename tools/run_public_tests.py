@@ -31,13 +31,8 @@ def start(binary, data_dir):
         encoding="utf-8",
         bufsize=1,
     )
-    ready = proc.stdout.readline()
-    try:
-        value = json.loads(ready)
-    except Exception as exc:
-        raise CaseFailure(f"bad ready line {ready!r}: {exc}")
-    if value.get("ready") is not True:
-        raise CaseFailure(f"missing ready marker: {ready!r}")
+    # jsonl default protocol prints no ready marker: responses start with the
+    # first SQL statement.
     return proc
 
 
@@ -55,14 +50,25 @@ def request(proc, text):
 
 def stop(proc):
     if proc.poll() is None:
-        proc.terminate()
+        # Official restart/shutdown contract: close stdin, wait for a clean
+        # exit (rollback + checkpoint). Fall back to terminate if it hangs.
         try:
-            proc.wait(timeout=5)
+            if proc.stdin:
+                proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=5)
-    if proc.stdin:
-        proc.stdin.close()
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+    else:
+        if proc.stdin:
+            proc.stdin.close()
     if proc.stdout:
         proc.stdout.close()
 
@@ -101,15 +107,17 @@ def equal_rows(actual, expected, unordered):
 
 def check_response(actual, expected, sql):
     if "error" in expected:
-        if actual.get("ok") is not False:
+        if "error" not in actual:
             raise CaseFailure(f"{sql}: expected error {expected['error']}, got {actual}")
-        code = actual.get("error") or actual.get("code")
+        code = actual.get("error")
         if not code:
             raise CaseFailure(f"{sql}: empty error code: {actual}")
         if code != expected["error"]:
             raise CaseFailure(f"{sql}: expected error {expected['error']}, got {code}")
+        if set(actual) != {"error"}:
+            raise CaseFailure(f"{sql}: unexpected fields alongside error: {actual}")
         return
-    if actual.get("ok") is not True:
+    if "error" in actual:
         raise CaseFailure(f"{sql}: expected success, got {actual}")
     if "affected_rows" in expected and actual.get("affected_rows") != expected["affected_rows"]:
         raise CaseFailure(
@@ -148,9 +156,10 @@ def run_case(binary, manifest_dir, case, work_root):
                 proc = start(binary, data_dir)
                 continue
             if statement.startswith("--mode "):
-                response = request(proc, statement)
-                if response.get("ok") is not True:
-                    raise CaseFailure(f"mode switch failed: {response}")
+                # Driver directives are consumed silently by the database;
+                # no response line follows.
+                proc.stdin.write(statement + "\n")
+                proc.stdin.flush()
                 continue
             if statement.startswith("--"):
                 raise CaseFailure(f"unknown driver directive: {statement}")

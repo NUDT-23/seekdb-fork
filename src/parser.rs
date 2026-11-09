@@ -47,6 +47,9 @@ pub enum OrderDir {
 #[derive(Debug, Clone)]
 pub enum OrderKey {
     Col { name: String, dir: OrderDir },
+    /// `ORDER BY L2_DISTANCE(col, 'vec')` - kept even when the projection
+    /// does not include the distance, so it can be computed hidden.
+    L2 { col: String, qvec: Vec<f32>, dir: OrderDir },
 }
 
 #[derive(Debug, Clone)]
@@ -447,6 +450,30 @@ fn parse_proj_item(lx: &mut Lexer) -> DbResult<ProjItem> {
 }
 
 fn parse_order_key(lx: &mut Lexer) -> DbResult<OrderKey> {
+    if lx.is_kw("L2_DISTANCE") {
+        lx.next();
+        lx.expect(Tok::LParen)?;
+        let col = lx.ident()?;
+        lx.expect(Tok::Comma)?;
+        let qtext = match lx.next() {
+            Some(Tok::Str(s)) => s,
+            _ => return Err(DbError::SyntaxError),
+        };
+        let inner = qtext.trim();
+        let inner = inner
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .ok_or(DbError::InvalidVector)?;
+        let qvec = parse_vector(inner, None)?;
+        lx.expect(Tok::RParen)?;
+        let dir = if lx.eat_kw("DESC") {
+            OrderDir::Desc
+        } else {
+            lx.eat_kw("ASC");
+            OrderDir::Asc
+        };
+        return Ok(OrderKey::L2 { col, qvec, dir });
+    }
     let name = lx.ident()?;
     let dir = if lx.eat_kw("DESC") {
         OrderDir::Desc

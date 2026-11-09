@@ -50,12 +50,13 @@ def main():
         )
         queries.append((query, filtered, sql))
 
+    # Full Recall@10 truth for every query (not just a sample): a mode that
+    # cannot hold 0.95 must fail loudly here instead of hiding in metrics.
     truth = {}
-    for index in list(range(5)) + list(range(5, 10)):
-        query, filtered, _ = queries[index]
+    for index, (query, filtered, _) in enumerate(queries):
         candidates = [row for row in rows if not filtered or row[1] == 0]
-        expected = sorted((l2(vector, query), pk) for pk, _, vector in candidates)[:10]
-        truth[index] = [pk for _, pk in expected]
+        ranked = sorted((l2(vector, query), pk) for pk, _, vector in candidates)[:10]
+        truth[index] = {pk for _, pk in ranked}
 
     data_dir = Path(tempfile.mkdtemp(prefix="minivectordb-bench-"))
     proc = subprocess.Popen(
@@ -74,11 +75,10 @@ def main():
         if not response:
             raise RuntimeError(f"database exited: {proc.poll()}")
         value = json.loads(response)
-        if not value.get("ok"):
+        if "error" in value:
             raise RuntimeError((sql[:200], value))
         return value
 
-    assert json.loads(proc.stdout.readline()).get("ready") is True
     request("CREATE TABLE t (id BIGINT PRIMARY KEY, category VARCHAR(4), v VECTOR(%d))" % args.dim)
     write_start = time.perf_counter()
     for base in range(0, len(rows), 100):
@@ -90,20 +90,24 @@ def main():
     write_seconds = time.perf_counter() - write_start
     request("CREATE VECTOR INDEX t_v ON t(v)")
     if args.mode == "ann":
-        request("--mode ann")
+        proc.stdin.write("--mode ann\n")
+        proc.stdin.flush()
 
     query_start = time.perf_counter()
-    recalls = []
+    hits = []
     for index, (_, filtered, sql) in enumerate(queries):
         result = request(sql)
         ids = [row[0] for row in result["rows"]]
         assert len(ids) == 10 and len(set(ids)) == 10
         if filtered:
             assert all(pk % 2 == 0 for pk in ids)
-        if index in truth:
-            expected = truth[index]
-            recalls.append(len(set(ids) & set(expected)) / 10)
+        hits.append(len(set(ids) & truth[index]) / 10)
     query_seconds = time.perf_counter() - query_start
+    recall_unfiltered = sum(hits[0::2]) / (len(hits) // 2)
+    recall_filtered = sum(hits[1::2]) / (len(hits) // 2)
+    if args.mode == "ann":
+        assert recall_unfiltered >= 0.95 and recall_filtered >= 0.95, (
+            "recall below 0.95", recall_unfiltered, recall_filtered)
     status = Path(f"/proc/{proc.pid}/status").read_text()
     memory_status = {
         key: int(line.split()[1]) // 1024
@@ -123,7 +127,9 @@ def main():
         "write_seconds": round(write_seconds, 6),
         "query_seconds": round(query_seconds, 6),
         "queries_per_second": round(args.queries / query_seconds, 3),
-        "sample_recall_at_10": round(sum(recalls) / len(recalls), 6),
+        "sample_recall_at_10": round(sum(hits) / len(hits), 6),
+        "recall_at_10_unfiltered": round(recall_unfiltered, 6),
+        "recall_at_10_filtered": round(recall_filtered, 6),
         "max_rss_mib": round(usage.ru_maxrss / 1024, 3),
         "db_vm_hwm_mib": memory_status.get("VmHWM"),
         "db_vm_rss_mib": memory_status.get("VmRSS"),
