@@ -19,7 +19,7 @@
 
 #include "lib/allocator/page_arena.h"
 #include "common/datum/ob_datum.h"
-#include "common/ob_searray.h"
+#include "lib/container/ob_se_array.h"
 #include "storage/blocksstable/ob_datum_row.h"
 #include "data_plane/fts/ob_doc_id.h"
 #include "storage/access/ob_table_param.h"
