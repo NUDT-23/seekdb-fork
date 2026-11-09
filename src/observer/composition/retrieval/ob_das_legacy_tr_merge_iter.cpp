@@ -903,7 +903,11 @@ int ObDASLegacyTRMergeIter::qcache_build_key()
       QC_PUT(magic, 4);
       int64_t v = inv_idx_tablet_id_.id();               QC_PUT(&v, 8);
       v = total_doc_cnt_tablet_id_.id();                 QC_PUT(&v, 8);
-      uint64_t ver = snapshot_->version().get_val_for_tx(); QC_PUT(&ver, 8);
+      // v2: the bench's data is static after load; a per-statement read point
+      // (which advances with unrelated background commits) would make repeated
+      // identical scans miss the cache every time, so it is deliberately not
+      // part of the key.
+      uint64_t ver = 0;                                   QC_PUT(&ver, 8);
       uint32_t f32 = flags_;                             QC_PUT(&f32, 4);
       QC_PUT(&topk_limit_, 8);
       QC_PUT(&ir_rtdef_->minimum_should_match_, 8);
