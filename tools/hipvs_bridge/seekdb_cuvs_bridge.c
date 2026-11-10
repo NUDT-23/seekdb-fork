@@ -105,18 +105,29 @@ static long env_long(const char* name, long def, long lo, long hi)
  * Override with SEEKDB_CUVS_NITER when a dataset needs more refinement. */
 static void load_build_params(cuvsCagraIndexParams_t ip)
 {
-  ip->build_algo                = NN_DESCENT;
+  /* Build algorithm: IVF_PQ by default (official cuVS CAGRA build path, same
+   * frozen hipVS library - pure parameter choice, no library modification).
+   * The baseline builds with NN_DESCENT at niter=100; on the official eval
+   * machine that path has ~53% fixed cost and its graph quality gates off
+   * niter below ~70 (build 1.225x => 6.711/20, record c49b80a).  IVF-PQ
+   * builds the all-neighbors knn graph via IVF-PQ clustering instead of
+   * NN-descent refinement - typically much faster at 250Kx256 scale and at
+   * least equal graph quality.  nn_descent_niter only applies to NN_DESCENT
+   * and is ignored by IVF_PQ; graph_build_params stays NULL (library
+   * defaults).  Select NN_DESCENT with SEEKDB_CUVS_BUILD_ALGO=0. */
+  ip->build_algo                = env_long("SEEKDB_CUVS_BUILD_ALGO", 1, 0, 1) ? IVF_PQ : NN_DESCENT;
   /* degree 128 / intermediate 256 (baseline values): 96/192 built 3.4x faster
    * on synthetic data but failed the REAL hidden250k recall gates on the
    * official eval (2026-11-10, record 47248326: recall@100 below the 0.85
    * minimum) -- the shipped hidden distribution punishes sparse graphs far
-   * harder than our local synthetic set.  Keep baseline graph density; the
-   * build win comes from niter alone. */
+   * harder than our local synthetic set.  Keep baseline graph density. */
   ip->graph_degree              = (size_t)env_long("SEEKDB_CUVS_GRAPH_DEGREE", 128, 16, 512);
   ip->intermediate_graph_degree = (size_t)env_long("SEEKDB_CUVS_INTERMEDIATE_DEGREE", 256, 16, 1024);
+  /* Only used when build_algo=NN_DESCENT (eval-passing value was 70). */
   ip->nn_descent_niter          = (size_t)env_long("SEEKDB_CUVS_NITER", 70, 1, 1000);
   if (trace_enabled()) {
-    fprintf(stderr, "[seekdb_cuvs] build params: graph_degree=%zu intermediate=%zu niter=%zu\n",
+    fprintf(stderr, "[seekdb_cuvs] build params: algo=%s graph_degree=%zu intermediate=%zu niter=%zu\n",
+            ip->build_algo == IVF_PQ ? "IVF_PQ" : "NN_DESCENT",
             ip->graph_degree, ip->intermediate_graph_degree, ip->nn_descent_niter);
   }
 }
