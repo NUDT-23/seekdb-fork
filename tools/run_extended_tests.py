@@ -24,6 +24,8 @@ class Db:
         self.directory = Path(directory)
         self.env = env or {}
         self.proc = None
+        self.seq = 0
+        self.mode = "exact"
 
     def start(self):
         env = os.environ.copy()
@@ -37,35 +39,47 @@ class Db:
             bufsize=1,
             env=env,
         )
-        # jsonl protocol: no ready marker, first response follows the first
-        # SQL statement.
+        # Official protocol (STDIO_PROTOCOL.md §2): exact ready object after
+        # recovery, before the first request.
+        line = self.proc.stdout.readline()
+        assert json.loads(line) == {"type": "ready"}, line
         return self
 
-    def sql(self, text):
-        self.proc.stdin.write(text + "\n")
+    def sql(self, text, mode=None):
+        self.seq += 1
+        request = {"id": self.seq, "op": "execute", "sql": text,
+                   "search_mode": mode or self.mode}
+        self.proc.stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
         self.proc.stdin.flush()
         line = self.proc.stdout.readline()
         assert line, (text, self.proc.poll())
-        return json.loads(line)
+        response = json.loads(line)
+        assert response.get("id") == self.seq, (text, response)
+        assert isinstance(response.get("ok"), bool), (text, response)
+        return response
 
     def directive(self, text):
-        """Send a driver directive; the database consumes it silently, so the
-        next response line belongs to the following statement."""
-        self.proc.stdin.write(text + "\n")
-        self.proc.stdin.flush()
+        """Mode directives from the old .test files now map to the per-request
+        search_mode field instead of a wire directive."""
+        if text == "--mode ann":
+            self.mode = "ann"
+        elif text == "--mode exact":
+            self.mode = "exact"
+        else:
+            raise ValueError(f"unsupported directive: {text}")
 
     def ok(self, text, affected=None):
         result = self.sql(text)
-        assert "error" not in result, (text, result)
+        assert result.get("ok") is True, (text, result)
         if affected is not None:
             assert result.get("affected_rows") == affected, (text, result)
         return result
 
     def error(self, text, code=None):
         result = self.sql(text)
-        assert "error" in result, (text, result)
+        assert result.get("ok") is False, (text, result)
         if code is not None:
-            assert result["error"] == code, (text, result)
+            assert result["error"]["code"] == code, (text, result)
         return result
 
     def rows(self, text):
@@ -82,14 +96,24 @@ class Db:
                 self.proc.kill()
                 self.proc.wait(timeout=10)
             else:
-                # Clean shutdown: close stdin, let the process roll back and
-                # checkpoint; force-kill only if it hangs.
-                self.proc.stdin.close()
+                # Official shutdown (§4): respond then exit 0 with no
+                # further stdout. Force-kill only if it hangs.
+                self.seq += 1
+                self.proc.stdin.write(
+                    json.dumps({"id": self.seq, "op": "shutdown"}) + "\n")
+                self.proc.stdin.flush()
+                line = self.proc.stdout.readline()
+                assert line, "no shutdown response"
+                response = json.loads(line)
+                assert response == {"id": self.seq, "ok": True}, response
                 try:
                     self.proc.wait(timeout=10)
                 except subprocess.TimeoutExpired:
                     self.proc.kill()
                     self.proc.wait(timeout=10)
+                assert self.proc.returncode == 0, self.proc.returncode
+                extra = self.proc.stdout.read()
+                assert not extra.strip(), f"extra stdout after shutdown: {extra!r}"
         if self.proc:
             if self.proc.stdin:
                 self.proc.stdin.close()

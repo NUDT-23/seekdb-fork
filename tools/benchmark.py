@@ -68,14 +68,23 @@ def main():
         bufsize=1,
     )
 
+    # Official protocol: ready object first, then JSONL requests.
+    ready = proc.stdout.readline()
+    assert json.loads(ready) == {"type": "ready"}, ready
+    seq = 0
+
     def request(sql):
-        proc.stdin.write(sql + "\n")
+        nonlocal seq
+        seq += 1
+        proc.stdin.write(json.dumps(
+            {"id": seq, "op": "execute", "sql": sql, "search_mode": args.mode},
+            ensure_ascii=False) + "\n")
         proc.stdin.flush()
         response = proc.stdout.readline()
         if not response:
             raise RuntimeError(f"database exited: {proc.poll()}")
         value = json.loads(response)
-        if "error" in value:
+        if value.get("ok") is not True:
             raise RuntimeError((sql[:200], value))
         return value
 
@@ -89,9 +98,6 @@ def main():
         assert result.get("affected_rows") == len(values)
     write_seconds = time.perf_counter() - write_start
     request("CREATE VECTOR INDEX t_v ON t(v)")
-    if args.mode == "ann":
-        proc.stdin.write("--mode ann\n")
-        proc.stdin.flush()
 
     query_start = time.perf_counter()
     hits = []
@@ -115,8 +121,14 @@ def main():
         for line in status.splitlines()
         if line.startswith(key + ":")
     }
-    proc.terminate()
+    # Official shutdown: respond, exit 0, nothing further on stdout.
+    seq += 1
+    proc.stdin.write(json.dumps({"id": seq, "op": "shutdown"}) + "\n")
+    proc.stdin.flush()
+    shutdown = json.loads(proc.stdout.readline())
+    assert shutdown == {"id": seq, "ok": True}, shutdown
     proc.wait(timeout=20)
+    assert proc.returncode == 0, proc.returncode
     usage = resource.getrusage(resource.RUSAGE_CHILDREN)
     disk_bytes = sum(path.stat().st_size for path in data_dir.rglob("*") if path.is_file())
     metrics = {

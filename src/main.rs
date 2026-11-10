@@ -1,6 +1,7 @@
 mod engine;
 mod error;
 mod ivf;
+mod jsonreq;
 mod lexer;
 mod parser;
 mod protocol;
@@ -10,8 +11,8 @@ mod value;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
-use engine::Engine;
-use protocol::{ProtoKind, Protocol};
+use engine::{Engine, ExecResult};
+use protocol::{ProtoKind, Protocol, render_official};
 use storage::Store;
 
 fn data_dir() -> PathBuf {
@@ -25,7 +26,10 @@ fn data_dir() -> PathBuf {
             return PathBuf::from(arg);
         }
     }
-    std::env::var_os("MINIVEC_DATA_DIR")
+    // The official protocol_check tool exports VECTORDB_DATA_DIR for
+    // --command mode (STDIO_PROTOCOL.md §9); /data stays the container default.
+    std::env::var_os("VECTORDB_DATA_DIR")
+        .or_else(|| std::env::var_os("MINIVEC_DATA_DIR"))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/data"))
 }
@@ -82,9 +86,16 @@ fn main() {
 
     let stdout = io::stdout();
     let mut out = stdout.lock();
+    // STDIO_PROTOCOL.md §2: ready after recovery, before the first request,
+    // exact object, flushed. Diagnostics stay on stderr.
     if let Some(ready) = proto.ready_line() {
         let _ = writeln!(out, "{}", ready);
         let _ = out.flush();
+    }
+
+    if matches!(proto.kind, ProtoKind::Official) {
+        run_official(engine, out);
+        return;
     }
 
     let stdin = io::stdin();
@@ -140,6 +151,74 @@ fn main() {
             }
         }
     }
+    let _ = engine.store.shutdown();
+    let _ = out.flush();
+}
+
+/// Official STDIO_PROTOCOL.md request loop: JSONL requests on stdin, one
+/// response each on stdout, until `{"op":"shutdown"}`.
+fn run_official(mut engine: Engine, mut out: io::StdoutLock<'static>) {
+    let stdin = io::stdin();
+    let mut first_line = true;
+    for line in stdin.lock().lines() {
+        let mut line = match line {
+            Ok(line) => line,
+            Err(error) => {
+                eprintln!("minivectordb: stdin error: {}", error);
+                break;
+            }
+        };
+        if first_line {
+            first_line = false;
+            if line.starts_with('\u{feff}') {
+                line.remove(0);
+            }
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        let request = match jsonreq::parse(&line) {
+            jsonreq::Parsed::Ok(req) => req,
+            jsonreq::Parsed::Bad(reason) => {
+                // The judge never sends malformed lines. Stay silent on
+                // stdout (an unsolicited response would fail the transport)
+                // and keep reading.
+                eprintln!("minivectordb: bad request line ({}): {:.120}", reason, line);
+                continue;
+            }
+        };
+        if request.op == "shutdown" {
+            // §4: roll back uncommitted transactions, persist, respond, then
+            // flush and exit 0 with nothing further on stdout.
+            let _ = engine.store.shutdown();
+            let _ = writeln!(out, "{{\"id\":{},\"ok\":true}}", request.id_raw);
+            let _ = out.flush();
+            std::process::exit(0);
+        }
+        let response = if request.op == "execute" {
+            // search_mode is per-request ("exact" default; anything but
+            // "ann" is exact).
+            let ann = request.search_mode.as_deref() == Some("ann");
+            engine.set_ann_mode(ann);
+            let sql = request.sql.unwrap_or_default();
+            // One statement per request (§3: the judge wraps each SQL
+            // statement; semicolons may appear inside SQL strings).
+            let result = match split_statements(&sql).into_iter().next() {
+                Some(stmt) => engine.execute(stmt),
+                None => Ok(ExecResult::Ok { affected_rows: None }),
+            };
+            render_official(&request.id_raw, &result)
+        } else {
+            format!(
+                "{{\"id\":{},\"ok\":false,\"error\":{{\"code\":\"UNSUPPORTED_OP\",\"message\":\"unsupported operation\"}}}}",
+                request.id_raw
+            )
+        };
+        if writeln!(out, "{}", response).and_then(|_| out.flush()).is_err() {
+            break;
+        }
+    }
+    // stdin closed without shutdown: still exit cleanly after a checkpoint.
     let _ = engine.store.shutdown();
     let _ = out.flush();
 }

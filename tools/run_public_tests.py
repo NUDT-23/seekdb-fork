@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """Local driver for the public MiniVectorDB mysqltest-style samples.
 
-This is deliberately independent from the database implementation. It speaks
-our interim one-line-JSON protocol and checks the package's result assertions.
-The official wire protocol will replace only the transport, not these checks.
+Speaks the official STDIO_PROTOCOL.md transport (JSONL requests/responses,
+`{"type":"ready"}` handshake, shutdown op) and checks the package's result
+assertions with stricter shape rules than the official protocol_check:
+response id must echo the request id, ok must be the right boolean, and no
+unexpected fields may ride along.
 """
 
 import argparse
 import json
 import math
-import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -21,56 +22,86 @@ class CaseFailure(Exception):
     pass
 
 
-def start(binary, data_dir):
-    proc = subprocess.Popen(
-        [str(binary), "--data-dir", str(data_dir)],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=None,
-        text=True,
-        encoding="utf-8",
-        bufsize=1,
-    )
-    # jsonl default protocol prints no ready marker: responses start with the
-    # first SQL statement.
-    return proc
+class Session:
+    def __init__(self, binary, data_dir):
+        self.proc = subprocess.Popen(
+            [str(binary), "--data-dir", str(data_dir)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=None,
+            text=True,
+            encoding="utf-8",
+            bufsize=1,
+        )
+        ready = self.proc.stdout.readline()
+        if json.loads(ready) != {"type": "ready"}:
+            raise CaseFailure(f"bad ready line: {ready!r}")
+        self.seq = 0
+        self.mode = "exact"
 
-
-def request(proc, text):
-    proc.stdin.write(text + "\n")
-    proc.stdin.flush()
-    line = proc.stdout.readline()
-    if not line:
-        raise CaseFailure(f"database closed stdout after {text!r}; rc={proc.poll()}")
-    try:
-        return json.loads(line)
-    except Exception as exc:
-        raise CaseFailure(f"non-JSON response to {text!r}: {line!r}: {exc}")
-
-
-def stop(proc):
-    if proc.poll() is None:
-        # Official restart/shutdown contract: close stdin, wait for a clean
-        # exit (rollback + checkpoint). Fall back to terminate if it hangs.
+    def execute(self, sql):
+        self.seq += 1
+        request = {"id": self.seq, "op": "execute", "sql": sql, "search_mode": self.mode}
+        self.proc.stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
+        self.proc.stdin.flush()
+        line = self.proc.stdout.readline()
+        if not line:
+            raise CaseFailure(f"database closed stdout after {sql!r}; rc={self.proc.poll()}")
         try:
-            if proc.stdin:
-                proc.stdin.close()
-        except Exception:
-            pass
+            response = json.loads(line)
+        except Exception as exc:
+            raise CaseFailure(f"non-JSON response to {sql!r}: {line!r}: {exc}")
+        if response.get("id") != self.seq:
+            raise CaseFailure(f"{sql}: response id {response.get('id')!r} != {self.seq}")
+        if not isinstance(response.get("ok"), bool):
+            raise CaseFailure(f"{sql}: missing boolean ok: {response}")
+        return response
+
+    def set_mode(self, mode):
+        self.mode = mode
+
+    def shutdown(self):
+        """Official restart/shutdown: respond, exit 0, nothing further."""
+        self.seq += 1
+        self.proc.stdin.write(json.dumps({"id": self.seq, "op": "shutdown"}) + "\n")
+        self.proc.stdin.flush()
+        line = self.proc.stdout.readline()
+        if not line:
+            raise CaseFailure(f"no shutdown response; rc={self.proc.poll()}")
+        response = json.loads(line)
+        if response != {"id": self.seq, "ok": True}:
+            raise CaseFailure(f"bad shutdown response: {response!r}")
         try:
-            proc.wait(timeout=10)
+            self.proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
-            proc.terminate()
+            raise CaseFailure("database did not exit after shutdown")
+        if self.proc.returncode != 0:
+            raise CaseFailure(f"shutdown exit code {self.proc.returncode}")
+        extra = self.proc.stdout.read()
+        if extra.strip():
+            raise CaseFailure(f"extra stdout after shutdown: {extra!r}")
+
+    def close(self):
+        if self.proc.poll() is None:
             try:
-                proc.wait(timeout=5)
+                if self.proc.stdin:
+                    self.proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                self.proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=5)
-    else:
-        if proc.stdin:
-            proc.stdin.close()
-    if proc.stdout:
-        proc.stdout.close()
+                self.proc.terminate()
+                try:
+                    self.proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.proc.kill()
+                    self.proc.wait(timeout=5)
+        else:
+            if self.proc.stdin:
+                self.proc.stdin.close()
+        if self.proc.stdout:
+            self.proc.stdout.close()
 
 
 def equal_value(actual, expected):
@@ -107,18 +138,21 @@ def equal_rows(actual, expected, unordered):
 
 def check_response(actual, expected, sql):
     if "error" in expected:
-        if "error" not in actual:
+        if actual.get("ok") is not False:
             raise CaseFailure(f"{sql}: expected error {expected['error']}, got {actual}")
-        code = actual.get("error")
+        code = actual.get("error", {}).get("code")
         if not code:
             raise CaseFailure(f"{sql}: empty error code: {actual}")
         if code != expected["error"]:
             raise CaseFailure(f"{sql}: expected error {expected['error']}, got {code}")
-        if set(actual) != {"error"}:
+        if set(actual) != {"id", "ok", "error"}:
             raise CaseFailure(f"{sql}: unexpected fields alongside error: {actual}")
         return
-    if "error" in actual:
+    if actual.get("ok") is not True:
         raise CaseFailure(f"{sql}: expected success, got {actual}")
+    allowed = {"id", "ok", "affected_rows", "columns", "rows"}
+    if set(actual) - allowed:
+        raise CaseFailure(f"{sql}: unexpected fields: {set(actual) - allowed}")
     if "affected_rows" in expected and actual.get("affected_rows") != expected["affected_rows"]:
         raise CaseFailure(
             f"{sql}: affected_rows expected {expected['affected_rows']}, got {actual.get('affected_rows')}"
@@ -147,27 +181,24 @@ def run_case(binary, manifest_dir, case, work_root):
     sql_count = sum(not line.startswith("--") for line in statements)
     if sql_count != len(expected_results):
         raise CaseFailure(f"assertion count {len(expected_results)} != SQL count {sql_count}")
-    proc = start(binary, data_dir)
+    session = Session(binary, data_dir)
     assertion = 0
     try:
         for statement in statements:
             if statement == "--restart":
-                stop(proc)
-                proc = start(binary, data_dir)
+                session.shutdown()
+                session = Session(binary, data_dir)
                 continue
             if statement.startswith("--mode "):
-                # Driver directives are consumed silently by the database;
-                # no response line follows.
-                proc.stdin.write(statement + "\n")
-                proc.stdin.flush()
+                session.set_mode(statement.split()[1])
                 continue
             if statement.startswith("--"):
                 raise CaseFailure(f"unknown driver directive: {statement}")
-            response = request(proc, statement)
+            response = session.execute(statement)
             check_response(response, expected_results[assertion], statement)
             assertion += 1
     finally:
-        stop(proc)
+        session.close()
 
 
 def main():

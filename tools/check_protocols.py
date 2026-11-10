@@ -35,6 +35,76 @@ def talk(binary, data_dir, lines, env=None):
     return [line for line in proc.stdout.splitlines() if line], proc.returncode
 
 
+def check_official(binary, root):
+    """Official STDIO_PROTOCOL.md transport: JSONL requests, id echo,
+    {"type":"ready"} handshake, shutdown semantics."""
+    data = root / "official"
+    proc = subprocess.Popen(
+        [str(binary), "--data-dir", str(data)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, encoding="utf-8", bufsize=1,
+    )
+    ready = proc.stdout.readline()
+    assert json.loads(ready) == {"type": "ready"}, ready
+
+    def req(payload):
+        proc.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        proc.stdin.flush()
+        line = proc.stdout.readline()
+        assert line, payload
+        return json.loads(line)
+
+    # DDL, DML, query, error; integer id echoed as integer.
+    assert req({"id": 1, "op": "execute", "sql":
+                "CREATE TABLE t (id BIGINT PRIMARY KEY, s VARCHAR(4), v VECTOR(2));",
+                "search_mode": "exact"}) == {"id": 1, "ok": True}
+    assert req({"id": 2, "op": "execute", "sql":
+                "INSERT INTO t VALUES (1,'a','[3,0]'),(2,'b','[1,0]');",
+                "search_mode": "exact"}) == {"id": 2, "ok": True, "affected_rows": 2}
+    query = req({"id": 3, "op": "execute", "sql":
+                 "SELECT id, L2_DISTANCE(v,'[0,0]') AS distance FROM t ORDER BY distance LIMIT 1;",
+                 "search_mode": "exact"})
+    assert query == {"id": 3, "ok": True, "columns": ["id", "distance"], "rows": [[2, 1.0]]}, query
+    err = req({"id": 4, "op": "execute", "sql": "INSERT INTO t VALUES (1,'d','[0,0]');",
+               "search_mode": "exact"})
+    assert err["ok"] is False and err["id"] == 4 and err["error"]["code"], err
+    # String id echoed with its JSON type preserved.
+    strid = req({"id": "seven", "op": "execute", "sql": "SELECT id FROM t;", "search_mode": "ann"})
+    assert strid == {"id": "seven", "ok": True, "columns": ["id"], "rows": [[1], [2]]}, strid
+    # Unsupported op answers an error object, not silence.
+    bad = req({"id": 5, "op": "frobnicate"})
+    assert bad["ok"] is False and bad["error"]["code"], bad
+    # Malformed lines must stay silent on stdout (unsolicited responses fail
+    # the judge transport).
+    proc.stdin.write("not json at all\n")
+    proc.stdin.flush()
+    # Shutdown: response, exit 0, nothing further on stdout.
+    proc.stdin.write('{"id":6,"op":"shutdown"}\n')
+    proc.stdin.flush()
+    line = proc.stdout.readline()
+    assert json.loads(line) == {"id": 6, "ok": True}, line
+    proc.stdin.close()
+    proc.wait(timeout=10)
+    assert proc.returncode == 0, proc.returncode
+    extra = proc.stdout.read()
+    assert not extra.strip(), extra
+    # Committed data survives the clean shutdown; ready repeats on restart.
+    proc = subprocess.Popen(
+        [str(binary), "--data-dir", str(data)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, encoding="utf-8", bufsize=1,
+    )
+    assert json.loads(proc.stdout.readline()) == {"type": "ready"}
+    proc.stdin.write('{"id":1,"op":"execute","sql":"SELECT id FROM t ORDER BY id;","search_mode":"exact"}\n')
+    proc.stdin.flush()
+    line = proc.stdout.readline()
+    assert json.loads(line) == {"id": 1, "ok": True, "columns": ["id"], "rows": [[1], [2]]}, line
+    proc.stdin.write('{"id":2,"op":"shutdown"}\n')
+    proc.stdin.flush()
+    proc.stdout.readline()
+    proc.stdin.close()
+    proc.wait(timeout=10)
+    return "official ok"
+
+
 def check_jsonl(binary, root):
     data = root / "jsonl"
     out, rc = talk(binary, data, [
@@ -46,7 +116,7 @@ def check_jsonl(binary, root):
         "SELECT nope FROM t;",
         "--mode ann",
         "SELECT id FROM t ORDER BY id;",
-    ])
+    ], env={"MINIVEC_PROTOCOL": "jsonl"})
     assert rc == 0, rc
     assert out == [
         "{}",
@@ -62,10 +132,10 @@ def check_jsonl(binary, root):
         "BEGIN;",
         "INSERT INTO t VALUES (3,'c','[0,9]');",
         "--restart",
-    ])
+    ], env={"MINIVEC_PROTOCOL": "jsonl"})
     assert rc == 0, rc
     assert out == ["{}", '{"affected_rows":1}'], out
-    out, rc = talk(binary, data, ["SELECT id FROM t ORDER BY id;"])
+    out, rc = talk(binary, data, ["SELECT id FROM t ORDER BY id;"], env={"MINIVEC_PROTOCOL": "jsonl"})
     assert out == ['{"columns":["id"],"rows":[[1],[2]]}'], out
     return "jsonl ok"
 
@@ -153,6 +223,7 @@ def main():
     binary = Path(sys.argv[1] if len(sys.argv) > 1 else "target/release/minivectordb").resolve()
     root = Path(tempfile.mkdtemp(prefix="minivectordb-protocols-"))
     try:
+        print(check_official(binary, root))
         print(check_jsonl(binary, root))
         print(check_tsv(binary, root))
         print(check_json(binary, root))

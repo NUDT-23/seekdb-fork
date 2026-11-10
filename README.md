@@ -25,41 +25,46 @@ The data directory defaults to `/data` or `MINIVEC_DATA_DIR`. `--data-dir` takes
 
 ## Wire protocol
 
-**Protocol status (2026-11-09, updated after fork archaeology + first submission failure):** the official driver is still unpublished, but the strongest evidence now points to a bare one-line-JSON-per-statement transport that mirrors the `.result` assertion vocabulary exactly:
+**Official transport (published 2026-11-10, official commit `f4d4e2665`).** The judge speaks JSON Lines in both directions per `STDIO_PROTOCOL.md`; `protocol_check/` is the official local self-check tool. The default (`MINIVEC_PROTOCOL=official`) implements exactly that:
 
-1. The official `mysqltest/README.md` states assertions are a JSON array with **exactly one entry per SQL statement**, that **driver directives occupy no assertion slot** (so they must produce no response), that `--restart` means *the driver* cleanly stops and restarts the process with the same data directory, and that the earlier example-style JSON *wrapping* is gone.
-2. Our first submission (ok-wrapped JSON plus a leading `{"ready":true}` line) failed **all** MySQL cases with no error logs — consistent with a positionally comparing driver being desynced by the extra line and rejecting every wrapped object.
-3. Independent platform evidence from another team: a TSV + `OK <n>` framing with **no** stdout ready marker ran to completion, while their one-line wrapped JSON also failed.
-
-The default transport (`MINIVEC_PROTOCOL=jsonl`) is therefore:
-
-Successful DDL / transaction command:
+Startup handshake (after recovery, before the first request, on every start):
 
 ```json
-{}
+{"type":"ready"}
 ```
 
-Successful INSERT / UPDATE / DELETE:
+The judge sends one JSON request per stdin line:
 
 ```json
-{"affected_rows":3}
+{"id":1,"op":"execute","sql":"SELECT id FROM docs ORDER BY id;","search_mode":"exact"}
+{"id":2,"op":"shutdown"}
 ```
 
-Query:
+Responses echo the request `id` verbatim (type-preserving: a numeric id stays numeric, a string id stays a string) and wrap results with a boolean `ok`:
 
 ```json
-{"columns":["id","distance"],"rows":[[1,5.0]]}
+{"id":1,"ok":true}
+{"id":2,"ok":true,"affected_rows":3}
+{"id":3,"ok":true,"columns":["id","distance"],"rows":[[2,1.0]]}
+{"id":4,"ok":false,"error":{"code":"duplicate_key","message":"duplicate_key"}}
 ```
 
-Error:
+`{"op":"shutdown"}` rolls back uncommitted transactions, checkpoints, responds `{"id":n,"ok":true}`, flushes, and exits 0 with nothing further on stdout — the judge restarts the process itself between `--restart` steps. `search_mode` is honored per request (`ann` switches to the IVF path, anything else scans exactly). Malformed input lines are logged to stderr and skipped (stdout stays silent: an unsolicited response would fail the judge transport). BIGINT values are emitted as exact integer tokens; floats are finite; every response is one UTF-8 line flushed immediately.
 
-```json
-{"error":"duplicate_key"}
+Request parsing is hand-rolled over the standard library (`src/jsonreq.rs`, no dependencies added): full JSON string unescaping including `\uXXXX` surrogate pairs, and the raw id token is spliced into responses so its JSON type round-trips exactly.
+
+Historical variants (our pre-publication hypotheses) remain selectable with `MINIVEC_PROTOCOL`: `jsonl` (bare `.result`-vocabulary lines), `json`, `json-noready`, `miniob`, `tsv`. `tools/check_protocols.py` smoke-tests all six, and the judge-side `--restart`/`--mode` directives of those line protocols keep working.
+
+### Verification against the official tool
+
+```bash
+export VECTORDB_IMAGE='你的镜像名:标签'
+python3 protocol_check/run.py --image "$VECTORDB_IMAGE" --handshake-only --output <new-dir>
+python3 protocol_check/run.py --image "$VECTORDB_IMAGE" --output <new-dir>
+python3 protocol_check/run.py --command '["./target/release/minivectordb","--data-dir","{data_dir}"]' --output <new-dir>
 ```
 
-No ready line is printed (any extra line would desync positional comparison; stderr carries a diagnostic instead). Statements are read line-by-line; trailing `;` is accepted, quote-aware multi-statement lines produce one response per statement, `--`/`#` comment lines are swallowed silently, and a UTF-8 BOM on the first line is stripped. Driver directives are consumed silently: `--mode ann` / `--mode exact` switch the vector query mode, and `--restart` / `--shutdown` / `exit` / `quit` / `\q` trigger a clean shutdown (rollback of uncommitted transactions, durable checkpoint) and exit 0 — the driver restarts the process itself. Every response is one UTF-8 line and stdout is flushed immediately. BIGINT values are emitted as exact integer tokens, not rounded through floating point.
-
-Fallback transports, selectable with `MINIVEC_PROTOCOL`: `tsv` (READY marker + tab-separated header/rows + `OK <n>` status line + `ERROR <name>: <msg>`, the framing with independent platform evidence), `json` (the earlier ok-wrapped interim format with a ready line), `json-noready`, and `miniob` (SUCCESS/FAILURE lines). When the official driver is published, the shipped default can be switched with one env knob without touching SQL execution.
+Both the `--command` (local binary) and `--image` (Docker) runs pass 20/20 public cases plus the handshake check at the current HEAD.
 
 ## Supported SQL
 
@@ -119,9 +124,9 @@ python3 -I tools/benchmark.py --binary target/release/minivectordb --mode ann
 
 The public runner checks all assertions, restart reuse of the data directory, exact columns/rows, unordered multisets when requested, and floating-point tolerance. The extended suite independently checks illegal vectors and integer boundaries, transactional DDL and rollback, SIGKILL recovery, repeated recovery, a torn WAL tail, forced checkpoints with a zero-sized vector arena, and random filtered TopK against Python brute-force truth. `tools/check_protocols.py` smoke-tests every wire-protocol variant (DDL/DML/query/error/directives/semicolon handling and `--restart` rollback semantics) so a fallback switch is a verified change, not a hope.
 
-Local release result on this workspace (10,000 rows, 128 dimensions, 1,000 queries, K=10; not an official platform score):
+Local release result on this workspace through the official protocol (10,000 rows, 128 dimensions, 1,000 queries, K=10; not an official platform score):
 
-- exact: write 1.19 s, query 0.325 s (≈3080 qps), Recall@10 = 1.0 (full truth for all 1000 queries, filtered and unfiltered);
+- exact: write 1.39 s, query 0.370 s (≈2700 qps), Recall@10 = 1.0 (full truth for all 1000 queries, filtered and unfiltered). The bare-transport numbers before JSON wrapping were 1.19 s / 0.325 s, so request parsing and response wrapping cost ~14% on the query path;
 - ann: IVF-Flat recall on 128-dim uniform data measures ~0.84 (weak cluster separation), so **exact is the submission mode**; the benchmark's ann mode fails its own ≥0.95 recall assert here by design;
 - query path (measured trajectory 1.19 s → 0.60 s → 0.36 s → 0.325 s): AVX2 f64-accumulated distance kernels (a first transmute-based version was 2.5× SLOWER than scalar - caught by benchmarking against the baseline, rewritten with `#[target_feature]` + `extractf128`), filter pre-binding, no pre-sort for TopK, then a flat contiguous scan cache (per-table snapshot with vectors concatenated into one buffer, per-row vector caches evicted after the build) with squared-distance comparison and early abandon against the current k-th best, and a four-accumulator kernel that breaks the FMA latency chain;
 - parallel scan: implemented and correctness-verified (recall 1.0 at 1/2/3/4/8 threads) but measured SLOWER on this machine (per-query thread spawn outweighs the win at ~0.3 ms/query), so the default is serial; `MINIVEC_SCAN_THREADS=N` enables it;
@@ -130,6 +135,6 @@ Local release result on this workspace (10,000 rows, 128 dimensions, 1,000 queri
 
 ## Known gaps
 
-1. The official evaluation wire format, resource limits and frozen error mapping are still unpublished; the default `jsonl` transport mirrors the official `.result` assertion vocabulary (strongest current evidence), with `tsv` and other fallbacks one env knob away. Must be re-verified once the official driver is published.
-2. IVF-Flat ANN is implemented (deterministic k-means, inverted lists, incremental maintenance, restart rebuild) but recall on 128-dim uniform benchmark data is ~0.84, below the 0.95 bar, so submission mode is exact scanning. IVF remains enabled for `--mode ann` on smaller/clusterable datasets.
+1. The official protocol is now published (`STDIO_PROTOCOL.md`, commit `f4d4e2665`) and fully implemented; the frozen platform-side error-code mapping (`config.json "error_codes"`) is still empty locally, so error codes beyond the public cases' vocabulary are our semantic names (the judge currently only requires a non-empty `error.code` string).
+2. IVF-Flat ANN is implemented (deterministic k-means, inverted lists, incremental maintenance, restart rebuild) but recall on 128-dim uniform benchmark data is ~0.84, below the 0.95 bar, so submission mode is exact scanning. IVF remains enabled for `search_mode:"ann"` on smaller/clusterable datasets.
 3. Single-client and single-transaction limits are intentional. No network protocol, NULL, joins, aggregates, distributed execution or concurrent transaction support is provided.

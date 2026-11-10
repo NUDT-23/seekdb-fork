@@ -1,29 +1,29 @@
 //! Wire-protocol adapters.
 //!
-//! The official driver has not been published. The evidence hierarchy
-//! (strongest first):
+//! **Official transport (published 2026-11-10, commit f4d4e2665):** the judge
+//! speaks JSONL *requests* and *responses* per `STDIO_PROTOCOL.md` /
+//! `protocol_check/`. Requests are `{"id":<json>,"op":"execute","sql":..,
+//! "search_mode":..}` or `{"id":..,"op":"shutdown"}`; responses echo `id`
+//! verbatim and wrap results as `{"id":..,"ok":true,"columns":..,"rows":..}`
+//! / `{"id":..,"ok":true,"affected_rows":n}` / `{"id":..,"ok":true}` /
+//! `{"id":..,"ok":false,"error":{"code":..,"message":..}}`. Startup emits
+//! `{"type":"ready"}`. => default `official`.
 //!
-//! 1. `mysqltest/cases/*.result` in the official round2 branch: a JSON array
-//!    with exactly one entry per SQL statement - `{}` for plain success,
-//!    `{"affected_rows":n}` for DML, `{"columns":[..],"rows":[[..]]}` for
-//!    queries, `{"error":"name"}` for errors. Driver directives occupy no
-//!    assertion slot, so they must produce no response. The README states
-//!    the old example-style JSON *wrapping* is gone; these bare shapes are
-//!    exactly what a positionally comparing driver would read line by line.
-//!    => default `jsonl`.
-//! 2. Another team's platform evidence: a TSV + `OK <n>` framing with no
-//!    stdout ready marker ran to completion while one-line-wrapped JSON
-//!    failed. => `tsv` kept as the fallback hypothesis with that framing.
+//! Historical variants kept for regression testing and archaeology:
+//! `jsonl` (bare `.result`-vocabulary lines; our best guess before the
+//! protocol was published), `json`, `json-noready`, `miniob`, `tsv`.
 //!
 //! All transports share: one response per statement, flushed before reading
 //! on; diagnostics on stderr only; BIGINT printed as exact integer tokens.
-//! Select with `MINIVEC_PROTOCOL=jsonl|json|json-noready|miniob|tsv`.
+//! Select with `MINIVEC_PROTOCOL=official|jsonl|json|json-noready|miniob|tsv`.
 
 use crate::engine::{ExecResult, OutValue};
 use crate::error::DbError;
 use crate::value::{fmt_f32, fmt_f64};
 
 pub enum ProtoKind {
+    /// Official STDIO_PROTOCOL.md transport (JSONL requests and responses).
+    Official,
     /// Bare one-line JSON mirroring the official `.result` vocabulary.
     Jsonl,
     /// Earlier interim transport: `{"ready":true}` then ok-wrapped JSON.
@@ -39,16 +39,18 @@ pub enum ProtoKind {
 impl ProtoKind {
     pub fn from_env() -> ProtoKind {
         match std::env::var("MINIVEC_PROTOCOL").as_deref() {
+            Ok("jsonl") => ProtoKind::Jsonl,
             Ok("json") => ProtoKind::Json,
             Ok("json-noready") => ProtoKind::JsonNoReady,
             Ok("miniob") => ProtoKind::Miniob,
             Ok("tsv") => ProtoKind::Tsv,
-            _ => ProtoKind::Jsonl,
+            _ => ProtoKind::Official,
         }
     }
 
     pub fn name(&self) -> &'static str {
         match self {
+            ProtoKind::Official => "official",
             ProtoKind::Jsonl => "jsonl",
             ProtoKind::Json | ProtoKind::JsonNoReady => "json",
             ProtoKind::Miniob => "miniob",
@@ -70,7 +72,10 @@ impl Protocol {
     /// does not expect a ready marker.
     pub fn ready_line(&self) -> Option<String> {
         match self.kind {
-            // The official assertion data is positionally aligned per SQL
+            // STDIO_PROTOCOL.md §2: exact object, before the first request,
+            // on every start including recovery restarts.
+            ProtoKind::Official => Some("{\"type\":\"ready\"}".to_string()),
+            // The old assertion data is positionally aligned per SQL
             // statement; any extra line would desync every comparison.
             ProtoKind::Jsonl => None,
             ProtoKind::Json => Some("{\"ready\":true}".to_string()),
@@ -85,6 +90,39 @@ impl Protocol {
             ProtoKind::Json | ProtoKind::JsonNoReady => render_json(result),
             ProtoKind::Miniob => render_miniob(result),
             ProtoKind::Tsv => render_tsv(result),
+            ProtoKind::Official => unreachable!("official renders via render_official with id"),
+        }
+    }
+}
+
+/// Official protocol response: echo the raw request id token verbatim
+/// (type-preserving), boolean ok, and the result payload. `message` is free
+/// text; the judge only requires a non-empty error.code string.
+pub fn render_official(id_raw: &str, result: &Result<ExecResult, DbError>) -> String {
+    match result {
+        Err(error) => format!(
+            "{{\"id\":{},\"ok\":false,\"error\":{{\"code\":{},\"message\":{}}}}}",
+            id_raw,
+            json_string(error.code()),
+            json_string(error.code())
+        ),
+        Ok(ExecResult::Ok { affected_rows }) => match affected_rows {
+            Some(n) => format!("{{\"id\":{},\"ok\":true,\"affected_rows\":{}}}", id_raw, n),
+            None => format!("{{\"id\":{},\"ok\":true}}", id_raw),
+        },
+        Ok(ExecResult::Query { columns, rows }) => {
+            let columns = columns.iter().map(|name| json_string(name)).collect::<Vec<_>>().join(",");
+            let rows = rows
+                .iter()
+                .map(|row| {
+                    format!(
+                        "[{}]",
+                        row.iter().map(render_json_value).collect::<Vec<_>>().join(",")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{\"id\":{},\"ok\":true,\"columns\":[{}],\"rows\":[{}]}}", id_raw, columns, rows)
         }
     }
 }

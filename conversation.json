@@ -42,6 +42,16 @@
       "id": "user-8",
       "source": "student",
       "content": "注意一下你的准备方向一定要对，或者不知道对不对就全面准备，一定要确保开赛之后迅速做出来"
+    },
+    {
+      "id": "user-9",
+      "source": "student",
+      "content": "看一下官方发驱动了吗"
+    },
+    {
+      "id": "user-10",
+      "source": "student",
+      "content": "每 1 小时扫一次官方分支"
     }
   ],
   "conversations": [
@@ -79,6 +89,16 @@
       "id": "design-2",
       "source": "agent",
       "content": "Protocol layer redesigned per the root cause: default MINIVEC_PROTOCOL=jsonl emits exactly the four official .result shapes ({} for DDL/transaction, {\"affected_rows\":n} for DML, {\"columns\":[...],\"rows\":[[...]]} for queries, {\"error\":\"name\"} for errors), no ready line, driver directives consumed silently (--mode ann/exact switch mode; --restart/--shutdown/exit/quit/\\q perform clean shutdown with rollback and exit 0), BOM stripping, comment swallowing, quote-aware semicolon splitting. Four fallback transports stay one environment variable away: tsv (READY + TSV + OK n consensus framing, the shape with independent platform evidence), json (former ok-wrapped interim), json-noready, miniob. All five variants are smoke-tested by tools/check_protocols.py so switching after the official driver publishes is a verified one-line change."
+    },
+    {
+      "id": "context-6",
+      "source": "agent",
+      "content": "2026-11-10: hourly monitoring of the official branch caught commit f4d4e2665 'upload stdin/stdout protocol and one demo py to double check'. It publishes STDIO_PROTOCOL.md (the judge's actual transport), protocol_check/ (official local self-check tool: run.py, _transport.py, _assertions.py, config.json, example_stdio.py), and a mysqltest/README.md update. The real protocol differed from ALL five of our hypothesized variants: requests are also JSON ({\"id\":N,\"op\":\"execute\",\"sql\":...,\"search_mode\":...} / {\"op\":\"shutdown\"}); startup handshake is exactly {\"type\":\"ready\"}; responses echo id verbatim (type-preserving) and wrap with boolean ok; errors are {\"ok\":false,\"error\":{\"code\":...,\"message\":...}}; shutdown responds then exits 0 with nothing further on stdout. The judge also rejects unsolicited output before each request and enforces startup 120s / per-request 60s / per-case 600s timeouts with 2 CPU / 2 GiB / 128 pids and a read-only root filesystem."
+    },
+    {
+      "id": "design-3",
+      "source": "agent",
+      "content": "Official transport implemented as the new default (MINIVEC_PROTOCOL=official): src/jsonreq.rs is a hand-rolled standard-library-only JSON request parser (full string unescaping including \\uXXXX surrogate pairs; the id token is kept raw and spliced verbatim into responses so its JSON type round-trips); render_official wraps results with id + boolean ok; main.rs gained run_official() which emits {\"type\":\"ready\"} after recovery, honors search_mode per request, treats {\"op\":\"shutdown\"} as rollback + checkpoint + response + exit(0), and skips malformed lines silently on stdout (stderr diagnostic only). VECTORDB_DATA_DIR from the official tool's --command mode joined the data-dir resolution chain. The five historical variants remain selectable and smoke-tested for regression archaeology."
     }
   ],
   "experiments": [
