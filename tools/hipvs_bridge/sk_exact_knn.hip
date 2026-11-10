@@ -229,10 +229,17 @@ __global__ void sk_topk_kernel(const float* __restrict__ scores,
        * would race with the atomic collection writes). */
       if (sk_better(ov, oi, mn, mi)) {
         int s = atomicAdd(&cnt, 1);
-        cv[s] = ov; ci[s] = oi;
+        nv[s] = ov; ni[s] = oi;
       }
       __syncthreads();
       if (cnt == 0) continue;              /* uniform branch: shared read after sync */
+      /* compact survivors into cv[0..cnt), pad the rest: a survivor's atomic
+       * slot is usually != its load slot, and the load slot would otherwise
+       * keep a ghost copy that the sort slides back into the prefix,
+       * duplicating it in every later merge (found via CPU sim). */
+      if (t < cnt) { cv[t] = nv[t]; ci[t] = ni[t]; }
+      else         { cv[t] = FLT_MAX; ci[t] = 0xFFFFFFFFu; }
+      __syncthreads();
     }
 
     sk_bitonic256(cv, ci);                 /* ascending; FLT_MAX padding sinks to end */
