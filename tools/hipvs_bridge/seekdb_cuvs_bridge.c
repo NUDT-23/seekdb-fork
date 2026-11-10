@@ -29,6 +29,18 @@
  *     to stderr; useful when comparing presets.
  *
  * Search tuning: itopk >= max(4*topk, 512) (baseline floor), width 4.
+ *
+ * Exact-graph build (sk_exact_knn.hip, new):
+ *  7. Default build path computes the exact kNN graph on the GPU (tiled
+ *     GEMM + per-row top-K + brute-force self-verification) and injects it
+ *     through the official cuvsCagraIndexFromArgs API - search still runs
+ *     the frozen hipVS cuvsCagraSearch.  ~3-6 s at 250Kx128 vs ~20-30 s
+ *     NN-descent; recall becomes exact-graph quality.
+ *  8. Safety: any failure (HIP alloc/launch error, verification mismatch,
+ *     IndexFromArgs error, SEEKDB_CUVS_EXACT=0) falls back to the
+ *     cuvsCagraBuild path below - worst case equals the previous commit's
+ *     behavior.  If sk_exact_knn.hip failed to COMPILE, build.sh defines
+ *     SK_NO_EXACT and this file falls back at build time.
  */
 #include "seekdb_cuvs_bridge.h"
 #include <cuvs/core/c_api.h>
@@ -46,6 +58,14 @@
 #include <sys/stat.h>
 #include <time.h>
 
+#ifndef SK_NO_EXACT
+/* sk_exact_knn.hip - custom GPU graph builder (challenge rules allow a
+ * custom build; the search implementation stays the frozen hipVS one) */
+extern long sk_exact_graph_build(const float* h_base, long n, int dim, int k,
+                                 long chunk_rows, void** dev_x_out, void** dev_graph_out);
+extern void sk_free_exact(void* p);
+#endif
+
 typedef struct {
   cuvsResources_t        res;
   cuvsCagraIndexParams_t ip;
@@ -62,6 +82,8 @@ typedef struct {
   long      staged_topk; /* top-k the staging buffers were sized for */
   cuvsCagraSearchParams_t sp;
   long      sp_topk; /* top-k the cached search params were tuned for */
+  void*     x_dev;      /* exact path: device dataset viewed by the index */
+  void*     graph_dev;  /* exact path: device graph viewed by the index   */
   pthread_mutex_t mu;
 } sk_cuvs_index;
 
@@ -205,6 +227,53 @@ void* seekdb_cuvs_build(const float* base, long n, long dim)
   if (cuvsCagraIndexParamsCreate(&h->ip) != CUVS_SUCCESS) goto fail_res;
   load_build_params(h->ip);
   if (cuvsCagraIndexCreate(&h->idx) != CUVS_SUCCESS) goto fail_ip;
+
+#ifndef SK_NO_EXACT
+  /* Exact kNN graph path: compute the graph on the GPU ourselves and inject
+   * it via the official cuvsCagraIndexFromArgs.  Every failure falls through
+   * to the cuvsCagraBuild path, so the worst case is the previous behavior. */
+  if (env_long("SEEKDB_CUVS_EXACT", 1, 0, 1) == 1 && n > (long)h->ip->graph_degree) {
+    long k     = (long)h->ip->graph_degree;   /* k <= 256 (SK_MAXK in the .hip) */
+    long chunk = env_long("SEEKDB_CUVS_EXACT_CHUNK", 2048, 256, 65536);
+    if (k <= 256) {
+      long t0 = now_us();
+      void* dx = NULL;
+      void* dg = NULL;
+      long rc  = sk_exact_graph_build(base, n, (int)dim, (int)k, chunk, &dx, &dg);
+      if (rc == 0 && dx && dg) {
+        DLManagedTensor ddev = dset;  /* same shape/dtype, device memory */
+        ddev.dl_tensor.data = dx;
+        ddev.dl_tensor.device.device_type = kDLCUDA;
+        ddev.dl_tensor.device.device_id   = 0;
+        long gs[2] = {n, k};
+        DLManagedTensor gt;
+        memset(&gt, 0, sizeof(gt));
+        gt.dl_tensor.data = dg;
+        gt.dl_tensor.device.device_type = kDLCUDA;
+        gt.dl_tensor.device.device_id   = 0;
+        gt.dl_tensor.ndim = 2;
+        gt.dl_tensor.dtype.code = kDLUInt; gt.dl_tensor.dtype.bits = 32; gt.dl_tensor.dtype.lanes = 1;
+        gt.dl_tensor.shape = gs; gt.dl_tensor.strides = 0; gt.dl_tensor.byte_offset = 0;
+        if (cuvsCagraIndexFromArgs(h->res, h->ip->metric, &gt, &ddev, h->idx) == CUVS_SUCCESS) {
+          h->x_dev = dx; h->graph_dev = dg;
+          h->n = n; h->dim = dim;
+          h->sp_topk = -1;
+          if (trace_enabled()) {
+            fprintf(stderr, "[seekdb_cuvs] exact graph k=%ld n=%ld dim=%ld took %.1f ms\n",
+                    k, n, dim, (now_us() - t0) / 1000.0);
+          }
+          return h;
+        }
+        fprintf(stderr, "[seekdb_cuvs] IndexFromArgs failed: %s\n", cuvsGetLastErrorText());
+        sk_free_exact(dx);
+        sk_free_exact(dg);
+      } else {
+        fprintf(stderr, "[seekdb_cuvs] exact graph build rc=%ld, falling back to cuvsCagraBuild\n", rc);
+      }
+    }
+  }
+#endif
+
   {
     long t0 = now_us();
     if (cuvsCagraBuild(h->res, h->ip, &dset, h->idx) != CUVS_SUCCESS) goto fail_idx;
@@ -296,8 +365,12 @@ void seekdb_cuvs_free(void* handle)
   if (h->dist_dev) cuvsRMMFree(h->res, h->dist_dev, sizeof(float) * h->dist_cap);
   if (h->ids_dev) cuvsRMMFree(h->res, h->ids_dev, sizeof(unsigned) * h->ids_cap);
   if (h->q_dev) cuvsRMMFree(h->res, h->q_dev, sizeof(float) * h->q_cap);
-  cuvsCagraIndexDestroy(h->idx);
+  cuvsCagraIndexDestroy(h->idx);   /* first: index views x_dev/graph_dev */
   cuvsCagraIndexParamsDestroy(h->ip);
+#ifndef SK_NO_EXACT
+  if (h->graph_dev) sk_free_exact(h->graph_dev);
+  if (h->x_dev)     sk_free_exact(h->x_dev);
+#endif
   cuvsResourcesDestroy(h->res);
   pthread_mutex_destroy(&h->mu);
   free(h);
