@@ -114,7 +114,7 @@ static void load_build_params(cuvsCagraIndexParams_t ip)
    * build win comes from niter alone. */
   ip->graph_degree              = (size_t)env_long("SEEKDB_CUVS_GRAPH_DEGREE", 128, 16, 512);
   ip->intermediate_graph_degree = (size_t)env_long("SEEKDB_CUVS_INTERMEDIATE_DEGREE", 256, 16, 1024);
-  ip->nn_descent_niter          = (size_t)env_long("SEEKDB_CUVS_NITER", 80, 1, 1000);
+  ip->nn_descent_niter          = (size_t)env_long("SEEKDB_CUVS_NITER", 70, 1, 1000);
   if (trace_enabled()) {
     fprintf(stderr, "[seekdb_cuvs] build params: graph_degree=%zu intermediate=%zu niter=%zu\n",
             ip->graph_degree, ip->intermediate_graph_degree, ip->nn_descent_niter);
