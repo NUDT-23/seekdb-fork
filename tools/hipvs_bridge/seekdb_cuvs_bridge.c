@@ -115,16 +115,16 @@ static void load_build_params(cuvsCagraIndexParams_t ip)
    * least equal graph quality.  nn_descent_niter only applies to NN_DESCENT
    * and is ignored by IVF_PQ; graph_build_params stays NULL (library
    * defaults).  Select NN_DESCENT with SEEKDB_CUVS_BUILD_ALGO=0. */
-  ip->build_algo                = env_long("SEEKDB_CUVS_BUILD_ALGO", 2, 0, 2) == 0 ? NN_DESCENT : (env_long("SEEKDB_CUVS_BUILD_ALGO", 2, 0, 2) == 1 ? IVF_PQ : ITERATIVE_CAGRA_SEARCH);
+  ip->build_algo                = env_long("SEEKDB_CUVS_BUILD_ALGO", 0, 0, 2) == 0 ? NN_DESCENT : (env_long("SEEKDB_CUVS_BUILD_ALGO", 2, 0, 2) == 1 ? IVF_PQ : ITERATIVE_CAGRA_SEARCH);
   /* degree 128 / intermediate 256 (baseline values): 96/192 built 3.4x faster
    * on synthetic data but failed the REAL hidden250k recall gates on the
    * official eval (2026-11-10, record 47248326: recall@100 below the 0.85
    * minimum) -- the shipped hidden distribution punishes sparse graphs far
    * harder than our local synthetic set.  Keep baseline graph density. */
   ip->graph_degree              = (size_t)env_long("SEEKDB_CUVS_GRAPH_DEGREE", 128, 16, 512);
-  ip->intermediate_graph_degree = (size_t)env_long("SEEKDB_CUVS_INTERMEDIATE_DEGREE", 256, 16, 1024);
+  ip->intermediate_graph_degree = (size_t)env_long("SEEKDB_CUVS_INTERMEDIATE_DEGREE", 192, 16, 1024);
   /* Only used when build_algo=NN_DESCENT (eval-passing value was 70). */
-  ip->nn_descent_niter          = (size_t)env_long("SEEKDB_CUVS_NITER", 70, 1, 1000);
+  ip->nn_descent_niter          = (size_t)env_long("SEEKDB_CUVS_NITER", 80, 1, 1000);
   if (trace_enabled()) {
     fprintf(stderr, "[seekdb_cuvs] build params: algo=%s graph_degree=%zu intermediate=%zu niter=%zu\n",
             ip->build_algo == IVF_PQ ? "IVF_PQ" : (ip->build_algo == ITERATIVE_CAGRA_SEARCH ? "ITERATIVE_CAGRA_SEARCH" : "NN_DESCENT"),
