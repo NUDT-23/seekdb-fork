@@ -9,9 +9,11 @@ mod storage;
 mod value;
 
 use std::io::{self, BufRead, Write};
+use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 
 use engine::{Engine, ExecResult};
+use error::DbError;
 use protocol::{ProtoKind, Protocol, render_official};
 use storage::Store;
 
@@ -189,23 +191,39 @@ fn run_official(mut engine: Engine, mut out: io::StdoutLock<'static>) {
         };
         if request.op == "shutdown" {
             // §4: roll back uncommitted transactions, persist, respond, then
-            // flush and exit 0 with nothing further on stdout.
-            let _ = engine.store.shutdown();
+            // flush and exit 0 with nothing further on stdout. A panic during
+            // the checkpoint must still produce the response and exit 0.
+            let _ = panic::catch_unwind(AssertUnwindSafe(|| engine.store.shutdown()));
             let _ = writeln!(out, "{{\"id\":{},\"ok\":true}}", request.id_raw);
             let _ = out.flush();
             std::process::exit(0);
         }
         let response = if request.op == "execute" {
             // search_mode is per-request ("exact" default; anything but
-            // "ann" is exact).
-            let ann = request.search_mode.as_deref() == Some("ann");
-            engine.set_ann_mode(ann);
-            let sql = request.sql.unwrap_or_default();
-            // One statement per request (§3: the judge wraps each SQL
-            // statement; semicolons may appear inside SQL strings).
-            let result = match split_statements(&sql).into_iter().next() {
-                Some(stmt) => engine.execute(stmt),
-                None => Ok(ExecResult::Ok { affected_rows: None }),
+            // "ann" is exact). One statement per request (§3: the judge
+            // wraps each SQL statement; semicolons may appear inside SQL
+            // strings). A panicking statement is downgraded to an error
+            // response: the process must survive so later statements and
+            // cases can still run (a dead process fails the whole judge
+            // transport with "database exited before response").
+            let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+                let ann = request.search_mode.as_deref() == Some("ann");
+                engine.set_ann_mode(ann);
+                let sql = request.sql.clone().unwrap_or_default();
+                match split_statements(&sql).into_iter().next() {
+                    Some(stmt) => engine.execute(stmt),
+                    None => Ok(ExecResult::Ok { affected_rows: None }),
+                }
+            }));
+            let result = match outcome {
+                Ok(result) => result,
+                Err(_) => {
+                    eprintln!(
+                        "minivectordb: statement panicked (recovered): {:.200}",
+                        request.sql.as_deref().unwrap_or("")
+                    );
+                    Err(DbError::Internal)
+                }
             };
             render_official(&request.id_raw, &result)
         } else {
