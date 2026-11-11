@@ -220,6 +220,7 @@ __global__ void sk_topk_kernel(const float* __restrict__ scores,
   const float* srow = scores + (long)blockIdx.x * n;
   const float qn  = xn[row];
 
+  __shared__ float wbv[SK_THREADS / 32];
   bool init = false;
   for (long seg = 0; seg < n; seg += SK_THREADS) {
     long c = seg + t;
@@ -229,6 +230,25 @@ __global__ void sk_topk_kernel(const float* __restrict__ scores,
       v  = qn + xn[c] - 2.f * srow[c];    /* squared L2 up to monotone fold */
       id = (unsigned)c;
     }
+
+    /* early skip: if even the segment's best distance cannot beat the bag's
+     * worst (kv[K-1]), no element can enter kv and the whole filter/sort/
+     * merge is skipped.  Strict '>' float compare: an exact tie with the
+     * worst value still takes the full path (tie-break by id is checked
+     * there), so the selection stays exact. */
+    if (init) {
+      float wv = v;
+#pragma unroll
+      for (int off = 16; off > 0; off >>= 1)
+        wv = fminf(wv, __shfl_xor_sync(0xffffffffull, wv, off));
+      if ((t & 31) == 0) wbv[t >> 5] = wv;
+      __syncthreads();
+      float bmin = wbv[0];
+#pragma unroll
+      for (int w = 1; w < SK_THREADS / 32; w++) bmin = fminf(bmin, wbv[w]);
+      if (bmin > kv[K - 1]) continue;     /* uniform across the CTA */
+    }
+
     cv[t] = v; ci[t] = id;
     __syncthreads();
 
@@ -260,8 +280,34 @@ __global__ void sk_topk_kernel(const float* __restrict__ scores,
       __syncthreads();
     }
 
-    sk_bitonic256(cv, ci);                 /* ascending; FLT_MAX padding sinks to end */
-    __syncthreads();
+    /* sort cv ascending.  With cnt survivors already compacted into
+     * cv[0..cnt) (rest FLT_MAX-padded by the compaction above), a full
+     * 256-slot bitonic is wasted work whenever cnt <= 32: warp 0 sorts the
+     * live prefix in registers with a shfl bitonic (no barriers).  The
+     * bitonic256 fallback covers the warm-up segments (large cnt) and the
+     * first segment (raw 256 elements, init == false). */
+    if (init && cnt <= 32) {
+      if (t < 32) {
+        float sv = cv[t]; unsigned si = ci[t];
+#pragma unroll
+        for (int size = 2; size <= 32; size <<= 1)
+#pragma unroll
+          for (int st = size >> 1; st > 0; st >>= 1) {
+            float pv = __shfl_xor_sync(0xffffffffull, sv, st);
+            unsigned pi = __shfl_xor_sync(0xffffffffull, si, st);
+            bool asc  = ((t & size) == 0);
+            bool low  = ((t & st) == 0);          /* lower index of the pair */
+            bool want_min = (asc == low);         /* rank this lane must hold */
+            bool pbetter = sk_better(pv, pi, sv, si);
+            if (want_min == pbetter) { sv = pv; si = pi; }  /* pick, not swap */
+          }
+        cv[t] = sv; ci[t] = si;
+      }
+      __syncthreads();
+    } else {
+      sk_bitonic256(cv, ci);              /* ascending; FLT_MAX padding sinks to end */
+      __syncthreads();
+    }
 
     if (!init) {
       if (t < K) { kv[t] = cv[t]; ki[t] = ci[t]; }
