@@ -167,4 +167,13 @@ if (OB_BUILD_CUVS AND EXISTS "${CUVS_BRIDGE_LIB}")
             ${CUVS_BRIDGE_DIR}/libseekdb_sk_exact.so
     COMMENT "sk_exact_kernel: libseekdb_sk_exact.so (optional exact-kNN kernels)"
     VERBATIM)
+  # Fourth layer: when the sidecar was produced, also LINK it into oblib so
+  # it is a declared dependency of the observer (travels with it even in a
+  # packaged runtime) and the bridge can resolve the kernels from the global
+  # namespace.  Guarded by EXISTS: when the kernel toolchain is unavailable
+  # nothing is linked and the bridge falls back at runtime.
+  if (EXISTS "${CUVS_BRIDGE_DIR}/libseekdb_sk_exact.so")
+    target_link_libraries(oblib_lib PUBLIC ${CUVS_BRIDGE_DIR}/libseekdb_sk_exact.so)
+    set_property(TARGET oblib_lib APPEND PROPERTY BUILD_RPATH ${CUVS_BRIDGE_DIR})
+  endif()
 endif()
