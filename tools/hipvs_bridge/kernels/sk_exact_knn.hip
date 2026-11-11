@@ -189,7 +189,7 @@ __global__ void sk_gemm_kernel(const float* __restrict__ X, float* __restrict__ 
 __global__ void sk_topk_kernel(const float* __restrict__ scores,
                                const float* __restrict__ xn,
                                uint32_t* __restrict__ graph,
-                               long chunk_start, long n, int K)
+                               long chunk_start, long n, int K, int stride)
 {
   __shared__ float    kv[SK_MAXK];
   __shared__ unsigned ki[SK_MAXK];
@@ -269,7 +269,7 @@ __global__ void sk_topk_kernel(const float* __restrict__ scores,
     __syncthreads();
   }
 
-  if (t < K) graph[row * K + t] = (uint32_t)ki[t];
+  if (t < K) graph[row * stride + t] = (uint32_t)ki[t];
 }
 
 /* ------------------------------------------------------------------ */
@@ -292,6 +292,7 @@ __device__ __forceinline__ unsigned long long sk_key(float v, unsigned id)
 
 __global__ void sk_verify_kernel(const float* __restrict__ X, const float* __restrict__ xn,
                                  const uint32_t* __restrict__ graph, long n, int dim, int K,
+                                 int stride,
                                  int* __restrict__ d_pass, const long* __restrict__ rows)
 {
   extern __shared__ float sh[];                 /* 256*16 floats + 256*16 ids */
@@ -361,7 +362,7 @@ __global__ void sk_verify_kernel(const float* __restrict__ X, const float* __res
       unsigned want = ext_id[e];
       if (want == 0xFFFFFFFFu) continue;
       for (int g = 0; g < 16 && g < K; g++)
-        if (graph[row * K + g] == want) { hit++; break; }
+        if (graph[row * stride + g] == want) { hit++; break; }
     }
     if (hit >= 15) atomicAdd(d_pass, 1);
   }
@@ -412,10 +413,30 @@ __global__ void sk_links_kernel(uint32_t* __restrict__ graph, long n, int K, int
 /* ------------------------------------------------------------------ */
 
 extern "C" long sk_exact_graph_build(const float* h_base, long n, int dim, int k,
-                                     long chunk_rows, void** dev_x_out, void** dev_graph_out)
+                                     long chunk_rows, void** dev_x_out, void** dev_graph_out,
+                                     long* graph_stride_out)
 {
   *dev_x_out = NULL; *dev_graph_out = NULL;
+  if (graph_stride_out) *graph_stride_out = 0;
   if (!h_base || n <= 0 || dim <= 0 || k <= 0 || k > SK_MAXK || n < (long)k + 1) return 1;
+
+  /* random long-range links are APPENDED after the k exact neighbors (row
+   * width K = k + R), not swapped in: on i.i.d. data every replaced exact
+   * edge is a pure recall loss (9908916 lesson), while appended bridges
+   * keep the exact graph intact and still connect cliques (clus128: A0
+   * 0.489 -> appended 0.98+).  R = env SK_KNN_RAND, default 16, 0 disables,
+   * capped so K stays within SK_MAXK. */
+  int R = 16;
+  {
+    const char* re = getenv("SK_KNN_RAND");
+    if (re && *re) {
+      int v = atoi(re);
+      if (v < 0) v = 0;
+      if (v > SK_MAXK - k) v = SK_MAXK - k;
+      R = v;
+    }
+  }
+  const int K = k + R;                     /* final graph row width */
 
   float*    X  = NULL;
   uint32_t* G  = NULL;
@@ -426,7 +447,7 @@ extern "C" long sk_exact_graph_build(const float* h_base, long n, int dim, int k
   chunk_rows = (chunk_rows + SK_TY - 1) / SK_TY * SK_TY;
 
   if (hipMalloc(&X,  sizeof(float)    * (size_t)n * dim) != hipSuccess) return 2;
-  if (hipMalloc(&G,  sizeof(uint32_t) * (size_t)n * k)   != hipSuccess) { hipFree(X); return 2; }
+  if (hipMalloc(&G,  sizeof(uint32_t) * (size_t)n * K)   != hipSuccess) { hipFree(X); return 2; }
   if (hipMalloc(&xn, sizeof(float)    * (size_t)n)       != hipSuccess) { hipFree(X); hipFree(G); return 2; }
   if (hipMemcpy(X, h_base, sizeof(float) * (size_t)n * dim, hipMemcpyHostToDevice) != hipSuccess)
     { hipFree(X); hipFree(G); hipFree(xn); return 2; }
@@ -455,34 +476,22 @@ extern "C" long sk_exact_graph_build(const float* h_base, long n, int dim, int k
                        X, SC, cs, rows, n, dim);
     if (hipGetLastError() != hipSuccess) { fprintf(stderr, "[sk_knn] gemm launch failed\n"); goto fail_gpu; }
     hipLaunchKernelGGL(sk_topk_kernel, dim3((unsigned)rows), dim3(SK_THREADS), 0, 0,
-                       SC, xn, G, cs, n, k);
+                       SC, xn, G, cs, n, k, K);
     if (hipGetLastError() != hipSuccess) { fprintf(stderr, "[sk_knn] topk launch failed\n"); goto fail_gpu; }
   }
   if (hipDeviceSynchronize() != hipSuccess) { fprintf(stderr, "[sk_knn] device sync failed\n"); goto fail_gpu; }
 
-  /* random long-range links: overwrite the last R slots of every row with
-   * deterministic random ids (anti-clique bridges for deep recall; see
-   * sk_links_kernel).  R = env SK_KNN_RAND, default 16, 0 disables,
-   * capped at k/2 so at most half the row stays exact. */
-  {
-    int R = 16;
-    const char* re = getenv("SK_KNN_RAND");
-    if (re && *re) {
-      int v = atoi(re);
-      if (v < 0) v = 0;
-      if (v > k / 2) v = k / 2;
-      R = v;
-    }
-    if (R > 0) {
-      long total = n * (long)R;
-      int blocks = (int)((total + SK_THREADS - 1) / SK_THREADS);
-      hipLaunchKernelGGL(sk_links_kernel, dim3(blocks), dim3(SK_THREADS), 0, 0,
-                         G, n, k, R, 0x5EED5EEDull);
-      if (hipGetLastError() != hipSuccess || hipDeviceSynchronize() != hipSuccess)
-        { fprintf(stderr, "[sk_knn] links kernel failed\n"); goto fail_gpu; }
-      if (getenv("SK_KNN_TRACE") && getenv("SK_KNN_TRACE")[0] == '1')
-        fprintf(stderr, "[sk_knn] %d random links/row injected\n", R);
-    }
+  /* random long-range links: append R deterministic random ids after the k
+   * exact neighbors of every row (see sk_links_kernel; P = K - R = k). */
+  if (R > 0) {
+    long total = n * (long)R;
+    int blocks = (int)((total + SK_THREADS - 1) / SK_THREADS);
+    hipLaunchKernelGGL(sk_links_kernel, dim3(blocks), dim3(SK_THREADS), 0, 0,
+                       G, n, K, R, 0x5EED5EEDull);
+    if (hipGetLastError() != hipSuccess || hipDeviceSynchronize() != hipSuccess)
+      { fprintf(stderr, "[sk_knn] links kernel failed\n"); goto fail_gpu; }
+    if (getenv("SK_KNN_TRACE") && getenv("SK_KNN_TRACE")[0] == '1')
+      fprintf(stderr, "[sk_knn] %d random links/row appended (K=%d)\n", R, K);
   }
 
   /* verification: 24 sampled rows, exact top-16 vs graph row prefix */
@@ -498,7 +507,7 @@ extern "C" long sk_exact_graph_build(const float* h_base, long n, int dim, int k
     hipMemset(d_pass, 0, sizeof(int));
     size_t shm = sizeof(float) * 256 * 16 + sizeof(unsigned) * 256 * 16;
     hipLaunchKernelGGL(sk_verify_kernel, dim3(S), dim3(SK_THREADS), shm, 0,
-                       X, xn, G, n, dim, k, d_pass, d_rows);
+                       X, xn, G, n, dim, k, K, d_pass, d_rows);
     hipError_t ve = hipGetLastError();
     int pass = -1;
     if (ve == hipSuccess) hipMemcpy(&pass, d_pass, sizeof(int), hipMemcpyDeviceToHost);
@@ -515,6 +524,7 @@ extern "C" long sk_exact_graph_build(const float* h_base, long n, int dim, int k
   hipFree(xn);
   *dev_x_out = X;          /* viewed by cuvsCagraIndexFromArgs; freed by the bridge */
   *dev_graph_out = G;
+  if (graph_stride_out) *graph_stride_out = K;
   return 0;
 
 fail_gpu:

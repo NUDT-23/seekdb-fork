@@ -132,7 +132,8 @@ static long env_long(const char* name, long def, long lo, long hi)
  * dependency on the kernels - if the sidecar is absent or broken the exact
  * path is disabled and builds fall back to cuvsCagraBuild. */
 typedef long (*sk_build_fn)(const float* h_base, long n, int dim, int k,
-                            long chunk_rows, void** dev_x_out, void** dev_graph_out);
+                            long chunk_rows, void** dev_x_out, void** dev_graph_out,
+                            long* graph_stride_out);
 typedef void (*sk_free_fn)(void* p);
 
 /* ---- embedded sidecar payload --------------------------------------------
@@ -429,13 +430,14 @@ void* seekdb_cuvs_build(const float* base, long n, long dim)
       long t0 = now_us();
       void* dx = NULL;
       void* dg = NULL;
-      long rc  = sk_build(base, n, (int)dim, (int)k, chunk, &dx, &dg);
+      long gstride = k;                    /* graph row width (= k + appended random links) */
+      long rc  = sk_build(base, n, (int)dim, (int)k, chunk, &dx, &dg, &gstride);
       if (rc == 0 && dx && dg) {
         DLManagedTensor ddev = dset;  /* same shape/dtype, device memory */
         ddev.dl_tensor.data = dx;
         ddev.dl_tensor.device.device_type = kDLCUDA;
         ddev.dl_tensor.device.device_id   = 0;
-        long gs[2] = {n, k};
+        long gs[2] = {n, gstride};
         DLManagedTensor gt;
         memset(&gt, 0, sizeof(gt));
         gt.dl_tensor.data = dg;
@@ -449,8 +451,8 @@ void* seekdb_cuvs_build(const float* base, long n, long dim)
           h->n = n; h->dim = dim;
           h->sp_topk = -1;
           if (trace_enabled()) {
-            fprintf(stderr, "[seekdb_cuvs] exact graph k=%ld n=%ld dim=%ld took %.1f ms\n",
-                    k, n, dim, (now_us() - t0) / 1000.0);
+            fprintf(stderr, "[seekdb_cuvs] exact graph k=%ld K=%ld (degree) n=%ld dim=%ld took %.1f ms\n",
+                    k, gstride, n, dim, (now_us() - t0) / 1000.0);
           }
           return h;
         }
