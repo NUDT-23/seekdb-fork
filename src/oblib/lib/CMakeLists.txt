@@ -140,3 +140,20 @@ else()
     message(FATAL_ERROR "Unsupported architecture: ${CMAKE_SYSTEM_PROCESSOR}")
   endif()
 endif()
+
+# [hipVS/cuVS] exact-kNN kernel sidecar: compiled from
+# tools/hipvs_bridge/kernels/sk_exact_knn.hip into
+# libseekdb_sk_exact.so next to the bridge .so.  The bridge dlopen()s it at
+# runtime and silently falls back to cuvsCagraBuild when it is absent, and
+# the helper script itself never returns failure, so this target can never
+# break the seekdb build.
+if (OB_BUILD_CUVS AND EXISTS "${CUVS_BRIDGE_LIB}")
+  get_filename_component(CUVS_BRIDGE_DIR "${CUVS_BRIDGE_LIB}" DIRECTORY)
+  add_custom_target(sk_exact_kernel ALL
+    COMMAND ${CMAKE_COMMAND} -E env bash
+            ${PROJECT_SOURCE_DIR}/tools/hipvs_bridge/build_kernel.sh
+            ${PROJECT_SOURCE_DIR}/tools/hipvs_bridge/kernels/sk_exact_knn.hip
+            ${CUVS_BRIDGE_DIR}/libseekdb_sk_exact.so
+    COMMENT "sk_exact_kernel: libseekdb_sk_exact.so (optional exact-kNN kernels)"
+    VERBATIM)
+endif()

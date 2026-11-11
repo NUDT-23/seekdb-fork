@@ -36,12 +36,16 @@
  *     through the official cuvsCagraIndexFromArgs API - search still runs
  *     the frozen hipVS cuvsCagraSearch.  ~3-6 s at 250Kx128 vs ~20-30 s
  *     NN-descent; recall becomes exact-graph quality.
- *  8. Safety: any failure (HIP alloc/launch error, verification mismatch,
- *     IndexFromArgs error, SEEKDB_CUVS_EXACT=0) falls back to the
- *     cuvsCagraBuild path below - worst case equals the previous commit's
- *     behavior.  If sk_exact_knn.hip failed to COMPILE, build.sh defines
- *     SK_NO_EXACT and this file falls back at build time.
+ *  8. Safety: any failure (sidecar missing, HIP alloc/launch error,
+ *     verification mismatch, IndexFromArgs error, SEEKDB_CUVS_EXACT=0)
+ *     falls back to the cuvsCagraBuild path below - worst case equals the
+ *     previous commit's behavior.  The exact kernels carry ZERO compile-time
+ *     coupling: they live in a sidecar libseekdb_sk_exact.so (built from
+ *     kernels/sk_exact_knn.hip by build_kernel.sh through the repo's CMake)
+ *     that is dlopen()ed here at runtime, so this bridge source always
+ *     builds standalone no matter how the toolchain is invoked.
  */
+#define _GNU_SOURCE 1 /* dladdr */
 #include "seekdb_cuvs_bridge.h"
 #include <cuvs/core/c_api.h>
 #include <cuvs/neighbors/cagra.h>
@@ -51,20 +55,13 @@
 #else
 #include <cuda_runtime.h>
 #endif
+#include <dlfcn.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
-
-#ifndef SK_NO_EXACT
-/* sk_exact_knn.hip - custom GPU graph builder (challenge rules allow a
- * custom build; the search implementation stays the frozen hipVS one) */
-extern long sk_exact_graph_build(const float* h_base, long n, int dim, int k,
-                                 long chunk_rows, void** dev_x_out, void** dev_graph_out);
-extern void sk_free_exact(void* p);
-#endif
 
 typedef struct {
   cuvsResources_t        res;
@@ -114,6 +111,64 @@ static long env_long(const char* name, long def, long lo, long hi)
   if (x < lo) x = lo;
   if (x > hi) x = hi;
   return x;
+}
+
+/* ---- exact-kNN sidecar (libseekdb_sk_exact.so) --------------------------
+ * Runtime loader for the custom GPU graph builder.  The sidecar is built by
+ * tools/hipvs_bridge/build_kernel.sh (invoked from the seekdb CMake build
+ * when OB_BUILD_CUVS=ON) and dropped next to the bridge .so.  Resolving the
+ * symbols at runtime keeps this translation unit free of any compile-time
+ * dependency on the kernels - if the sidecar is absent or broken the exact
+ * path is disabled and builds fall back to cuvsCagraBuild. */
+typedef long (*sk_build_fn)(const float* h_base, long n, int dim, int k,
+                            long chunk_rows, void** dev_x_out, void** dev_graph_out);
+typedef void (*sk_free_fn)(void* p);
+
+static int sk_exact_load(sk_build_fn* bf, sk_free_fn* ff)
+{
+  static sk_build_fn build_fn = NULL;
+  static sk_free_fn  free_fn  = NULL;
+  static int tried = 0;
+  if (tried) {
+    *bf = build_fn; *ff = free_fn;
+    return build_fn && free_fn;
+  }
+  tried = 1;
+
+  void* so = NULL;
+  Dl_info info;
+  char sidecar[4096];
+  if (dladdr((void*)&seekdb_cuvs_free, &info) && info.dli_fname) {
+    const char* slash = strrchr(info.dli_fname, '/');
+    if (slash) {
+      size_t n = (size_t)(slash - info.dli_fname);
+      if (n > 0 && n < sizeof(sidecar) - 32) {
+        memcpy(sidecar, info.dli_fname, n);
+        sidecar[n] = '\0';
+        strcat(sidecar, "/libseekdb_sk_exact.so");
+        so = dlopen(sidecar, RTLD_NOW | RTLD_LOCAL);
+        if (so && trace_enabled())
+          fprintf(stderr, "[seekdb_cuvs] exact sidecar: %s\n", sidecar);
+      }
+    }
+  }
+  if (!so) so = dlopen("libseekdb_sk_exact.so", RTLD_NOW | RTLD_LOCAL);
+  if (!so) {
+    if (trace_enabled())
+      fprintf(stderr, "[seekdb_cuvs] exact sidecar unavailable (%s), "
+              "builds use cuvsCagraBuild\n", dlerror());
+    *bf = NULL; *ff = NULL;
+    return 0;
+  }
+  build_fn = (sk_build_fn)dlsym(so, "sk_exact_graph_build");
+  free_fn  = (sk_free_fn)dlsym(so, "sk_free_exact");
+  if (!build_fn || !free_fn) {
+    if (trace_enabled())
+      fprintf(stderr, "[seekdb_cuvs] exact sidecar symbols missing: %s\n", dlerror());
+    build_fn = NULL; free_fn = NULL;
+  }
+  *bf = build_fn; *ff = free_fn;
+  return build_fn && free_fn;
 }
 
 /* Build knobs.
@@ -228,18 +283,20 @@ void* seekdb_cuvs_build(const float* base, long n, long dim)
   load_build_params(h->ip);
   if (cuvsCagraIndexCreate(&h->idx) != CUVS_SUCCESS) goto fail_ip;
 
-#ifndef SK_NO_EXACT
   /* Exact kNN graph path: compute the graph on the GPU ourselves and inject
-   * it via the official cuvsCagraIndexFromArgs.  Every failure falls through
-   * to the cuvsCagraBuild path, so the worst case is the previous behavior. */
+   * it via the official cuvsCagraIndexFromArgs.  Every failure - including
+   * the sidecar being unavailable - falls through to the cuvsCagraBuild
+   * path, so the worst case is the previous behavior. */
   if (env_long("SEEKDB_CUVS_EXACT", 1, 0, 1) == 1 && n > (long)h->ip->graph_degree) {
     long k     = (long)h->ip->graph_degree;   /* k <= 256 (SK_MAXK in the .hip) */
     long chunk = env_long("SEEKDB_CUVS_EXACT_CHUNK", 2048, 256, 65536);
-    if (k <= 256) {
+    sk_build_fn sk_build;
+    sk_free_fn  sk_free;
+    if (k <= 256 && sk_exact_load(&sk_build, &sk_free)) {
       long t0 = now_us();
       void* dx = NULL;
       void* dg = NULL;
-      long rc  = sk_exact_graph_build(base, n, (int)dim, (int)k, chunk, &dx, &dg);
+      long rc  = sk_build(base, n, (int)dim, (int)k, chunk, &dx, &dg);
       if (rc == 0 && dx && dg) {
         DLManagedTensor ddev = dset;  /* same shape/dtype, device memory */
         ddev.dl_tensor.data = dx;
@@ -265,14 +322,13 @@ void* seekdb_cuvs_build(const float* base, long n, long dim)
           return h;
         }
         fprintf(stderr, "[seekdb_cuvs] IndexFromArgs failed: %s\n", cuvsGetLastErrorText());
-        sk_free_exact(dx);
-        sk_free_exact(dg);
+        sk_free(dx);
+        sk_free(dg);
       } else {
         fprintf(stderr, "[seekdb_cuvs] exact graph build rc=%ld, falling back to cuvsCagraBuild\n", rc);
       }
     }
   }
-#endif
 
   {
     long t0 = now_us();
@@ -367,10 +423,16 @@ void seekdb_cuvs_free(void* handle)
   if (h->q_dev) cuvsRMMFree(h->res, h->q_dev, sizeof(float) * h->q_cap);
   cuvsCagraIndexDestroy(h->idx);   /* first: index views x_dev/graph_dev */
   cuvsCagraIndexParamsDestroy(h->ip);
-#ifndef SK_NO_EXACT
-  if (h->graph_dev) sk_free_exact(h->graph_dev);
-  if (h->x_dev)     sk_free_exact(h->x_dev);
-#endif
+  {
+    sk_build_fn sk_build;
+    sk_free_fn  sk_free;
+    if (h->graph_dev || h->x_dev) {
+      if (sk_exact_load(&sk_build, &sk_free) && sk_free) {
+        if (h->graph_dev) sk_free(h->graph_dev);
+        if (h->x_dev)     sk_free(h->x_dev);
+      }
+    }
+  }
   cuvsResourcesDestroy(h->res);
   pthread_mutex_destroy(&h->mu);
   free(h);
