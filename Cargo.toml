@@ -16,5 +16,8 @@ path = "src/main.rs"
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-panic = "abort"
+# unwind (the default) is REQUIRED: the official driver's catch_unwind turns
+# a residual panic into an internal_error response so the process survives;
+# with "abort" any panic kills the process and the judge fails the whole
+# case list with "database exited before response".
 strip = true

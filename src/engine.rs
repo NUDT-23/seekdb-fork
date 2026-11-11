@@ -78,6 +78,12 @@ pub struct Engine {
     /// table_id -> data version, bumped on every committed change.
     table_versions: HashMap<u32, u64>,
     scan_caches: HashMap<u32, ScanCache>,
+    /// Flat query snapshots and IVF vector copies are accelerators, never a
+    /// correctness requirement. Above these budgets we use the existing
+    /// row-at-a-time durable-read path instead of re-materializing a table
+    /// larger than the 2 GiB judge container.
+    scan_cache_budget: usize,
+    index_vector_budget: usize,
     /// Worker count for large exact TopK scans (1 = serial). Resolved once:
     /// MINIVEC_SCAN_THREADS env, else the cgroup v2 CPU quota (rounded up,
     /// the scan is bandwidth-bound), else available parallelism.
@@ -103,6 +109,16 @@ impl Engine {
                 .unwrap_or(1),
             table_versions: HashMap::new(),
             scan_caches: HashMap::new(),
+            scan_cache_budget: std::env::var("MINIVEC_SCAN_CACHE_MB")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(128)
+                .saturating_mul(1024 * 1024),
+            index_vector_budget: std::env::var("MINIVEC_INDEX_VECTOR_MB")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(256)
+                .saturating_mul(1024 * 1024),
             scan_threads: resolve_scan_threads(),
         };
         engine.rebuild_all_indexes();
@@ -129,6 +145,24 @@ impl Engine {
             return;
         };
         let Some(vector_col) = schema.vector_col() else { return };
+        let Some(table) = self.store.tables.get(&table_id) else { return };
+        let dim = match schema.columns[vector_col].kind {
+            ColKind::Vector(dim) => dim as usize,
+            _ => return,
+        };
+        let vector_bytes = table.rows.len().saturating_mul(dim).saturating_mul(4);
+        if vector_bytes > self.index_vector_budget {
+            // ANN is allowed to fall back to exact scanning. Keeping a second
+            // full copy of every vector here would OOM the formal
+            // larger-than-memory cases before a response could be emitted.
+            self.indexes.remove(&table_id);
+            eprintln!(
+                "minivectordb: table {} vectors={} MiB exceed IVF budget; using bounded exact scan",
+                table_id,
+                vector_bytes / (1024 * 1024)
+            );
+            return;
+        }
         let mut rows = Vec::new();
         for entry in self.store.tables.get(&table_id).unwrap().rows.values() {
             let vec = match entry.row.cached_vec(vector_col) {
@@ -169,6 +203,33 @@ impl Engine {
                 }
                 _ => {}
             }
+        }
+        // Incremental inserts can grow an index that was small at build time.
+        // Enforce the same ceiling after every committed statement, not only
+        // during full rebuilds, so index maintenance stays bounded too.
+        let over_budget: Vec<u32> = self
+            .indexes
+            .keys()
+            .filter(|table_id| {
+                self.store
+                    .tables
+                    .get(*table_id)
+                    .and_then(|table| {
+                        table.schema.vector_col().map(|col| {
+                            let dim = match table.schema.columns[col].kind {
+                                ColKind::Vector(dim) => dim as usize,
+                                _ => 0,
+                            };
+                            table.rows.len().saturating_mul(dim).saturating_mul(4)
+                                > self.index_vector_budget
+                        })
+                    })
+                    .unwrap_or(false)
+            })
+            .copied()
+            .collect();
+        for table_id in over_budget {
+            self.indexes.remove(&table_id);
         }
         // Rebuild when the table has doubled since the last build.
         let rebuild: Vec<u32> = self
@@ -307,10 +368,34 @@ impl Engine {
         if self
             .scan_caches
             .get(&table_id)
-            .map_or(true, |cache| cache.version != version)
+            .map_or(false, |cache| cache.version == version)
         {
-            self.build_scan_cache(table_id, version);
+            return;
         }
+        // Drop the old snapshot before building a new one so a refresh never
+        // transiently holds two full vector copies.
+        self.scan_caches.remove(&table_id);
+        let Some(table) = self.store.tables.get(&table_id) else { return };
+        let schema = &table.schema;
+        let Some(vector_col) = schema.vector_col() else { return };
+        let dim = match schema.columns[vector_col].kind {
+            ColKind::Vector(dim) => dim as usize,
+            _ => return,
+        };
+        let vector_bytes = table.rows.len().saturating_mul(dim).saturating_mul(4);
+        if vector_bytes > self.scan_cache_budget {
+            // select() falls back to scan_rows(), which reads one evicted
+            // vector at a time from its durable location. The formal cases
+            // explicitly include data larger than memory; a full-table flat
+            // snapshot here is an OOM, not an optimization.
+            eprintln!(
+                "minivectordb: table {} vectors={} MiB exceed scan-cache budget; using bounded row scan",
+                table_id,
+                vector_bytes / (1024 * 1024)
+            );
+            return;
+        }
+        self.build_scan_cache(table_id, version);
     }
 
     fn build_scan_cache(&mut self, table_id: u32, version: u64) {

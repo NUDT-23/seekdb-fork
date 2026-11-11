@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -824,22 +824,38 @@ impl Store {
     }
 
     fn replay_wal(&mut self) -> io::Result<(u64, u64)> {
-        let mut bytes = Vec::new();
-        self.wal_read.read_to_end(&mut bytes)?;
-        let mut pos = 0usize;
+        // Stream one frame at a time. The formal recovery cases can exceed
+        // the 2 GiB container; read_to_end here used to OOM before `ready`.
+        // A cloned handle shares the file offset but leaves positioned reads
+        // used by read_vec unaffected.
+        let file_len = self.wal_read.metadata()?.len();
+        let cache_wal_vectors = file_len <= self.arena_budget as u64;
+        let mut reader = BufReader::new(self.wal_read.try_clone()?);
+        let mut pos = 0u64;
         let mut valid_end = 0u64;
         let mut max_lsn = self.lsn;
-        'frames: while pos + 8 <= bytes.len() {
-            let len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
-            let expected_crc = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap());
-            if pos + 8 + len > bytes.len() {
+        'frames: loop {
+            let mut header = [0u8; 8];
+            match reader.read_exact(&mut header) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(error) => return Err(error),
+            }
+            let len = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
+            let expected_crc = u32::from_le_bytes(header[4..8].try_into().unwrap());
+            if pos + 8 + len as u64 > file_len {
+                break; // torn tail: do not trust its length or allocate it
+            }
+            let mut payload = vec![0u8; len];
+            match reader.read_exact(&mut payload) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(error) => return Err(error),
+            }
+            if len < 8 || crc32(&payload) != expected_crc {
                 break;
             }
-            let payload = &bytes[pos + 8..pos + 8 + len];
-            if len < 8 || crc32(payload) != expected_crc {
-                break;
-            }
-            let mut cur = Cur::new(payload);
+            let mut cur = Cur::new(&payload);
             let record_lsn = match cur.u64() {
                 Ok(v) => v,
                 Err(_) => break,
@@ -848,19 +864,34 @@ impl Store {
             let mut locs = Vec::new();
             while cur.p < payload.len() {
                 let op_start = cur.p;
-                let op = match get_op(&mut cur) {
+                let mut op = match get_op(&mut cur) {
                     Ok(op) => op,
                     Err(_) => break 'frames,
                 };
                 if let WalOp::UpsertRow { row, .. } = &op {
                     locs.push(RowLoc {
                         gen: 0,
-                        off: (pos + 8 + op_start + 5) as u64,
+                        off: pos + 8 + op_start as u64 + 5,
                         len: match row_len(row) {
                             Ok(v) => v,
                             Err(_) => break 'frames,
                         },
                     });
+                }
+                if !cache_wal_vectors {
+                    // A multi-GiB WAL must not refill the vector arena during
+                    // recovery and trigger repeated whole-table eviction
+                    // scans. Keep the durable location above; read_vec will
+                    // materialize this row on demand after startup.
+                    if let WalOp::UpsertRow { table_id, row } = &mut op {
+                        if let Some(vector_col) = self
+                            .tables
+                            .get(table_id)
+                            .and_then(|table| table.schema.vector_col())
+                        {
+                            row.vals[vector_col] = VVal::Vec(None);
+                        }
+                    }
                 }
                 ops.push(op);
             }
@@ -868,8 +899,8 @@ impl Store {
             if record_lsn > self.lsn {
                 self.apply_ops(&ops, &locs);
             }
-            pos += 8 + len;
-            valid_end = pos as u64;
+            pos += 8 + len as u64;
+            valid_end = pos;
         }
         Ok((valid_end, max_lsn))
     }
@@ -933,20 +964,34 @@ fn load_checkpoint_rows(
     table: &mut TableData,
     cache_vectors: bool,
 ) -> io::Result<()> {
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    let mut pos = 0usize;
-    while pos + 8 <= bytes.len() {
-        let len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
-        let expected_crc = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap());
-        if pos + 8 + len > bytes.len() {
+    // Checkpoint files may be larger than RAM. Read and validate one row
+    // frame at a time; `cache_vectors=false` strips each vector immediately,
+    // leaving only scalar metadata resident after recovery.
+    let file_len = file.metadata()?.len();
+    let mut reader = BufReader::new(file);
+    let mut pos = 0u64;
+    loop {
+        let mut header = [0u8; 8];
+        match reader.read_exact(&mut header) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(error) => return Err(error),
+        }
+        let len = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
+        let expected_crc = u32::from_le_bytes(header[4..8].try_into().unwrap());
+        if pos + 8 + len as u64 > file_len {
             break;
         }
-        let payload = &bytes[pos + 8..pos + 8 + len];
-        if crc32(payload) != expected_crc {
+        let mut payload = vec![0u8; len];
+        match reader.read_exact(&mut payload) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(error) => return Err(error),
+        }
+        if crc32(&payload) != expected_crc {
             break;
         }
-        let mut row = get_row(&mut Cur::new(payload))
+        let mut row = get_row(&mut Cur::new(&payload))
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad row"))?;
         if !cache_vectors {
             if let Some(vector_col) = table.schema.vector_col() {
@@ -955,9 +1000,9 @@ fn load_checkpoint_rows(
         }
         table.rows.insert(
             row.pk,
-            RowEntry { row, loc: RowLoc { gen, off: (pos + 8) as u64, len: len as u32 } },
+            RowEntry { row, loc: RowLoc { gen, off: pos + 8, len: len as u32 } },
         );
-        pos += 8 + len;
+        pos += 8 + len as u64;
     }
     Ok(())
 }

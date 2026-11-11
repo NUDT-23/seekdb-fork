@@ -1,7 +1,7 @@
 {
   "schema": "minivectordb-learning-material-v1",
   "synthetic": false,
-  "materials_scope": "Actual user prompts and implementation/verification records from the 2026-11-09 MiniVectorDB work sessions (initial implementation, first platform submission, protocol root-cause analysis, and performance work). Agent explanations are labeled as agent output, not as student understanding. No hidden reasoning, credentials or external test data are included.",
+  "materials_scope": "Actual user prompts and implementation/verification records from the 2026-11-09 through 2026-11-11 MiniVectorDB work sessions (initial implementation, platform submissions, official protocol adoption, performance work, and larger-than-memory failure reproduction and repair). Agent explanations are labeled as agent output, not as student understanding. No hidden reasoning, credentials or external test data are included.",
   "user_prompts": [
     {
       "id": "user-1",
@@ -52,6 +52,31 @@
       "id": "user-10",
       "source": "student",
       "content": "每 1 小时扫一次官方分支"
+    },
+    {
+      "id": "user-11",
+      "source": "student",
+      "content": "推送之前先预计一下大概能多少分，我的目标是题一满分"
+    },
+    {
+      "id": "user-12",
+      "source": "student",
+      "content": "不要浪费我的提测次数啊，准备好了再交"
+    },
+    {
+      "id": "user-13",
+      "source": "student",
+      "content": "在wsl使用cargo会不会性能比较差"
+    },
+    {
+      "id": "user-14",
+      "source": "student",
+      "content": "能看到别的队是怎么成功的或者官方有做解释吗，你把保证成功率提上去再说"
+    },
+    {
+      "id": "user-15",
+      "source": "student",
+      "content": "继续，先解释我们目前要做什么，这两个小题80分，我们进度如何，还有两个排行榜是怎么回事"
     }
   ],
   "conversations": [
@@ -99,6 +124,26 @@
       "id": "design-3",
       "source": "agent",
       "content": "Official transport implemented as the new default (MINIVEC_PROTOCOL=official): src/jsonreq.rs is a hand-rolled standard-library-only JSON request parser (full string unescaping including \\uXXXX surrogate pairs; the id token is kept raw and spliced verbatim into responses so its JSON type round-trips); render_official wraps results with id + boolean ok; main.rs gained run_official() which emits {\"type\":\"ready\"} after recovery, honors search_mode per request, treats {\"op\":\"shutdown\"} as rollback + checkpoint + response + exit(0), and skips malformed lines silently on stdout (stderr diagnostic only). VECTORDB_DATA_DIR from the official tool's --command mode joined the data-dir resolution chain. The five historical variants remain selectable and smoke-tested for regression archaeology."
+    },
+    {
+      "id": "context-7",
+      "source": "agent",
+      "content": "Three protocol-correct submissions (cb5f729b7, 72ab66503, 59c4b5964) each passed 28 of 29 formal cases; the same single hidden case killed the process with 'database exited before response'. The first hardening attempt wrapped statement execution in catch_unwind, but Cargo.toml still had release panic=abort, making that wrapper ineffective in the judge's release image. The second reproduced and fixed a real 100k-term WHERE stack overflow, but the platform signature stayed unchanged, falsifying stack depth as the hidden-case cause."
+    },
+    {
+      "id": "context-8",
+      "source": "agent",
+      "content": "External evidence review requested by the student: the official branch remained at f4d4e2665, forum topic 35653825 had no official reply, and public Python/C++ implementations plus a submission-monitoring repository contained no evidence of a 29/29 pass. Re-reading the statement then prioritized section 2.3: formal tests explicitly include datasets larger than the memory limit, and section 3.2 requires greater-than-memory processing and recovery. That requirement had not been directly tested at >2 GiB scale."
+    },
+    {
+      "id": "design-4",
+      "source": "agent",
+      "content": "Deep-expression hardening retained as defense in depth: WHERE expressions use an arena (Vec<FNode> with child indexes), bind to a flat postfix program, and evaluate on a non-recursive stack machine; the server runs on a 512 MiB stack thread and parenthesis nesting is capped. Release panic was changed back to unwind and catch_unwind now covers request parsing, execution, response rendering and shutdown checkpoint."
+    },
+    {
+      "id": "design-5",
+      "source": "agent",
+      "content": "Memory architecture corrected after the >2 GiB reproduction. Flat exact-scan snapshots are built only below MINIVEC_SCAN_CACHE_MB (default 128); larger tables use the existing row-at-a-time durable-read TopK path. Full IVF vector copies are skipped above MINIVEC_INDEX_VECTOR_MB (default 256), including incremental growth, so ANN falls back to the same bounded exact scan with recall 1.0. The vector arena default is 128 MiB. WAL replay and checkpoint loading stream one CRC-framed record at a time instead of read_to_end; oversized WAL replay strips vector payloads after recording durable row locations. Small-table benchmark behavior remains on the original fast path."
     }
   ],
   "experiments": [
@@ -155,6 +200,48 @@
       "source": "tool_result",
       "command": "python3 -I tools/benchmark.py --binary target/release/minivectordb --mode ann",
       "output": "IVF-Flat (deterministic k-means, sqrt(n) lists, nprobe = nlist/2) on 128-dim uniform data: recall_at_10 unfiltered 0.84, filtered 0.8318 - below the hard 0.95 gate. Decision: exact scanning is the submission mode; IVF remains for --mode ann on clusterable data; the benchmark's ann mode fails its own >= 0.95 assertion there by design."
+    },
+    {
+      "id": "experiment-official-image",
+      "source": "tool_result",
+      "command": "python3 protocol_check/run.py --image minivectordb:official --output <fresh-dir>",
+      "output": "The official self-check tool passed 20/20 public cases plus its transport checks against the release Docker image. The image was run with the reference harness flags: 2 CPUs, 2 GiB memory, swap disabled, 128 pids, read-only rootfs, cap-drop=ALL, no-new-privileges, network=none and a bind-mounted /data."
+    },
+    {
+      "id": "experiment-deep-input",
+      "source": "tool_result",
+      "command": "python3 -I tools/adversarial_deep.py target/release/minivectordb",
+      "output": "100k/200k-term AND/OR chains, 50k mixed chains, a 1M-character WHERE, 8000 nested parentheses, a 100k-term UPDATE and restart recovery all completed with correct results. Before the arena/postfix fix, the 100k-term AND chain aborted with 'fatal runtime error: stack overflow'. This fixed a real defect but did not change the platform failure, so investigation continued rather than claiming success."
+    },
+    {
+      "id": "experiment-panic-and-ann-hunts",
+      "source": "tool_result",
+      "command": "python3 -I tools/panic_hunt.py target/release/minivectordb && python3 -I tools/ann_hunt.py target/release/minivectordb",
+      "output": "More than 150 pathological numeric/vector/string/DDL/transaction/query shapes plus empty, tied, filtered, updated, deleted, restarted and dimension-edge ANN cases produced zero internal_error responses and zero process deaths. With panic=unwind these hunts would expose a caught panic as an internal_error response; none was found."
+    },
+    {
+      "id": "experiment-oom-reproduction",
+      "source": "tool_result",
+      "command": "python3 -I tools/judge_sim.py minivectordb:official 512 1100000 stream",
+      "output": "BEFORE the bounded-scan fix, 1,100,000 rows x 512 dimensions (about 2.25 GB vector payload) loaded under the judge's 2 GiB/no-swap limits, then the first exact TopK query died with rc=137 (OOM-kill) and only the startup line on stderr. Code inspection showed build_scan_cache allocating a second full-table Vec<f32>. This locally reproduced the platform's 'database exited before response' class on a statement-mandated larger-than-memory case."
+    },
+    {
+      "id": "experiment-oom-fixed",
+      "source": "tool_result",
+      "command": "python3 -I tools/judge_sim.py minivectordb:official 512 1100000 stream (bounded scan + streaming recovery)",
+      "output": "AFTER the fix, the identical 2.25 GB workload passed load, index definition, two exact TopK queries, one ANN TopK query, shutdown, same-directory restart, and exact+ANN queries after recovery. Total 265.1 s (case budget 600 s): load 139.4 s, initial queries 102.1 s, shutdown 11.1 s, restart-to-ready 4.7 s, recovery queries 6.7 s; final exit 0. The pre-fix rc=137 became a complete pass with no change to resource limits."
+    },
+    {
+      "id": "experiment-bounded-regressions",
+      "source": "tool_result",
+      "command": "MINIVEC_SCAN_CACHE_MB=0 MINIVEC_INDEX_VECTOR_MB=0 MINIVEC_VECTOR_ARENA_MB=0 python3 -I tools/ann_hunt.py target/release/minivectordb; MINIVEC_VECTOR_ARENA_MB=1 python3 -I tools/crash_fuzz.py target/release/minivectordb 60",
+      "output": "Forcing every accelerator off kept exact/ANN results consistent across updates, deletes and restart. Sixty random SIGKILL/restart cycles with a tiny arena also recovered successfully, exercising oversized-WAL vector stripping and durable positioned reload. Public 20/20 and extended 6/6 (including torn WAL) remained green."
+    },
+    {
+      "id": "experiment-bounded-ab-perf",
+      "source": "tool_result",
+      "command": "Alternating three exact benchmark runs of the previous and bounded-memory release binaries with data directories on ext4",
+      "output": "Previous binary query seconds: 0.454594, 0.448640, 0.405647 (mean 0.4363). Bounded-memory binary: 0.453676, 0.421760, 0.408534 (mean 0.4280). Recall remained 1.0. The 10k x 128 benchmark stays on the flat-cache fast path; WSL absolute timings vary, so the same-invocation alternating A/B is the comparison used for the no-regression decision."
     }
   ],
   "retrospective": [
@@ -177,11 +264,21 @@
       "id": "iteration-4",
       "source": "agent",
       "content": "Performance work followed weights from the scoring formula (query time 40%, write 20%, I/O 20%, memory 20% of the composite index): the flat scan cache adds one contiguous vector buffer and evicts per-row copies after the build so steady-state memory stays flat; exact mode no longer materializes IVF indexes it never probes, which removes index-build I/O and memory from the measured window; the transient build peak (~5 MiB) was accepted after estimating it is cheaper than re-reading vectors from the WAL, which would trade measured read bytes for memory."
+    },
+    {
+      "id": "iteration-5",
+      "source": "agent",
+      "content": "Two plausible hardening attempts did not fix the platform case. They were retained only after local reproduction proved real defects, but were not presented as the hidden-case root cause. The unchanged failure signature forced a broader evidence review. Reading the student's quota constraint as a requirement for falsifiable experiments led to the judge simulator and a before/after controlled test instead of another speculative submission."
+    },
+    {
+      "id": "iteration-6",
+      "source": "agent",
+      "content": "The original flat scan cache was a valid small-benchmark optimization but violated the statement's larger-than-memory requirement when treated as universal. The final design makes acceleration conditional: small tables retain contiguous AVX2 scans, large tables use bounded durable reads, ANN may degenerate to exact scanning, and recovery streams frames. This is a correctness-driven tradeoff, not a claim that the slow path is faster; the A/B benchmark checks that the ranked small workload did not regress."
     }
   ],
   "limitations": [
-    "The official evaluation wire protocol and frozen resource/error mapping were still unpublished when this material was recorded. The default jsonl transport mirrors the official .result assertion vocabulary and is the best-evidence choice, not a confirmed one; four verified fallbacks exist for the same reason. The remaining daily submission attempt is deliberately held until the official driver or a precheck entry is available.",
-    "IVF-Flat recall on 128-dim uniform benchmark data is ~0.84, so the submission mode is exact scanning; ANN with the index remains available for smaller or clusterable datasets. No platform rank or score is claimed.",
+    "The official protocol is implemented and verified with the official tool, but hidden-case SQL and platform stderr are not public. The 2.25 GB OOM reproduction is strong local evidence for the observed death class, not a claim of a platform 29/29 result; only the next formal evaluation can confirm it.",
+    "Exact scanning is the submission mode. ANN defaults to probing all IVF lists for exact-quality recall on indexed small/medium tables and falls back to bounded exact scanning above the index memory budget. Scalar row metadata remains resident even when vector payloads are disk-backed. No platform rank or score is claimed.",
     "Most technical work in this material was performed by the agent under the student's direction, verification requests and quota decisions; agent output is labeled as such and is not claimed as independent student understanding. Only the quoted prompts are the student's own words."
   ]
 }

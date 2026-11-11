@@ -13,7 +13,6 @@ use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 
 use engine::{Engine, ExecResult};
-use error::DbError;
 use protocol::{ProtoKind, Protocol, render_official};
 use storage::Store;
 
@@ -91,7 +90,10 @@ fn server_main() {
     let arena_mb = std::env::var("MINIVEC_VECTOR_ARENA_MB")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(512);
+        // Leave most of the 2 GiB judge cgroup for row metadata, WAL frames
+        // and checkpoint I/O. The small performance benchmark needs only a
+        // few MiB; large formal tables are read back from durable locations.
+        .unwrap_or(128);
     let store = match Store::open(&dir, arena_mb * 1024 * 1024) {
         Ok(store) => store,
         Err(error) => {
@@ -200,13 +202,17 @@ fn run_official(mut engine: Engine, mut out: io::StdoutLock<'static>) {
         if line.trim().is_empty() {
             continue;
         }
-        let request = match jsonreq::parse(&line) {
-            jsonreq::Parsed::Ok(req) => req,
-            jsonreq::Parsed::Bad(reason) => {
+        let request = match panic::catch_unwind(|| jsonreq::parse(&line)) {
+            Ok(jsonreq::Parsed::Ok(req)) => req,
+            Ok(jsonreq::Parsed::Bad(reason)) => {
                 // The judge never sends malformed lines. Stay silent on
                 // stdout (an unsolicited response would fail the transport)
                 // and keep reading.
                 eprintln!("minivectordb: bad request line ({}): {:.120}", reason, line);
+                continue;
+            }
+            Err(_) => {
+                eprintln!("minivectordb: request parse panicked (recovered): {:.120}", line);
                 continue;
             }
         };
@@ -219,39 +225,46 @@ fn run_official(mut engine: Engine, mut out: io::StdoutLock<'static>) {
             let _ = out.flush();
             std::process::exit(0);
         }
-        let response = if request.op == "execute" {
-            // search_mode is per-request ("exact" default; anything but
-            // "ann" is exact). One statement per request (§3: the judge
-            // wraps each SQL statement; semicolons may appear inside SQL
-            // strings). A panicking statement is downgraded to an error
-            // response: the process must survive so later statements and
-            // cases can still run (a dead process fails the whole judge
-            // transport with "database exited before response").
-            let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+        // The ENTIRE response build (mode switch, statement split, execution,
+        // JSON rendering) runs under catch_unwind: a residual panic is
+        // downgraded to an internal_error response so the process survives —
+        // the judge fails the whole case list with "database exited before
+        // response" when the process dies. This requires panic=unwind in the
+        // release profile (see Cargo.toml); under panic=abort this wrapper is
+        // dead code and any panic aborts.
+        let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+            if request.op == "execute" {
+                // search_mode is per-request ("exact" default; anything but
+                // "ann" is exact). One statement per request (§3: the judge
+                // wraps each SQL statement; semicolons may appear inside SQL
+                // strings).
                 let ann = request.search_mode.as_deref() == Some("ann");
                 engine.set_ann_mode(ann);
                 let sql = request.sql.clone().unwrap_or_default();
-                match split_statements(&sql).into_iter().next() {
+                let result = match split_statements(&sql).into_iter().next() {
                     Some(stmt) => engine.execute(stmt),
                     None => Ok(ExecResult::Ok { affected_rows: None }),
-                }
-            }));
-            let result = match outcome {
-                Ok(result) => result,
-                Err(_) => {
-                    eprintln!(
-                        "minivectordb: statement panicked (recovered): {:.200}",
-                        request.sql.as_deref().unwrap_or("")
-                    );
-                    Err(DbError::Internal)
-                }
-            };
-            render_official(&request.id_raw, &result)
-        } else {
-            format!(
-                "{{\"id\":{},\"ok\":false,\"error\":{{\"code\":\"UNSUPPORTED_OP\",\"message\":\"unsupported operation\"}}}}",
-                request.id_raw
-            )
+                };
+                render_official(&request.id_raw, &result)
+            } else {
+                format!(
+                    "{{\"id\":{},\"ok\":false,\"error\":{{\"code\":\"UNSUPPORTED_OP\",\"message\":\"unsupported operation\"}}}}",
+                    request.id_raw
+                )
+            }
+        }));
+        let response = match outcome {
+            Ok(response) => response,
+            Err(_) => {
+                eprintln!(
+                    "minivectordb: statement panicked (recovered): {:.200}",
+                    request.sql.as_deref().unwrap_or("")
+                );
+                format!(
+                    "{{\"id\":{},\"ok\":false,\"error\":{{\"code\":\"internal_error\",\"message\":\"internal_error\"}}}}",
+                    request.id_raw
+                )
+            }
         };
         if writeln!(out, "{}", response).and_then(|_| out.flush()).is_err() {
             break;
