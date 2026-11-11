@@ -30,6 +30,7 @@
  * order, so the merged result does not depend on slot order.
  */
 #include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
 #include <float.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -106,6 +107,19 @@ __global__ void sk_norms_kernel(const float* __restrict__ X, float* __restrict__
   xn[i] = acc;
 }
 
+/* kernel 1b: pack X to half for the mixed-precision GEMM (f16xf16->f32
+ * FMA = 2x ALU throughput on gfx1100; scores/norms/graph stay float so
+ * only the inner-product inputs lose ~1e-3 relative precision - well
+ * below the top-128 neighbor gaps the ranking actually depends on). */
+__global__ void sk_tohalf_kernel(const float* __restrict__ X, __half* __restrict__ Xh,
+                                 long n, int dim)
+{
+  long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  long total = n * (long)dim;
+  if (i >= total) return;
+  Xh[i] = __float2half(X[i]);
+}
+
 /* ------------------------------------------------------------------ */
 /* kernel 2: chunked GEMM  scores[lr][c] = sum_k X[row][k] * X[c][k]   */
 /*   grid = (ceil(n/SK_TX), ceil(rows/SK_TY)), block = 256             */
@@ -115,11 +129,11 @@ __global__ void sk_norms_kernel(const float* __restrict__ X, float* __restrict__
 /*   +1 padding: load phase contiguous, compute phase 4-way max)       */
 /* ------------------------------------------------------------------ */
 
-__global__ void sk_gemm_kernel(const float* __restrict__ X, float* __restrict__ scores,
+__global__ void sk_gemm_kernel(const __half* __restrict__ X, float* __restrict__ scores,
                                long chunk_start, long rows, long n, int dim)
 {
-  __shared__ float As[SK_TK][SK_TY];
-  __shared__ float Bs[SK_TX][SK_TK + 1];
+  __shared__ __half As[SK_TK][SK_TY];
+  __shared__ __half Bs[SK_TX][SK_TK + 1];
 
   const int t    = threadIdx.x;                 /* 0..255 */
   const int ty16 = t / 16;                      /* 0..15  */
@@ -141,7 +155,7 @@ __global__ void sk_gemm_kernel(const float* __restrict__ X, float* __restrict__ 
       int kk = idx / SK_TY, m = idx % SK_TY;
       long row = row0 + m;
       int  k   = k0 + kk;
-      As[kk][m] = (row < n && k < dim) ? X[row * dim + k] : 0.f;
+      As[kk][m] = (row < n && k < dim) ? X[row * dim + k] : __ushort_as_half(0);
     }
     /* B tile: 128 cols x 32 k -> Bs[col][kk]; consecutive t -> consecutive kk
      * (coalesced 128 B global runs along each X row, contiguous LDS writes) */
@@ -149,7 +163,7 @@ __global__ void sk_gemm_kernel(const float* __restrict__ X, float* __restrict__ 
       int col = idx / SK_TK, kk = idx % SK_TK;
       long c  = col0 + col;
       int  k  = k0 + kk;
-      Bs[col][kk] = (c < n && k < dim) ? X[c * dim + k] : 0.f;
+      Bs[col][kk] = (c < n && k < dim) ? X[c * dim + k] : __ushort_as_half(0);
     }
     __syncthreads();
 
@@ -157,9 +171,9 @@ __global__ void sk_gemm_kernel(const float* __restrict__ X, float* __restrict__ 
     for (int kk = 0; kk < SK_TK; kk++) {
       float a[4], b[8];
 #pragma unroll
-      for (int i = 0; i < 4; i++) a[i] = As[kk][ty16 * 4 + i];
+      for (int i = 0; i < 4; i++) a[i] = __half2float(As[kk][ty16 * 4 + i]);
 #pragma unroll
-      for (int j = 0; j < 8; j++) b[j] = Bs[tx16 * 8 + j][kk];
+      for (int j = 0; j < 8; j++) b[j] = __half2float(Bs[tx16 * 8 + j][kk]);
 #pragma unroll
       for (int i = 0; i < 4; i++)
 #pragma unroll
@@ -452,6 +466,20 @@ extern "C" long sk_exact_graph_build(const float* h_base, long n, int dim, int k
   if (hipMemcpy(X, h_base, sizeof(float) * (size_t)n * dim, hipMemcpyHostToDevice) != hipSuccess)
     { hipFree(X); hipFree(G); hipFree(xn); return 2; }
 
+  /* half-precision mirror for the mixed-precision GEMM (2x FMA throughput;
+   * scores stay float, X float is kept for norms/verify/index injection). */
+  __half* Xh = NULL;
+  {
+    if (hipMalloc(&Xh, sizeof(__half) * (size_t)n * dim) != hipSuccess)
+      { hipFree(X); hipFree(G); hipFree(xn); return 2; }
+    long tot = n * (long)dim;
+    int hb = (int)((tot + SK_THREADS - 1) / SK_THREADS);
+    hipLaunchKernelGGL(sk_tohalf_kernel, dim3(hb), dim3(SK_THREADS), 0, 0,
+                       X, Xh, n, dim);
+    if (hipGetLastError() != hipSuccess || hipDeviceSynchronize() != hipSuccess)
+      { fprintf(stderr, "[sk_knn] tohalf failed\n"); hipFree(Xh); hipFree(X); hipFree(G); hipFree(xn); return 3; }
+  }
+
   {
     int blocks = (int)((n + SK_THREADS - 1) / SK_THREADS);
     hipLaunchKernelGGL(sk_norms_kernel, dim3(blocks), dim3(SK_THREADS), 0, 0,
@@ -473,7 +501,7 @@ extern "C" long sk_exact_graph_build(const float* h_base, long n, int dim, int k
     long rows = (cs + alloc_rows <= n) ? alloc_rows : (n - cs);
     dim3 grid((unsigned)((n + SK_TX - 1) / SK_TX), (unsigned)((rows + SK_TY - 1) / SK_TY));
     hipLaunchKernelGGL(sk_gemm_kernel, grid, dim3(SK_THREADS), 0, 0,
-                       X, SC, cs, rows, n, dim);
+                       Xh, SC, cs, rows, n, dim);
     if (hipGetLastError() != hipSuccess) { fprintf(stderr, "[sk_knn] gemm launch failed\n"); goto fail_gpu; }
     hipLaunchKernelGGL(sk_topk_kernel, dim3((unsigned)rows), dim3(SK_THREADS), 0, 0,
                        SC, xn, G, cs, n, k, K);
@@ -521,6 +549,7 @@ extern "C" long sk_exact_graph_build(const float* h_base, long n, int dim, int k
   }
 
   hipFree(SC);
+  hipFree(Xh);
   hipFree(xn);
   *dev_x_out = X;          /* viewed by cuvsCagraIndexFromArgs; freed by the bridge */
   *dev_graph_out = G;
@@ -528,7 +557,7 @@ extern "C" long sk_exact_graph_build(const float* h_base, long n, int dim, int k
   return 0;
 
 fail_gpu:
-  hipFree(SC); hipFree(xn); hipFree(G); hipFree(X);
+  hipFree(SC); hipFree(Xh); hipFree(xn); hipFree(G); hipFree(X);
   return 4;
 }
 
