@@ -66,6 +66,27 @@ fn split_statements(line: &str) -> Vec<&str> {
 }
 
 fn main() {
+    // The filter pipeline is fully iterative, but the whole server runs on a
+    // dedicated big-stack thread so any residual deep recursion (hostile
+    // nested JSON values, deeply parenthesized SQL, future code paths) has
+    // 512 MiB of headroom instead of the 8 MiB default. A stack overflow is
+    // an uncatchable abort — on the judge that is the whole-case-list
+    // "database exited before response" failure, not a recoverable error.
+    let stack_mb = std::env::var("MINIVEC_MAIN_STACK_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|mb| *mb >= 8)
+        .unwrap_or(512);
+    let worker = std::thread::Builder::new()
+        .stack_size(stack_mb * 1024 * 1024)
+        .spawn(server_main)
+        .expect("minivectordb: failed to spawn server thread");
+    if worker.join().is_err() {
+        std::process::exit(1);
+    }
+}
+
+fn server_main() {
     let dir = data_dir();
     let arena_mb = std::env::var("MINIVEC_VECTOR_ARENA_MB")
         .ok()

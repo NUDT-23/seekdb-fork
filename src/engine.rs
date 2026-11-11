@@ -6,7 +6,7 @@ use std::rc::Rc;
 
 use crate::error::{DbError, DbResult};
 use crate::ivf::IvfIndex;
-use crate::parser::{CmpOp, Expr, Literal, OrderDir, OrderKey, ProjItem, SelectStmt, Stmt};
+use crate::parser::{CmpOp, Expr, FNode, Literal, OrderDir, OrderKey, ProjItem, SelectStmt, Stmt};
 use crate::storage::{IndexDef, Row, Store, VVal, WalOp};
 use crate::value::{
     check_varchar, dist_sq_f64_abandon, l2_distance, l2_distance_sq_fast, parse_vector, ColKind,
@@ -504,7 +504,7 @@ impl Engine {
         filter: Option<Expr>,
     ) -> DbResult<u64> {
         let (table_id, schema) = self.resolve_table(&table_name)?;
-        validate_filter(&schema, filter.as_ref())?;
+        let bound_filter = bind_filter(&schema, filter.as_ref())?;
         let mut bound_sets = Vec::new();
         for (name, literal) in sets {
             let index = schema.col_index(&name).ok_or(DbError::ColumnNotFound)?;
@@ -516,7 +516,7 @@ impl Engine {
         let rows = self.visible_rows(table_id)?;
         let mut ops = Vec::new();
         for row in rows {
-            if !eval_filter(&schema, &row, filter.as_ref())? {
+            if bound_filter.as_ref().map_or(true, |f| !eval_bound(f, &row)) {
                 continue;
             }
             let mut updated = row.clone();
@@ -533,11 +533,11 @@ impl Engine {
 
     fn delete(&mut self, table_name: String, filter: Option<Expr>) -> DbResult<u64> {
         let (table_id, schema) = self.resolve_table(&table_name)?;
-        validate_filter(&schema, filter.as_ref())?;
+        let bound_filter = bind_filter(&schema, filter.as_ref())?;
         let rows = self.visible_rows(table_id)?;
         let mut ops = Vec::new();
         for row in rows {
-            if eval_filter(&schema, &row, filter.as_ref())? {
+            if bound_filter.as_ref().map_or(false, |f| eval_bound(f, &row)) {
                 ops.push(WalOp::DeleteRow { table_id, pk: row.pk });
             }
         }
@@ -628,7 +628,7 @@ impl Engine {
         &self,
         table_id: u32,
         visible: Vec<&'a Row>,
-        bound_filter: &Option<BoundExpr>,
+        bound_filter: &Option<BoundFilter>,
         dist_ctx: &Option<(usize, Vec<f32>)>,
         topk_limit: Option<usize>,
         records: &mut Vec<SelectedRow<'a>>,
@@ -1125,58 +1125,106 @@ fn bind_order(schema: &Schema, items: &[BoundProj], order: &[OrderKey]) -> DbRes
         .collect()
 }
 
-/// Filter pre-bound to column indexes so per-row evaluation does no name
-/// lookups on the scan path.
-enum BoundExpr {
+/// Filter compiled to a flat postfix program: operands are emitted before
+/// the operator that consumes them. `bind_filter` binds the whole arena in
+/// one forward pass (parents have higher indexes than children) and
+/// `eval_bound` runs a two-slot stack machine — no recursion anywhere, so
+/// any chain length evaluates without stack risk. Column indexes are
+/// pre-bound so the per-row scan path does no name lookups.
+enum BInstr {
     Cmp { col: usize, op: CmpOp, lit: Literal },
-    And(Box<BoundExpr>, Box<BoundExpr>),
-    Or(Box<BoundExpr>, Box<BoundExpr>),
+    And,
+    Or,
 }
 
-fn bind_filter(schema: &Schema, expr: Option<&Expr>) -> DbResult<Option<BoundExpr>> {
-    match expr {
-        None => Ok(None),
-        Some(Expr::And(left, right)) => Ok(Some(BoundExpr::And(
-            Box::new(bind_filter(schema, Some(left))?.ok_or(DbError::Internal)?),
-            Box::new(bind_filter(schema, Some(right))?.ok_or(DbError::Internal)?),
-        ))),
-        Some(Expr::Or(left, right)) => Ok(Some(BoundExpr::Or(
-            Box::new(bind_filter(schema, Some(left))?.ok_or(DbError::Internal)?),
-            Box::new(bind_filter(schema, Some(right))?.ok_or(DbError::Internal)?),
-        ))),
-        Some(Expr::Cmp { col, op, lit }) => {
-            let index = schema.col_index(col).ok_or(DbError::ColumnNotFound)?;
-            match (&schema.columns[index].kind, lit) {
-                (ColKind::BigInt, Literal::Int(_)) | (ColKind::Varchar(_), Literal::Str(_)) => {
-                    Ok(Some(BoundExpr::Cmp { col: index, op: *op, lit: lit.clone() }))
+struct BoundFilter {
+    prog: Vec<BInstr>,
+}
+
+fn bind_filter(schema: &Schema, expr: Option<&Expr>) -> DbResult<Option<BoundFilter>> {
+    let expr = match expr {
+        None => return Ok(None),
+        Some(expr) => expr,
+    };
+    if expr.nodes.is_empty() {
+        return Err(DbError::Internal);
+    }
+    let mut prog: Vec<BInstr> = Vec::new();
+    for (idx, node) in expr.nodes.iter().enumerate() {
+        match node {
+            FNode::Cmp { col, op, lit } => {
+                let index = schema.col_index(col).ok_or(DbError::ColumnNotFound)?;
+                match (&schema.columns[index].kind, lit) {
+                    (ColKind::BigInt, Literal::Int(_)) | (ColKind::Varchar(_), Literal::Str(_)) => {}
+                    (ColKind::Vector(_), _) => return Err(DbError::UnsupportedSql),
+                    _ => return Err(DbError::TypeMismatch),
                 }
-                (ColKind::Vector(_), _) => Err(DbError::UnsupportedSql),
-                _ => Err(DbError::TypeMismatch),
+                prog.push(BInstr::Cmp { col: index, op: *op, lit: lit.clone() });
+            }
+            FNode::And { l, r } => {
+                if *l >= idx || *r >= idx {
+                    return Err(DbError::Internal); // parser invariant: children below parents
+                }
+                prog.push(BInstr::And);
+            }
+            FNode::Or { l, r } => {
+                if *l >= idx || *r >= idx {
+                    return Err(DbError::Internal);
+                }
+                prog.push(BInstr::Or);
             }
         }
+    }
+    Ok(Some(BoundFilter { prog }))
+}
+
+fn eval_cmp(col: usize, op: CmpOp, lit: &Literal, row: &Row) -> bool {
+    let ordering = match (&row.vals[col], lit) {
+        (VVal::Int(left), Literal::Int(right)) => left.cmp(right),
+        (VVal::Str(left), Literal::Str(right)) => left.cmp(right),
+        _ => Ordering::Equal,
+    };
+    match op {
+        CmpOp::Eq => ordering == Ordering::Equal,
+        CmpOp::Ne => ordering != Ordering::Equal,
+        CmpOp::Lt => ordering == Ordering::Less,
+        CmpOp::Le => ordering != Ordering::Greater,
+        CmpOp::Gt => ordering == Ordering::Greater,
+        CmpOp::Ge => ordering != Ordering::Less,
     }
 }
 
-fn eval_bound(expr: &BoundExpr, row: &Row) -> bool {
-    match expr {
-        BoundExpr::And(left, right) => eval_bound(left, row) && eval_bound(right, row),
-        BoundExpr::Or(left, right) => eval_bound(left, row) || eval_bound(right, row),
-        BoundExpr::Cmp { col, op, lit } => {
-            let ordering = match (&row.vals[*col], lit) {
-                (VVal::Int(left), Literal::Int(right)) => left.cmp(right),
-                (VVal::Str(left), Literal::Str(right)) => left.cmp(right),
-                _ => Ordering::Equal,
-            };
-            match op {
-                CmpOp::Eq => ordering == Ordering::Equal,
-                CmpOp::Ne => ordering != Ordering::Equal,
-                CmpOp::Lt => ordering == Ordering::Less,
-                CmpOp::Le => ordering != Ordering::Greater,
-                CmpOp::Gt => ordering == Ordering::Greater,
-                CmpOp::Ge => ordering != Ordering::Less,
-            }
+fn eval_bound(filter: &BoundFilter, row: &Row) -> bool {
+    // Single-comparison filters (the hot benchmark shape) skip the machine.
+    if filter.prog.len() == 1 {
+        if let BInstr::Cmp { col, op, lit } = &filter.prog[0] {
+            return eval_cmp(*col, *op, lit, row);
         }
     }
+    thread_local! {
+        static STACK: std::cell::RefCell<Vec<bool>> =
+            std::cell::RefCell::new(Vec::new());
+    }
+    STACK.with(|cell| {
+        let mut stack = cell.borrow_mut();
+        stack.clear();
+        for instr in &filter.prog {
+            match instr {
+                BInstr::Cmp { col, op, lit } => stack.push(eval_cmp(*col, *op, lit, row)),
+                BInstr::And => {
+                    let b = stack.pop().unwrap_or(true);
+                    let a = stack.pop().unwrap_or(true);
+                    stack.push(a && b);
+                }
+                BInstr::Or => {
+                    let b = stack.pop().unwrap_or(false);
+                    let a = stack.pop().unwrap_or(false);
+                    stack.push(a || b);
+                }
+            }
+        }
+        stack.pop().unwrap_or(true)
+    })
 }
 
 fn bind_literal(kind: &ColKind, literal: Literal) -> DbResult<VVal> {
@@ -1197,54 +1245,6 @@ fn bind_literal(kind: &ColKind, literal: Literal) -> DbResult<VVal> {
             Ok(VVal::Vec(Some(Rc::new(parse_vector(inner, Some(*dim))?))))
         }
         (ColKind::Vector(_), _) => Err(DbError::TypeMismatch),
-    }
-}
-
-fn validate_filter(schema: &Schema, expr: Option<&Expr>) -> DbResult<()> {
-    match expr {
-        None => Ok(()),
-        Some(Expr::And(left, right)) | Some(Expr::Or(left, right)) => {
-            validate_filter(schema, Some(left))?;
-            validate_filter(schema, Some(right))
-        }
-        Some(Expr::Cmp { col, lit, .. }) => {
-            let index = schema.col_index(col).ok_or(DbError::ColumnNotFound)?;
-            match (&schema.columns[index].kind, lit) {
-                (ColKind::BigInt, Literal::Int(_)) | (ColKind::Varchar(_), Literal::Str(_)) => Ok(()),
-                (ColKind::Vector(_), _) => Err(DbError::UnsupportedSql),
-                _ => Err(DbError::TypeMismatch),
-            }
-        }
-    }
-}
-
-fn eval_filter(schema: &Schema, row: &Row, expr: Option<&Expr>) -> DbResult<bool> {
-    match expr {
-        None => Ok(true),
-        Some(Expr::And(left, right)) => Ok(eval_filter(schema, row, Some(left))?
-            && eval_filter(schema, row, Some(right))?),
-        Some(Expr::Or(left, right)) => Ok(eval_filter(schema, row, Some(left))?
-            || eval_filter(schema, row, Some(right))?),
-        Some(Expr::Cmp { col, op, lit }) => {
-            let index = schema.col_index(col).ok_or(DbError::ColumnNotFound)?;
-            let ordering = compare_literal(&row.vals[index], lit)?;
-            Ok(match op {
-                CmpOp::Eq => ordering == Ordering::Equal,
-                CmpOp::Ne => ordering != Ordering::Equal,
-                CmpOp::Lt => ordering == Ordering::Less,
-                CmpOp::Le => ordering != Ordering::Greater,
-                CmpOp::Gt => ordering == Ordering::Greater,
-                CmpOp::Ge => ordering != Ordering::Less,
-            })
-        }
-    }
-}
-
-fn compare_literal(value: &VVal, literal: &Literal) -> DbResult<Ordering> {
-    match (value, literal) {
-        (VVal::Int(left), Literal::Int(right)) => Ok(left.cmp(right)),
-        (VVal::Str(left), Literal::Str(right)) => Ok(left.cmp(right)),
-        _ => Err(DbError::TypeMismatch),
     }
 }
 

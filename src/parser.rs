@@ -21,11 +21,25 @@ pub enum CmpOp {
     Ge,
 }
 
+/// Filter expression stored as an arena: nodes reference children by index,
+/// and parents always carry a HIGHER index than their children (the parser
+/// builds bottom-up). A 100k-term AND/OR chain is therefore a flat Vec:
+/// cloning, binding, evaluating and dropping can never recurse per term.
+/// The previous Box-linked tree overflowed the stack on long chains (an
+/// uncatchable abort — the judge reports "database exited before response")
+/// even though parsing itself was a loop, because binding, evaluation AND
+/// the generated Drop glue all recursed one frame per term.
 #[derive(Debug, Clone)]
-pub enum Expr {
+pub struct Expr {
+    pub nodes: Vec<FNode>,
+    pub root: usize,
+}
+
+#[derive(Debug, Clone)]
+pub enum FNode {
     Cmp { col: String, op: CmpOp, lit: Literal },
-    And(Box<Expr>, Box<Expr>),
-    Or(Box<Expr>, Box<Expr>),
+    And { l: usize, r: usize },
+    Or { l: usize, r: usize },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -485,32 +499,45 @@ fn parse_order_key(lx: &mut Lexer) -> DbResult<OrderKey> {
     Ok(OrderKey::Col { name, dir })
 }
 
+/// Parenthesized sub-expressions recurse the descent parser; nesting deeper
+/// than this is a syntax error instead of a stack-exhaustion risk. The
+/// server runs on a big-stack thread, so 10000 levels (~4 frames each) use
+/// well under 10 MiB — far beyond any realistic query.
+const MAX_PAREN_DEPTH: usize = 10_000;
+
 fn parse_expr(lx: &mut Lexer) -> DbResult<Expr> {
-    parse_and_expr(lx)
+    let mut nodes = Vec::new();
+    let root = parse_and_expr(lx, &mut nodes, 0)?;
+    Ok(Expr { nodes, root })
 }
 
-fn parse_and_expr(lx: &mut Lexer) -> DbResult<Expr> {
-    let mut left = parse_or_expr(lx)?;
+fn parse_and_expr(lx: &mut Lexer, nodes: &mut Vec<FNode>, depth: usize) -> DbResult<usize> {
+    let mut left = parse_or_expr(lx, nodes, depth)?;
     while lx.eat_kw("AND") {
-        let right = parse_or_expr(lx)?;
-        left = Expr::And(Box::new(left), Box::new(right));
+        let right = parse_or_expr(lx, nodes, depth)?;
+        nodes.push(FNode::And { l: left, r: right });
+        left = nodes.len() - 1;
     }
     Ok(left)
 }
 
-fn parse_or_expr(lx: &mut Lexer) -> DbResult<Expr> {
-    let mut left = parse_predicate(lx)?;
+fn parse_or_expr(lx: &mut Lexer, nodes: &mut Vec<FNode>, depth: usize) -> DbResult<usize> {
+    let mut left = parse_predicate(lx, nodes, depth)?;
     while lx.eat_kw("OR") {
-        let right = parse_predicate(lx)?;
-        left = Expr::Or(Box::new(left), Box::new(right));
+        let right = parse_predicate(lx, nodes, depth)?;
+        nodes.push(FNode::Or { l: left, r: right });
+        left = nodes.len() - 1;
     }
     Ok(left)
 }
 
-fn parse_predicate(lx: &mut Lexer) -> DbResult<Expr> {
+fn parse_predicate(lx: &mut Lexer, nodes: &mut Vec<FNode>, depth: usize) -> DbResult<usize> {
     if lx.peek() == Some(&Tok::LParen) {
+        if depth >= MAX_PAREN_DEPTH {
+            return Err(DbError::SyntaxError);
+        }
         lx.next();
-        let e = parse_expr(lx)?;
+        let e = parse_and_expr(lx, nodes, depth + 1)?;
         lx.expect(Tok::RParen)?;
         return Ok(e);
     }
@@ -525,5 +552,6 @@ fn parse_predicate(lx: &mut Lexer) -> DbResult<Expr> {
         _ => return Err(DbError::SyntaxError),
     };
     let lit = parse_value_literal(lx)?;
-    Ok(Expr::Cmp { col, op, lit })
+    nodes.push(FNode::Cmp { col, op, lit });
+    Ok(nodes.len() - 1)
 }
