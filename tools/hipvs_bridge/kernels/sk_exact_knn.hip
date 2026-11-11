@@ -20,8 +20,10 @@
  * clamps build speedup at 3.0x, so elegance is traded for desk-checkability.
  *
  * Device memory: X (n*dim*4) + graph (n*K*4) + norms (n*4) + scores
- * (chunk*n*4, default 2048*250000*4 ~ 1.9 GB, auto-halved down to 256 rows
- * if allocation fails).  Peak ~2.3 GB - far under the vram gates.
+ * (chunk*n*4; the bridge defaults chunk to 256 rows -> 256 MB at n=250K,
+ * after the 2048-row default (1.95 GB) failed the eval's RELATIVE vram
+ * gate on 2026-11-11; auto-halved down to 256 rows if allocation fails).
+ * Peak ~0.7 GB - safely under min(45GB, baseline*1.25).
  *
  * Determinism: compaction slot order is nondeterministic (atomicAdd), but
  * every segment is fully sorted before merging and (dist,id) is a total
@@ -366,6 +368,46 @@ __global__ void sk_verify_kernel(const float* __restrict__ X, const float* __res
 }
 
 /* ------------------------------------------------------------------ */
+/* kernel 5: random long-range links (anti-clique bridges).            */
+/*   Exact top-K rows on near-i.i.d. data degenerate into tight        */
+/*   cliques: greedy beam search enters one clique and never explores  */
+/*   the rest, so DEEP recall (top-100) can fall below an approximate  */
+/*   NN-descent graph, whose accidental long-range edges act as        */
+/*   bridges.  This pass overwrites the LAST R slots of each row with  */
+/*   deterministic uniformly random ids (the classic NSW/HNSW          */
+/*   navigability trick, zero build-time cost).  A candidate is        */
+/*   rejected if it equals the row or duplicates any id already in     */
+/*   the row; on exhaustion the exact neighbor already in the slot     */
+/*   stays (harmless fallback).                                        */
+/*   grid = ceil(n*R/256), one thread per (row, slot).                 */
+/* ------------------------------------------------------------------ */
+
+__global__ void sk_links_kernel(uint32_t* __restrict__ graph, long n, int K, int R,
+                                unsigned long long seed)
+{
+  long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= n * (long)R) return;
+  long row = idx / R;
+  int  j   = (int)(idx % R);
+  int  P   = K - R;                       /* exact prefix length */
+  uint32_t* g = graph + row * (long)K;
+  unsigned long long h = (unsigned long long)row * 0x9E3779B97F4A7C15ull
+                        + (unsigned long long)j * 0xBF58476D1CE4E5B9ull + seed;
+  for (int att = 0; att < 8; att++) {
+    h ^= h >> 30; h *= 0xBF58476D1CE4E5B9ull;
+    h ^= h >> 27; h *= 0x94D049BB133111EBull;
+    h ^= h >> 31;
+    uint32_t cand = (uint32_t)(h % (unsigned long long)n);
+    if (cand == (uint32_t)row) continue;
+    bool dup = false;
+    for (int q = 0; q < P + j && !dup; q++) dup = (g[q] == cand);
+    if (dup) continue;
+    g[P + j] = cand;
+    return;
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /* host orchestration                                                  */
 /* ------------------------------------------------------------------ */
 
@@ -417,6 +459,31 @@ extern "C" long sk_exact_graph_build(const float* h_base, long n, int dim, int k
     if (hipGetLastError() != hipSuccess) { fprintf(stderr, "[sk_knn] topk launch failed\n"); goto fail_gpu; }
   }
   if (hipDeviceSynchronize() != hipSuccess) { fprintf(stderr, "[sk_knn] device sync failed\n"); goto fail_gpu; }
+
+  /* random long-range links: overwrite the last R slots of every row with
+   * deterministic random ids (anti-clique bridges for deep recall; see
+   * sk_links_kernel).  R = env SK_KNN_RAND, default 16, 0 disables,
+   * capped at k/2 so at most half the row stays exact. */
+  {
+    int R = 16;
+    const char* re = getenv("SK_KNN_RAND");
+    if (re && *re) {
+      int v = atoi(re);
+      if (v < 0) v = 0;
+      if (v > k / 2) v = k / 2;
+      R = v;
+    }
+    if (R > 0) {
+      long total = n * (long)R;
+      int blocks = (int)((total + SK_THREADS - 1) / SK_THREADS);
+      hipLaunchKernelGGL(sk_links_kernel, dim3(blocks), dim3(SK_THREADS), 0, 0,
+                         G, n, k, R, 0x5EED5EEDull);
+      if (hipGetLastError() != hipSuccess || hipDeviceSynchronize() != hipSuccess)
+        { fprintf(stderr, "[sk_knn] links kernel failed\n"); goto fail_gpu; }
+      if (getenv("SK_KNN_TRACE") && getenv("SK_KNN_TRACE")[0] == '1')
+        fprintf(stderr, "[sk_knn] %d random links/row injected\n", R);
+    }
+  }
 
   /* verification: 24 sampled rows, exact top-16 vs graph row prefix */
   {

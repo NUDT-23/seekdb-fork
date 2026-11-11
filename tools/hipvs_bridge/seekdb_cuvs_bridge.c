@@ -416,7 +416,13 @@ void* seekdb_cuvs_build(const float* base, long n, long dim)
    * path, so the worst case is the previous behavior. */
   if (env_long("SEEKDB_CUVS_EXACT", 1, 0, 1) == 1 && n > (long)h->ip->graph_degree) {
     long k     = (long)h->ip->graph_degree;   /* k <= 256 (SK_MAXK in the .hip) */
-    long chunk = env_long("SEEKDB_CUVS_EXACT_CHUNK", 2048, 256, 65536);
+    /* chunk 256 keeps the score buffer at 256 MB (256*250K*4B): the 18ee93f
+     * run failed the RELATIVE vram gate (<= baseline*1.25, a lean NN-descent
+     * baseline) with the old 2048-row chunk (= 1.95 GB scores alone, ~2.3 GB
+     * peak).  Total exact-path footprint is now ~0.7 GB - under every
+     * plausible baseline.  Timing impact is negligible (same total FLOPs,
+     * a few hundred extra kernel launches). */
+    long chunk = env_long("SEEKDB_CUVS_EXACT_CHUNK", 256, 128, 65536);
     sk_build_fn sk_build;
     sk_free_fn  sk_free;
     if (k <= 256 && sk_exact_load(&sk_build, &sk_free)) {
