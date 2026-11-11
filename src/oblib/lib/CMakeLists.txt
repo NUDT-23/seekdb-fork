@@ -145,10 +145,21 @@ endif()
 # tools/hipvs_bridge/kernels/sk_exact_knn.hip into
 # libseekdb_sk_exact.so next to the bridge .so.  The bridge dlopen()s it at
 # runtime and silently falls back to cuvsCagraBuild when it is absent, and
-# the helper script itself never returns failure, so this target can never
-# break the seekdb build.
+# the helper script itself never returns failure, so this can never break
+# the configure or the build.
 if (OB_BUILD_CUVS AND EXISTS "${CUVS_BRIDGE_LIB}")
   get_filename_component(CUVS_BRIDGE_DIR "${CUVS_BRIDGE_LIB}" DIRECTORY)
+  # Built at CONFIGURE time on purpose: configure always runs, whereas
+  # custom targets are skipped by single-target build invocations.
+  execute_process(
+    COMMAND ${CMAKE_COMMAND} -E env bash
+            ${PROJECT_SOURCE_DIR}/tools/hipvs_bridge/build_kernel.sh
+            ${PROJECT_SOURCE_DIR}/tools/hipvs_bridge/kernels/sk_exact_knn.hip
+            ${CUVS_BRIDGE_DIR}/libseekdb_sk_exact.so
+    TIMEOUT 240
+    OUTPUT_QUIET
+    ERROR_QUIET)
+  # Belt and suspenders: also (re)build at make time in default builds.
   add_custom_target(sk_exact_kernel ALL
     COMMAND ${CMAKE_COMMAND} -E env bash
             ${PROJECT_SOURCE_DIR}/tools/hipvs_bridge/build_kernel.sh

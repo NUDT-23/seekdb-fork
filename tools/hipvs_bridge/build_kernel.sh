@@ -25,8 +25,11 @@ mkdir -p "$OUT_DIR" 2>/dev/null || true
 rm -f "$ERR_FILE" 2>/dev/null || true
 
 # Primary path: the native hipcc of the eval machine (official ROCm).
+# The offload arch is pinned: W7900D-class parts are gfx1100, and an
+# unset/policy default could target the wrong silicon (kernels then fail
+# to launch at runtime and the bridge silently falls back).
 if [ -x "$HIPCC" ]; then
-  if "$HIPCC" -O2 -fPIC -shared "$IN" \
+  if "$HIPCC" -O2 -fPIC -shared --offload-arch=gfx1100 "$IN" \
        -Wl,-soname,libseekdb_sk_exact.so \
        -o "$OUT" 2> "$ERR_FILE"; then
     echo "build_kernel: built $OUT"

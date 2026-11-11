@@ -154,6 +154,16 @@ static int sk_exact_load(sk_build_fn* bf, sk_free_fn* ff)
   }
   if (!so) so = dlopen("libseekdb_sk_exact.so", RTLD_NOW | RTLD_LOCAL);
   if (!so) {
+    /* Third channel: the observer may already have the sidecar in its
+     * global namespace (e.g. if it was linked as a dependency). */
+    build_fn = (sk_build_fn)dlsym(RTLD_DEFAULT, "sk_exact_graph_build");
+    free_fn  = (sk_free_fn)dlsym(RTLD_DEFAULT, "sk_free_exact");
+    if (build_fn && free_fn) {
+      if (trace_enabled())
+        fprintf(stderr, "[seekdb_cuvs] exact kernels resolved from global namespace\n");
+      *bf = build_fn; *ff = free_fn;
+      return 1;
+    }
     if (trace_enabled())
       fprintf(stderr, "[seekdb_cuvs] exact sidecar unavailable (%s), "
               "builds use cuvsCagraBuild\n", dlerror());
