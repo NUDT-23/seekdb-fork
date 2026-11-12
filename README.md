@@ -77,7 +77,7 @@ Both the `--command` (local binary) and `--image` (Docker) runs pass 20/20 publi
 - `UPDATE` (including vector values) and `DELETE`; primary-key updates are rejected.
 - `BEGIN`, `COMMIT`, `ROLLBACK`; autocommit outside an explicit transaction.
 
-Distance TopK filters first, then selects the K smallest distances. Ties always use ascending primary key. Exact mode returns distances accumulated in float64; ANN mode uses a float32 accumulator over stored float32 vectors. On the serial 128-dimensional flat-cache path, TopM=32 candidates are rescored from component zero with the original f64 kernel and accepted only when every excluded row is certified strictly worse than the exact Kth candidate. Candidate scanning has three certified levels: a table-scaled int8 mirror using exact integer SIMD, an RNE-f16 mirror, and the original full-f32 TopM pass. Int8 reads 128 bytes per row and f16 reads 256; both use quantization-aware lower bounds. Int8 uses one table-wide scale, so an all-zero table, an out-of-range query or an inadequate distance gap rejects that level. Failures fall back in the order int8 → f16 → f32 → the original full f64 scan, always discarding intermediate heaps. Thus exact distances, row selection and primary-key ties are unchanged. Other dimensions, parallel scans, transactions and K>=32 use the original path. Small-table ANN may probe IVF lists; larger tables fall back to bounded exact scanning.
+Distance TopK filters first, then selects the K smallest distances. Ties always use ascending primary key. Exact mode returns distances accumulated in float64; ANN mode uses a float32 accumulator over stored float32 vectors. On the serial 128-dimensional flat-cache path, TopM=32 candidates are rescored from component zero with the original f64 kernel and accepted only when every excluded row is certified strictly worse than the exact Kth candidate. Candidate scanning has three certified levels: a table-scaled int8 mirror using exact integer SIMD, an RNE-f16 mirror, and the original full-f32 TopM pass. Int8 reads 128 bytes per row and f16 reads 256; both use quantization-aware lower bounds. Int8 uses one table-wide scale, so an all-zero table, an out-of-range query or an inadequate distance gap rejects that level. Each snapshot keeps one compressed mirror: int8 when available, otherwise f16. Its failure falls back to f32 and then the original full f64 scan, always discarding intermediate heaps. Thus exact distances, row selection and primary-key ties are unchanged. Other dimensions, parallel scans, transactions and K>=32 use the original path. Small-table ANN may probe IVF lists; larger tables fall back to bounded exact scanning.
 
 Unsupported SQL fails explicitly rather than being reinterpreted. The implementation rejects NULL, JOIN, aggregation, subqueries, ALTER/DROP, primary-key updates, unsupported scalar types, and nested transactions.
 
@@ -139,6 +139,67 @@ Larger-than-memory verification uses `tools/judge_sim.py` with the official refe
 
 ## Known gaps
 
+The latest formal evaluation is commit `48a23c603ad3faec50e7b842011faa4427c91447`
+(2026-11-12): functional admission passed, performance E=3516.901115 and valid
+Agent Prompt raw score=3.5. The current candidate additionally
+memoizes one filter's row positions per scan snapshot (at most 131072 rows and
+32 filter instructions; otherwise the original streaming filter applies), and
+keeps int8 TopM candidates in exact integer distance order before applying the
+shared scale for the certificate. Original-f64 rescoring and strict fallback
+remain in place. Data-version rebuilds discard the filter memo.
+
+Two local seeds with result-cache hits explicitly cleared before each timed
+block measured native query improvements of 20.64%/18.34% and official-flags
+Docker improvements of 9.02%/6.55% against the latest formal version. Full truth
+and baseline results matched, with both recall groups at 1.0. Tests passed:
+18 release units, official 20/20, extended 6/6, deep input, panic/ANN checks and
+2.25 GB streaming recovery (208.7 s, exit 0). Repeated result-cache hits showed
+essentially no additional gain, and median cgroup peak stayed about 31.9 MB.
+These local results do not establish E>=5000. On 2026-11-12 the user explicitly
+authorized using the remaining daily formal attempt with this validated candidate;
+its new platform scores are pending.
+
+The current candidate also advises Linux to reclaim complete, clean
+pages in each newly appended WAL range after `sync_data`, while the WAL fits
+the vector arena budget. This reduces duplicate file-cache and arena storage;
+larger WALs retain their cache for disk-backed reads. The advice is optional
+and does not change file bytes, durable row locations or acknowledgement order.
+Three alternating official-flags resource pairs measured median cgroup peak
+32,538,624 -> 26,472,448 bytes (-18.64%). Repeated-query median time changed
+0.42948 -> 0.41591 s (+3.16%, below the performance adoption gate); prior
+12-pair write checks were flat (+0.14% native, -0.26% Docker), with identical
+WAL hashes in every pair. This change is retained for memory savings.
+Release units 18/18, public protocol cases 20/20, extended 6/6, deep input and
+panic/ANN checks pass. The 2.25 GB streaming/recovery case passed in 193.8 s;
+a targeted nonzero-arena test also verified durable vector projections after
+scan-cache eviction, two SIGKILL recoveries and repeated forced checkpoints.
+Timing figures remain local evidence and do not predict the full platform E.
+
+The candidate also builds only one compressed mirror: when int8 construction
+succeeds it omits f16, retaining the original f32 candidate pass and f64 scan
+for certificate failures. Three alternating resource pairs measured median
+peak 26,529,792 -> 24,006,656 bytes (-9.51%); miss-query time was +3.66% native
+and -0.76% Docker, so this is a memory change. A fresh cumulative comparison
+against the formal binary measured 7.65% faster Docker query misses with full
+independent truth, and peak 32,145,408 -> 23,568,384 bytes (-26.68%); repeated
+query hits were flat. Current checks pass 19 release units, public 20/20,
+extended 6/6, deep inputs, advised-WAL readback and forced checkpoint recovery.
+The 1,100,000x512 streaming chain passed with exit 0 in 205.0 s. Source-level
+regression results and local ratios still do not establish E>=5000.
+
+New vector records can use a lossless 16-entry dictionary for their most
+significant byte, preserving the other 24 bits verbatim and using a four-bit
+dictionary index. Vectors with too many distinct high bytes or fewer than
+32 components retain the original encoding. New readers accept both tags;
+WAL recovery records the actual encoded row length instead of recomputing it.
+The older executable cannot read the new tag. Three local resource pairs
+measured physical writes 5,931,008 -> 5,386,240 bytes (-9.19%), with no time
+or memory gain claimed (peak +0.88%; Docker writes -0.29%, queries +0.44%).
+Bit-exact encoding units, old/mixed-WAL and packed-checkpoint zero-arena
+readback, public 20/20, extended 6/6, deep input, 20 random crash cycles and
+the 2.25 GB recovery chain all pass (191.4 s, exit 0). This candidate changes
+the durable encoding; new readers accept legacy and packed records.
+
 The 2026-11-12 candidate adds a process-local result cache for repeated identical
 SELECT statements with LIMIT 1..128 outside explicit transactions. It defaults to
 8 MiB (`MINIVEC_RESULT_CACHE_MB=0` disables it), has a 2048-entry ceiling and
@@ -161,4 +222,11 @@ limits and exact internal evidence references in both synchronized JSON copies.
 1. The official protocol is now published (`STDIO_PROTOCOL.md`, commit `f4d4e2665`) and fully implemented; the frozen platform-side error-code mapping (`config.json "error_codes"`) is still empty locally, so error codes beyond the public cases' vocabulary are our semantic names (the judge currently only requires a non-empty `error.code` string).
 2. IVF-Flat ANN is implemented (deterministic k-means, inverted lists, incremental maintenance, restart rebuild) but recall on 128-dim uniform benchmark data is ~0.84, below the 0.95 bar, so submission mode is exact scanning. IVF remains enabled for `search_mode:"ann"` on smaller/clusterable datasets.
 3. Single-client and single-transaction limits are intentional. No network protocol, NULL, joins, aggregates, distributed execution or concurrent transaction support is provided.
-4. The certified TopM acceleration is restricted to serial, 128-dimensional flat-cache TopK with K<32 and a default IEEE arithmetic environment; f16 additionally requires F16C and int8 requires AVX2 plus enough cache budget for the mirrors. Int8's table-wide scale can be ineffective on skewed data, and duplicate-heavy or otherwise certificate-failing inputs pay for one or more candidate passes before the full f64 fallback. WSL and local Docker gains are controlled local measurements only; the current platform score and rank remain those of commit `7979f8d3c` until a later formal evaluation.
+4. The certified TopM acceleration is restricted to serial, 128-dimensional flat-cache TopK with K<32 and a default IEEE arithmetic environment; f16 additionally requires F16C and int8 requires AVX2 plus enough cache budget for the mirrors. Int8's table-wide scale can be ineffective on skewed data, and duplicate-heavy or otherwise certificate-failing inputs pay for one or more candidate passes before the full f64 fallback. WSL and local Docker gains are controlled local measurements only; the current platform score remains E=3516.901115 from commit `48a23c603` until a later formal evaluation.
+
+Submission preparation on 2026-11-12: final source matches the retained validated
+candidate. Fresh checks pass 20 release units, 20 public official cases, six
+extended groups, deep inputs, durable readback/forced checkpoints and 20 random
+crash cycles. Commit uses actual serialized row lengths without a second
+dictionary pass. Learning materials are identical UTF-8 JSON copies below
+128 KiB with exact internal evidence references; no new score is predicted.

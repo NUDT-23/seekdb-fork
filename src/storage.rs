@@ -44,6 +44,32 @@ const CRC_POLY: u32 = 0xEDB8_8320;
 #[cfg(test)]
 mod crc_tests {
     #[test]
+    fn packed_vectors_preserve_bits_lengths_and_old_rows() {
+        use super::*;
+        for dim in [0,1,31,32,33,127,128,129,512] {
+            let vector: Vec<f32> = (0..dim).map(|i| f32::from_bits(
+                (([0x3eu32,0x3f,0xbe,0xbf][i%4])<<24) | (i as u32*17171 & 0xffffff))).collect();
+            let row = Row { pk:9, vals:vec![VVal::Vec(Some(Rc::new(vector.clone()))) ]};
+            let mut encoded=Buf::new();put_row(&mut encoded,&row).unwrap();
+            assert_eq!(encoded.b.len(),row_len(&row).unwrap() as usize);
+            let mut cur=Cur::new(&encoded.b);let decoded=get_row(&mut cur).unwrap();
+            assert_eq!(cur.p,encoded.b.len());
+            assert_eq!(decoded.cached_vec(0).unwrap().iter().map(|f| f.to_bits()).collect::<Vec<_>>(),vector.iter().map(|f|f.to_bits()).collect::<Vec<_>>());
+            let mut old=Buf::new();old.i64(9);old.u32(1);old.u8(VT_VEC);old.u32(dim as u32);
+            for f in &vector { old.f32(*f); }
+            assert_eq!(get_row(&mut Cur::new(&old.b)).unwrap().cached_vec(0).unwrap().iter().map(|f|f.to_bits()).collect::<Vec<_>>(),vector.iter().map(|f|f.to_bits()).collect::<Vec<_>>());
+        }
+        let arbitrary:Vec<f32>=(0..128).map(|i|f32::from_bits((i as u32)<<24)).collect();
+        assert!(vector_dictionary(&arbitrary).is_none());
+        let edge:Vec<f32>=[0,0x80000000,1,0x80000001,0x7f7fffff,0xff7fffff].into_iter()
+            .cycle().take(129).map(f32::from_bits).collect();
+        let row=Row {pk:-1,vals:vec![VVal::Vec(Some(Rc::new(edge.clone())))]};
+        let mut encoded=Buf::new();put_row(&mut encoded,&row).unwrap();
+        assert_eq!(encoded.b.len(),row_len(&row).unwrap() as usize);
+        assert_eq!(get_row(&mut Cur::new(&encoded.b)).unwrap().cached_vec(0).unwrap().iter().map(|f|f.to_bits()).collect::<Vec<_>>(),edge.iter().map(|f|f.to_bits()).collect::<Vec<_>>());
+        for count in 0..encoded.b.len() { assert!(get_row(&mut Cur::new(&encoded.b[..count])).is_err()); }
+    }
+    #[test]
     fn known_vectors() {
         assert_eq!(super::crc32(b"123456789"), 0xCBF4_3926);
         assert_eq!(super::crc32(b""), 0x0000_0000);
@@ -176,6 +202,23 @@ const TAG_CREATE_VINDEX: u8 = 4;
 const VT_INT: u8 = 1;
 const VT_STR: u8 = 2;
 const VT_VEC: u8 = 3;
+const VT_VEC_PACKED: u8 = 4;
+
+// A sixteen-entry dictionary for the most-significant byte preserves all32bits.
+// Repeated exponents/signs save four bits per component; arbitrary vectors
+// retain the original encoding when the dictionary would not fit.
+fn vector_dictionary(vector: &[f32]) -> Option<Vec<u8>> {
+    if vector.len() < 32 { return None; }
+    let mut dict = Vec::with_capacity(16);
+    for value in vector {
+        let byte = (value.to_bits() >> 24) as u8;
+        if !dict.contains(&byte) {
+            if dict.len() == 16 { return None; }
+            dict.push(byte);
+        }
+    }
+    Some(dict)
+}
 
 struct Buf {
     b: Vec<u8>,
@@ -258,10 +301,24 @@ fn put_row(buf: &mut Buf, row: &Row) -> DbResult<()> {
                 buf.str(v);
             }
             VVal::Vec(Some(v)) => {
-                buf.u8(VT_VEC);
-                buf.u32(v.len() as u32);
-                for f in v.iter() {
-                    buf.f32(*f);
+                if let Some(dict) = vector_dictionary(v) {
+                    buf.u8(VT_VEC_PACKED);
+                    buf.u32(v.len() as u32);
+                    buf.u8(dict.len() as u8);
+                    buf.b.extend_from_slice(&dict);
+                    for chunk in v.chunks(2) {
+                        let mut codes = 0u8;
+                        for (i, f) in chunk.iter().enumerate() {
+                            let bytes = f.to_bits().to_le_bytes();
+                        codes |= (dict.iter().position(|b| *b == bytes[3]).unwrap() as u8) << (i*4);
+                            buf.b.extend_from_slice(&bytes[..3]);
+                        }
+                        buf.u8(codes);
+                    }
+                } else {
+                    buf.u8(VT_VEC);
+                    buf.u32(v.len() as u32);
+                    for f in v.iter() { buf.f32(*f); }
                 }
             }
             // A durable write must never silently replace an evicted vector
@@ -288,6 +345,23 @@ fn get_row(cur: &mut Cur) -> DbResult<Row> {
                 }
                 VVal::Vec(Some(Rc::new(values)))
             }
+            VT_VEC_PACKED => {
+                let dim = cur.u32()? as usize;
+                let count = cur.u8()? as usize;
+                if !(1..=16).contains(&count) { return Err(DbError::Internal); }
+                let dict = cur.take(count)?.to_vec();
+                let mut values = Vec::with_capacity(dim.min(cur.b.len()));
+                while values.len() < dim {
+                    let n = (dim-values.len()).min(2);
+                    let bytes = cur.take(n*3)?;
+                    let codes = cur.u8()?;
+                    for i in 0..n {
+                        let high = *dict.get(((codes >> (i*4)) & 15) as usize).ok_or(DbError::Internal)?;
+                        values.push(f32::from_bits(u32::from_le_bytes([bytes[i*3],bytes[i*3+1],bytes[i*3+2],high])));
+                    }
+                }
+                VVal::Vec(Some(Rc::new(values)))
+            }
             _ => return Err(DbError::Internal),
         };
         vals.push(value);
@@ -295,6 +369,7 @@ fn get_row(cur: &mut Cur) -> DbResult<Row> {
     Ok(Row { pk, vals })
 }
 
+#[cfg(test)]
 fn row_len(row: &Row) -> DbResult<u32> {
     let mut n = 8usize + 4;
     for value in &row.vals {
@@ -302,7 +377,8 @@ fn row_len(row: &Row) -> DbResult<u32> {
         match value {
             VVal::Int(_) => n += 8,
             VVal::Str(s) => n += 4 + s.len(),
-            VVal::Vec(Some(v)) => n += 4 + v.len() * 4,
+            VVal::Vec(Some(v)) => n += 4 + vector_dictionary(v).map_or(v.len()*4,
+                |dict| 1+dict.len()+v.len()*3+v.len().div_ceil(2)),
             VVal::Vec(None) => return Err(DbError::Internal),
         }
     }
@@ -559,11 +635,16 @@ impl Store {
         let mut locs = Vec::new();
         for op in ops {
             let encoded = put_op(op)?;
-            if let WalOp::UpsertRow { row, .. } = op {
+            if let WalOp::UpsertRow { .. } = op {
                 // frame header (8) + LSN (8) + previous payload + op tag (1)
                 // + table id (4) = absolute row-payload offset.
                 let off = self.wal_len + 8 + payload.b.len() as u64 + 5;
-                locs.push(RowLoc { gen: 0, off, len: row_len(row)? });
+                // put_op already serialized the row. Its first five bytes
+                // are the operation tag and table id; reuse the actual row
+                // length instead of building its vector dictionary again.
+                let len = u32::try_from(encoded.b.len().checked_sub(5)
+                    .ok_or(DbError::Internal)?).map_err(|_| DbError::Internal)?;
+                locs.push(RowLoc { gen: 0, off, len });
             }
             payload.b.extend_from_slice(&encoded.b);
         }
@@ -578,6 +659,20 @@ impl Store {
         self.wal_since_checkpoint += frame.b.len() as u64;
         self.lsn += 1;
         self.apply_ops(ops, &locs);
+        #[cfg(target_os = "linux")]
+        if self.wal_len <= self.arena_budget as u64 {
+            use std::os::unix::io::AsRawFd;
+            extern "C" { fn posix_fadvise(fd: i32, offset: i64, len: i64, advice: i32) -> i32; }
+            // sync_data already completed. Small WALs duplicate vectors in
+            // the arena; advise reclaiming only complete clean pages from
+            // this append. The file and durable locations remain unchanged.
+            // Large WALs retain their cache for the disk-backed scan path.
+            let start = (self.wal_len - frame.b.len() as u64) & !4095;
+            let end = self.wal_len & !4095;
+            if end > start {
+                unsafe { posix_fadvise(self.wal_write.as_raw_fd(), start as i64, (end-start) as i64, 4); }
+            }
+        }
         Ok(locs)
     }
 
@@ -868,11 +963,14 @@ impl Store {
                     Ok(op) => op,
                     Err(_) => break 'frames,
                 };
-                if let WalOp::UpsertRow { row, .. } = &op {
+                if let WalOp::UpsertRow { .. } = &op {
                     locs.push(RowLoc {
                         gen: 0,
                         off: pos + 8 + op_start as u64 + 5,
-                        len: match row_len(row) {
+                        // Keep the original encoded length: replay may be
+                        // reading an older uncompressed row that this writer
+                        // would encode differently.
+                        len: match u32::try_from(cur.p-op_start-5) {
                             Ok(v) => v,
                             Err(_) => break 'frames,
                         },

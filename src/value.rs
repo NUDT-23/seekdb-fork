@@ -491,7 +491,7 @@ pub fn l2_distance_sq_topm_i8(a: &[i8], b: &[i8], scale_sq: f64) -> f64 {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn dist_sq_avx2_topm_i8(a: &[i8], b: &[i8]) -> i32 {
+pub unsafe fn dist_sq_avx2_topm_i8(a: &[i8], b: &[i8]) -> i32 {
     use std::arch::x86_64::{
         __m128i, _mm256_add_epi32, _mm256_cvtepi8_epi16, _mm256_madd_epi16,
         _mm256_setzero_si256, _mm256_storeu_si256, _mm256_sub_epi16, _mm_loadu_si128,
