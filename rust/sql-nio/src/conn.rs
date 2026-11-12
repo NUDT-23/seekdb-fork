@@ -47,9 +47,6 @@ pub(crate) struct ResponseWriter {
     pub(crate) active_generation: u64,
     pub(crate) next_mysql_seq: u8,
     pub(crate) batch: Vec<u8>,
-    pub(crate) capture_enabled: bool,
-    pub(crate) captured: Vec<u8>,
-    pub(crate) captured_complete: bool,
 }
 
 impl ResponseWriter {
@@ -58,9 +55,6 @@ impl ResponseWriter {
             active_generation: 0,
             next_mysql_seq: 0,
             batch: Vec::new(),
-            capture_enabled: false,
-            captured: Vec::new(),
-            captured_complete: true,
         }
     }
 
@@ -70,9 +64,6 @@ impl ResponseWriter {
         }
         self.active_generation = generation;
         self.next_mysql_seq = next_mysql_seq;
-        self.capture_enabled = false;
-        self.captured.clear();
-        self.captured_complete = true;
         true
     }
 
@@ -87,47 +78,9 @@ impl ResponseWriter {
         }
     }
 
-    pub(crate) fn clear_capture(&mut self) {
-        self.capture_enabled = false;
-        self.captured.clear();
-        if self.captured.capacity() > RETAINED_RESPONSE_CAPACITY {
-            self.captured.shrink_to(RETAINED_RESPONSE_CAPACITY);
-        }
-        self.captured_complete = true;
-    }
-
-    pub(crate) fn capture_active(&self) -> bool {
-        self.capture_enabled && self.captured_complete
-    }
-
-    pub(crate) fn capture_frames(&mut self, frames: &[u8]) {
-        if !self.capture_enabled || !self.captured_complete || frames.is_empty() {
-            return;
-        }
-        let Some(new_len) = self
-            .captured
-            .len()
-            .checked_add(frames.len())
-            .filter(|len| *len <= RESPONSE_CAPTURE_MAX_LEN)
-        else {
-            self.clear_capture();
-            self.captured_complete = false;
-            return;
-        };
-        if self.captured.try_reserve_exact(frames.len()).is_err() {
-            self.clear_capture();
-            self.captured_complete = false;
-            return;
-        }
-        let old_len = self.captured.len();
-        self.captured.resize(new_len, 0);
-        self.captured[old_len..].copy_from_slice(frames);
-    }
-
     pub(crate) fn finish(&mut self, generation: u64) -> bool {
         let matched = self.is_active(generation);
         self.clear_batch();
-        self.clear_capture();
         self.active_generation = 0;
         self.next_mysql_seq = 0;
         matched
@@ -135,7 +88,6 @@ impl ResponseWriter {
 
     pub(crate) fn repair_for_completion(&mut self, generation: u64) {
         self.clear_batch();
-        self.clear_capture();
         self.active_generation = generation;
         self.next_mysql_seq = 0;
     }

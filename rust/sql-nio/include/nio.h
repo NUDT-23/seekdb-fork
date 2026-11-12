@@ -538,20 +538,6 @@ int nio_response_flush(nio_connection_handle *connection_handle,
                        uint64_t generation,
                        int is_final);
 
-int nio_response_capture(nio_connection_handle *connection_handle,
-                         uint64_t generation,
-                         char *response,
-                         int64_t response_len,
-                         int64_t *captured_len);
-
-int nio_response_replay(nio_connection_handle *connection_handle,
-                        uint64_t generation,
-                        const char *response,
-                        int64_t response_len);
-
-int nio_response_capture_start(nio_connection_handle *connection_handle,
-                               uint64_t generation);
-
 /* Generation-scoped finalization uses the same opaque connection handle.
  * auth_outcome is a nio_auth_outcome value; see its definition. */
 int nio_prepare_commit(nio_connection_handle *connection_handle,

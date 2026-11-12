@@ -1085,50 +1085,6 @@ int ObMPPacketSender::flush_buffer(const bool is_last) {
   return ret;
 }
 
-int ObMPPacketSender::capture_response(char *response, const int64_t response_len,
-                                       int64_t &captured_len) {
-  int ret = OB_SUCCESS;
-  captured_len = 0;
-  if (OB_UNLIKELY(!is_conn_valid())) {
-    ret = OB_CONNECT_ERROR;
-  } else if (OB_UNLIKELY(RequestOwnership::OWNED != request_ownership_) ||
-             OB_ISNULL(req_) || OB_ISNULL(response)) {
-    ret = OB_ERR_UNEXPECTED;
-  } else if (0 != nio_response_capture(nio_connection_handle_, request_generation_,
-                                       response, response_len, &captured_len)) {
-    ret = OB_SIZE_OVERFLOW;
-  }
-  return ret;
-}
-
-int ObMPPacketSender::start_response_capture() {
-  int ret = OB_SUCCESS;
-  if (OB_UNLIKELY(!is_conn_valid())) {
-    ret = OB_CONNECT_ERROR;
-  } else if (OB_UNLIKELY(RequestOwnership::OWNED != request_ownership_) ||
-             OB_ISNULL(req_)) {
-    ret = OB_ERR_UNEXPECTED;
-  } else if (0 != nio_response_capture_start(nio_connection_handle_,
-                                             request_generation_)) {
-    ret = OB_ERR_UNEXPECTED;
-  }
-  return ret;
-}
-
-int ObMPPacketSender::replay_response(const char *response, const int64_t response_len) {
-  int ret = OB_SUCCESS;
-  if (OB_UNLIKELY(!is_conn_valid())) {
-    ret = OB_CONNECT_ERROR;
-  } else if (OB_UNLIKELY(RequestOwnership::OWNED != request_ownership_) ||
-             OB_ISNULL(req_) || OB_ISNULL(response) || response_len <= 0) {
-    ret = OB_ERR_UNEXPECTED;
-  } else if (0 != nio_response_replay(nio_connection_handle_, request_generation_,
-                                      response, response_len)) {
-    ret = OB_ERR_UNEXPECTED;
-  }
-  return ret;
-}
-
 int ObMPPacketSender::get_conn_id(uint32_t &sessid) const {
   int ret = OB_SUCCESS;
   ObSMConnection *conn = get_conn();
