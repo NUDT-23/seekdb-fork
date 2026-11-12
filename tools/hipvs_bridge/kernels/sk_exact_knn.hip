@@ -307,7 +307,6 @@ SK_W32 __global__ void sk_topk_kernel(const float* __restrict__ scores,
   const long  row = chunk_start + blockIdx.x;
   const float* srow = scores + (long)blockIdx.x * n;
   const float qn  = xn[row];
-
   bool init = false;
   for (long seg = 0; seg < n; seg += SK_THREADS) {
     long c = seg + t;
@@ -317,28 +316,46 @@ SK_W32 __global__ void sk_topk_kernel(const float* __restrict__ scores,
       v  = qn + xn[c] - 2.f * srow[c];    /* squared L2 up to monotone fold */
       id = (unsigned)c;
     }
+    /* own-slot write only: v/id stay in registers for the filter below; the
+     * cross-thread visibility barrier the original had here is redundant
+     * (every read before the sort is same-thread) and cost one __syncthreads
+     * per segment, 977x per row.  Sort paths sync before touching cv. */
     cv[t] = v; ci[t] = id;
-    __syncthreads();
 
     if (init) {
-      const float    mn = kv[K - 1];
+      const float    mn = kv[K - 1];     /* stable: last segment ended with a sync */
       const unsigned mi = ki[K - 1];
-      const float    ov = cv[t];
-      const unsigned oi = ci[t];
       if (t == 0) cnt = 0;
-      __syncthreads();
-      /* Collect survivors into slots [0, cnt) via atomics.  Non-survivors
-       * keep their original slots: every survivor is strictly better than
-       * (mn, mi) = the bag's worst, every non-survivor is not, so after the
-       * sort below all survivors sort before all non-survivors and the merge
-       * can simply use cv[0..cnt).  No sentinel overwrite needed (which
-       * would race with the atomic collection writes). */
-      if (sk_better(ov, oi, mn, mi)) {
+      __syncthreads();                   /* orders the cnt reset before the atomics */
+      /* Survivors beat the bag's worst.  Non-survivors keep their original
+       * slots: every survivor is strictly better than (mn, mi) and every
+       * non-survivor is not, so after the sort all survivors sort before all
+       * non-survivors and the merge can simply use cv[0..cnt). */
+      if (sk_better(v, id, mn, mi)) {
         int s = atomicAdd(&cnt, 1);
-        nv[s] = ov; ni[s] = oi;
+        nv[s] = v; ni[s] = id;
       }
-      __syncthreads();
-      if (cnt == 0) continue;              /* uniform branch: shared read after sync */
+      __syncthreads();                   /* cnt + nv visible */
+      if (cnt == 0) continue;            /* uniform branch: shared read after sync */
+
+      /* Single-survivor fast path: for a full bag the expected survivor count
+       * per 256-wide segment is 256*K/n ~= 0.13 (Poisson), so of the ~12% of
+       * segments that reach here, ~94% carry exactly ONE candidate.  Thread 0
+       * rank-inserts it straight into kv[0..K): no compaction, no sort, no
+       * merge - one barrier instead of ~39. */
+      if (cnt == 1) {
+        if (t == 0) {
+          float sv = nv[0]; unsigned si = ni[0];
+          int r = sk_lb(K, kv, ki, sv, si);
+          if (r < K) {
+            for (int q = K - 1; q > r; q--) { kv[q] = kv[q-1]; ki[q] = ki[q-1]; }
+            kv[r] = sv; ki[r] = si;
+          }
+        }
+        __syncthreads();
+        continue;
+      }
+
       /* compact survivors into cv[0..cnt), pad the rest: a survivor's atomic
        * slot is usually != its load slot, and the load slot would otherwise
        * keep a ghost copy that the sort slides back into the prefix,
@@ -346,9 +363,11 @@ SK_W32 __global__ void sk_topk_kernel(const float* __restrict__ scores,
       if (t < cnt) { cv[t] = nv[t]; ci[t] = ni[t]; }
       else         { cv[t] = FLT_MAX; ci[t] = 0xFFFFFFFFu; }
       __syncthreads();
+    } else {
+      __syncthreads();                   /* first segment: cv cross-visibility */
     }
 
-    sk_bitonic256(cv, ci);                 /* ascending; FLT_MAX padding sinks to end */
+    sk_bitonic256(cv, ci);               /* ascending; FLT_MAX padding sinks to end */
     __syncthreads();
 
     if (!init) {
