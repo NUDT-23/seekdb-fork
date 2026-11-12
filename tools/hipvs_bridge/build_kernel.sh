@@ -28,14 +28,23 @@ rm -f "$ERR_FILE" 2>/dev/null || true
 # The offload arch is pinned: W7900D-class parts are gfx1100, and an
 # unset/policy default could target the wrong silicon (kernels then fail
 # to launch at runtime and the bridge silently falls back).
+# -mwavefrontsize64: required by the WMMA builtin in sk_gemm_wmma_kernel
+# (its w64 variant demands the wavefrontsize64 target feature).
 if [ -x "$HIPCC" ]; then
-  if "$HIPCC" -O2 -fPIC -shared --offload-arch=gfx1100 "$IN" \
+  if "$HIPCC" -O2 -fPIC -shared --offload-arch=gfx1100 -mwavefrontsize64 "$IN" \
        -Wl,-soname,libseekdb_sk_exact.so \
        -o "$OUT" 2> "$ERR_FILE"; then
     echo "build_kernel: built $OUT"
     exit 0
   fi
-  echo "build_kernel: hipcc failed, trying clang++ hip front-end:" >&2
+  echo "build_kernel: hipcc failed, retrying without wmma flag / clang++ hip front-end:" >&2
+  cat "$ERR_FILE" >&2 2>/dev/null || true
+  if "$HIPCC" -O2 -fPIC -shared --offload-arch=gfx1100 "$IN" \
+       -Wl,-soname,libseekdb_sk_exact.so \
+       -o "$OUT" 2> "$ERR_FILE"; then
+    echo "build_kernel: built $OUT (no wmma flag)"
+    exit 0
+  fi
   cat "$ERR_FILE" >&2 2>/dev/null || true
 fi
 

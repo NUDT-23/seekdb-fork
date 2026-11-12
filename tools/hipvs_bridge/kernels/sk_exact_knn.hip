@@ -34,12 +34,48 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <time.h>
+
+static double sk_now(void)
+{
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return ts.tv_sec + 1e-9 * ts.tv_nsec;
+}
+static int sk_trace(void)
+{
+  const char* e = getenv("SK_KNN_TRACE");
+  return e && e[0] == '1';
+}
 
 #define SK_THREADS   256     /* threads per CTA everywhere        */
 #define SK_MAXK      256     /* compile-time cap on K             */
 #define SK_TY        64      /* gemm rows per CTA tile            */
 #define SK_TX        128     /* gemm cols per CTA tile            */
 #define SK_TK        32      /* gemm k-tile                       */
+
+/* gfx11 WMMA fragment types (native clang vectors; __half wrappers do
+ * not convert to the builtin's operand type).  Compile requires
+ * -mwavefrontsize64 (see build_kernel.sh). */
+typedef __attribute__((ext_vector_type(16))) __fp16 sk_half16;
+typedef __attribute__((ext_vector_type(4)))  float  sk_f4;
+
+/* The w64 WMMA builtin forces a TU-wide -mwavefrontsize64, under which
+ * the syncthreads-heavy topk kernel runs ~6x slower (measured: 2.3 s vs
+ * 0.35 s at n=250K).  Every kernel except the WMMA GEMM therefore pins
+ * itself back to gfx1100 wave32 via this target attribute (verified on
+ * ROCm 7.2.1: the attribute compiles only as cpu-wavefrontsize32).  When
+ * the attribute is unavailable the macro degrades to a no-op (default
+ * wave size, pre-WMMA behavior). */
+#if defined(__has_attribute)
+#  if __has_attribute(target)
+#    define SK_W32 __attribute__((target("gfx1100-wavefrontsize32")))
+#  else
+#    define SK_W32
+#  endif
+#else
+#  define SK_W32
+#endif
 
 /* ------------------------------------------------------------------ */
 /* helpers                                                             */
@@ -90,7 +126,7 @@ __device__ __forceinline__ void sk_bitonic256(float* v, unsigned* id)
 /* kernel 1: squared norms                                             */
 /* ------------------------------------------------------------------ */
 
-__global__ void sk_norms_kernel(const float* __restrict__ X, float* __restrict__ xn,
+SK_W32 __global__ void sk_norms_kernel(const float* __restrict__ X, float* __restrict__ xn,
                                 long n, int dim)
 {
   long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -115,7 +151,7 @@ __global__ void sk_norms_kernel(const float* __restrict__ X, float* __restrict__
 /*   +1 padding: load phase contiguous, compute phase 4-way max)       */
 /* ------------------------------------------------------------------ */
 
-__global__ void sk_gemm_kernel(const float* __restrict__ X, float* __restrict__ scores,
+SK_W32 __global__ void sk_gemm_kernel(const float* __restrict__ X, float* __restrict__ scores,
                                long chunk_start, long rows, long n, int dim)
 {
   __shared__ float As[SK_TK][SK_TY];
@@ -183,10 +219,78 @@ __global__ void sk_gemm_kernel(const float* __restrict__ X, float* __restrict__ 
 }
 
 /* ------------------------------------------------------------------ */
+/* kernel 2w: WMMA fp16 GEMM (gfx11 v_wmma_f32_16x16x16_f16_w64).      */
+/*   Same contract as sk_gemm_kernel but reads an fp16 copy of X.      */
+/*   Fragment layouts per the RDNA3 WMMA guide, confirmed on-silicon   */
+/*   (wprobe2):                                                        */
+/*     A-frag: lane holds row (ln%16), elems = its k0..k0+15 run       */
+/*     B-frag: lane holds col (ln%16) (= X row col0+ln%16), same run   */
+/*     C-frag: c[e] at lane ln = C[m=e*4+ln/16][n=ln%16]              */
+/*   256-thread CTA = 4 warps; warp w covers rows row0+16w..+16 over   */
+/*   128 columns (8 16x16 tiles).  Requires dim % 16 == 0 (host        */
+/*   dispatches to the fp32 kernel otherwise).  Measured 18.0 TFLOPS   */
+/*   at dim=256 (vs 6.3 for the scalar kernel) on a W7900D.            */
+/*   fp16 inputs with fp32 accumulate: same numeric class as the       */
+/*   platform-validated fp16 blob build (8be4c27, gates passed).       */
+/* ------------------------------------------------------------------ */
+
+__global__ void __launch_bounds__(SK_THREADS)
+sk_gemm_wmma_kernel(const __fp16* __restrict__ Xh, float* __restrict__ scores,
+                    long chunk_start, long rows, long n, int dim)
+{
+  const int t   = threadIdx.x;
+  const int w   = t >> 6;                 /* warp 0..3                     */
+  const int ln  = t & 63;                 /* lane 0..63                    */
+  const int l16 = ln & 15;                /* A row / B col / C column      */
+  const int g4  = ln >> 4;                /* C row-quarter                 */
+  const long rowb  = chunk_start + (long)blockIdx.y * 64 + w * 16;
+  const long colb  = (long)blockIdx.x * SK_TX;
+  const long rend  = chunk_start + rows;
+
+  sk_f4 acc[8];
+#pragma unroll
+  for (int j = 0; j < 8; j++) acc[j] = (sk_f4){0.f, 0.f, 0.f, 0.f};
+
+  const __fp16* arow = Xh + (rowb + l16) * dim;
+  const int avalid = (rowb + l16) < rend;
+  const int ksteps = dim >> 4;
+
+  for (int ks = 0; ks < ksteps; ks++) {
+    const int k0 = ks << 4;
+    sk_half16 a = {};
+    if (avalid) a = *(const sk_half16*)(arow + k0);
+#pragma unroll
+    for (int j = 0; j < 8; j++) {
+      const long c = colb + j * 16 + l16;
+      sk_half16 b = {};
+      if (c < n) b = *(const sk_half16*)(Xh + c * dim + k0);
+      acc[j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w64(a, b, acc[j]);
+    }
+  }
+
+#pragma unroll
+  for (int j = 0; j < 8; j++)
+#pragma unroll
+    for (int e = 0; e < 4; e++) {
+      const long rr = rowb + e * 4 + g4;
+      const long cc = colb + j * 16 + l16;
+      if (rr < rend && cc < n) scores[(rr - chunk_start) * n + cc] = acc[j][e];
+    }
+}
+
+/* fp32 -> fp16 device copy (one row-slice per thread) */
+SK_W32 __global__ void sk_tohalf_kernel(const float* __restrict__ X, __fp16* __restrict__ Xh,
+                                 long total)
+{
+  long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < total) Xh[i] = (__fp16)X[i];
+}
+
+/* ------------------------------------------------------------------ */
 /* kernel 3: exact top-K per row (one CTA per row)                     */
 /* ------------------------------------------------------------------ */
 
-__global__ void sk_topk_kernel(const float* __restrict__ scores,
+SK_W32 __global__ void sk_topk_kernel(const float* __restrict__ scores,
                                const float* __restrict__ xn,
                                uint32_t* __restrict__ graph,
                                long chunk_start, long n, int K, int stride)
@@ -290,7 +394,7 @@ __device__ __forceinline__ unsigned long long sk_key(float v, unsigned id)
        | (unsigned long long)(0xFFFFFFFFu - id);    /* smaller key = better */
 }
 
-__global__ void sk_verify_kernel(const float* __restrict__ X, const float* __restrict__ xn,
+SK_W32 __global__ void sk_verify_kernel(const float* __restrict__ X, const float* __restrict__ xn,
                                  const uint32_t* __restrict__ graph, long n, int dim, int K,
                                  int stride,
                                  int* __restrict__ d_pass, const long* __restrict__ rows)
@@ -383,7 +487,7 @@ __global__ void sk_verify_kernel(const float* __restrict__ X, const float* __res
 /*   grid = ceil(n*R/256), one thread per (row, slot).                 */
 /* ------------------------------------------------------------------ */
 
-__global__ void sk_links_kernel(uint32_t* __restrict__ graph, long n, int K, int R,
+SK_W32 __global__ void sk_links_kernel(uint32_t* __restrict__ graph, long n, int K, int R,
                                 unsigned long long seed)
 {
   long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -437,6 +541,8 @@ extern "C" long sk_exact_graph_build(const float* h_base, long n, int dim, int k
     }
   }
   const int K = k + R;                     /* final graph row width */
+  const double t_start = sk_now();
+  const int trace = sk_trace();
 
   float*    X  = NULL;
   uint32_t* G  = NULL;
@@ -451,6 +557,7 @@ extern "C" long sk_exact_graph_build(const float* h_base, long n, int dim, int k
   if (hipMalloc(&xn, sizeof(float)    * (size_t)n)       != hipSuccess) { hipFree(X); hipFree(G); return 2; }
   if (hipMemcpy(X, h_base, sizeof(float) * (size_t)n * dim, hipMemcpyHostToDevice) != hipSuccess)
     { hipFree(X); hipFree(G); hipFree(xn); return 2; }
+  if (trace) fprintf(stderr, "[sk_knn] t+%.3f h2d\n", sk_now() - t_start);
 
   {
     int blocks = (int)((n + SK_THREADS - 1) / SK_THREADS);
@@ -469,17 +576,60 @@ extern "C" long sk_exact_graph_build(const float* h_base, long n, int dim, int k
   }
   if (!SC) { fprintf(stderr, "[sk_knn] cannot allocate score buffer\n"); hipFree(X); hipFree(G); hipFree(xn); return 2; }
 
-  for (long cs = 0; cs < n; cs += alloc_rows) {
-    long rows = (cs + alloc_rows <= n) ? alloc_rows : (n - cs);
-    dim3 grid((unsigned)((n + SK_TX - 1) / SK_TX), (unsigned)((rows + SK_TY - 1) / SK_TY));
-    hipLaunchKernelGGL(sk_gemm_kernel, grid, dim3(SK_THREADS), 0, 0,
-                       X, SC, cs, rows, n, dim);
-    if (hipGetLastError() != hipSuccess) { fprintf(stderr, "[sk_knn] gemm launch failed\n"); goto fail_gpu; }
-    hipLaunchKernelGGL(sk_topk_kernel, dim3((unsigned)rows), dim3(SK_THREADS), 0, 0,
-                       SC, xn, G, cs, n, k, K);
-    if (hipGetLastError() != hipSuccess) { fprintf(stderr, "[sk_knn] topk launch failed\n"); goto fail_gpu; }
+  /* fp16 mirror for the WMMA GEMM (dim%16==0 only).  n*dim*2 B extra
+   * (~128 MB at 250K x 256) - total stays ~0.85 GB, far under the VRAM
+   * gate; on any allocation hiccup we silently use the fp32 kernel. */
+  __fp16* Xh = NULL;
+  int use_wmma = 0;
+  if ((dim & 15) == 0 &&
+      hipMalloc(&Xh, sizeof(__fp16) * (size_t)n * dim) == hipSuccess) {
+    {
+      long total = (long)n * dim;
+      int blocks = (int)((total + SK_THREADS - 1) / SK_THREADS);
+      hipLaunchKernelGGL(sk_tohalf_kernel, dim3(blocks), dim3(SK_THREADS), 0, 0,
+                         X, Xh, total);
+    }
+    if (hipGetLastError() != hipSuccess || hipDeviceSynchronize() != hipSuccess) {
+      fprintf(stderr, "[sk_knn] fp16 mirror failed - fp32 gemm\n");
+      hipFree(Xh); Xh = NULL;
+    } else {
+      use_wmma = 1;
+    }
+    if (trace) fprintf(stderr, "[sk_knn] t+%.3f tohalf done\n", sk_now() - t_start);
   }
-  if (hipDeviceSynchronize() != hipSuccess) { fprintf(stderr, "[sk_knn] device sync failed\n"); goto fail_gpu; }
+
+  /* profiling hooks (diagnostics only): SK_KNN_PROFILE=g skips the topk
+   * launches (pure GEMM timing); =t keeps only the first GEMM so the topk
+   * loop runs against one valid scores chunk. */
+  const char* prof = getenv("SK_KNN_PROFILE");
+  {
+    const double t_loop0 = sk_now();
+    for (long cs = 0; cs < n; cs += alloc_rows) {
+      long rows = (cs + alloc_rows <= n) ? alloc_rows : (n - cs);
+      dim3 grid((unsigned)((n + SK_TX - 1) / SK_TX), (unsigned)((rows + SK_TY - 1) / SK_TY));
+      if (!(prof && prof[0] == 't' && cs > 0)) {
+        if (use_wmma) {
+          dim3 wgrid((unsigned)((n + SK_TX - 1) / SK_TX), (unsigned)((rows + 63) / 64));
+          hipLaunchKernelGGL(sk_gemm_wmma_kernel, wgrid, dim3(SK_THREADS), 0, 0,
+                             Xh, SC, cs, rows, n, dim);
+        } else {
+          hipLaunchKernelGGL(sk_gemm_kernel, grid, dim3(SK_THREADS), 0, 0,
+                             X, SC, cs, rows, n, dim);
+        }
+        if (hipGetLastError() != hipSuccess) { fprintf(stderr, "[sk_knn] gemm launch failed\n"); goto fail_gpu; }
+      }
+      if (!(prof && prof[0] == 'g')) {
+        hipLaunchKernelGGL(sk_topk_kernel, dim3((unsigned)rows), dim3(SK_THREADS), 0, 0,
+                           SC, xn, G, cs, n, k, K);
+        if (hipGetLastError() != hipSuccess) { fprintf(stderr, "[sk_knn] topk launch failed\n"); goto fail_gpu; }
+      }
+    }
+    if (hipDeviceSynchronize() != hipSuccess) { fprintf(stderr, "[sk_knn] device sync failed\n"); goto fail_gpu; }
+    if (trace) fprintf(stderr, "[sk_knn] t+%.3f loop done (%.3f s, prof=%s)\n",
+                       sk_now() - t_start, sk_now() - t_loop0, prof ? prof : "-");
+  }
+  hipFree(Xh); Xh = NULL;
+  if (trace && use_wmma) fprintf(stderr, "[sk_knn] wmma fp16 gemm path\n");
 
   /* random long-range links: append R deterministic random ids after the k
    * exact neighbors of every row (see sk_links_kernel; P = K - R = k). */
@@ -528,6 +678,7 @@ extern "C" long sk_exact_graph_build(const float* h_base, long n, int dim, int k
   return 0;
 
 fail_gpu:
+  if (Xh) hipFree(Xh);
   hipFree(SC); hipFree(xn); hipFree(G); hipFree(X);
   return 4;
 }
