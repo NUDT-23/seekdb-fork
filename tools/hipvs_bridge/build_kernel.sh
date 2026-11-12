@@ -30,7 +30,6 @@ rm -f "$ERR_FILE" 2>/dev/null || true
 # to launch at runtime and the bridge silently falls back).
 if [ -x "$HIPCC" ]; then
   if "$HIPCC" -O2 -fPIC -shared --offload-arch=gfx1100 "$IN" \
-       -L"$ROCM_ROOT/lib" -Wl,--no-as-needed -lhipblas \
        -Wl,-soname,libseekdb_sk_exact.so \
        -o "$OUT" 2> "$ERR_FILE"; then
     echo "build_kernel: built $OUT"

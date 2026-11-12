@@ -98,6 +98,13 @@ private:
   void check_is_trans_ctrl_cmd(const ObString &sql,
                                bool &is_trans_ctrl_cmd,
                                stmt::StmtType &stmt_type);
+  bool is_stmt_result_cacheable(const sql::ObMultiStmtItem &multi_stmt_item,
+                                sql::ObSQLSessionInfo &session,
+                                bool force_sync_resp,
+                                bool has_more_result) const;
+  int try_stmt_result_cache(sql::ObSQLSessionInfo &session,
+                            const sql::ObMultiStmtItem &multi_stmt_item,
+                            bool &cache_filled);
 
   void update_audit_info(const ObWaitEventStat &total_wait_desc,
                          ObAuditRecordData &record);
