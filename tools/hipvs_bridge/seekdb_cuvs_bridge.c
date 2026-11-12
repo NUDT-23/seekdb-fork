@@ -97,10 +97,14 @@ typedef struct {
 
 static int trace_enabled(void)
 {
+  /* Level 1: one summary line per build/serialize/search.
+   * Level 2 (SEEKDB_CUVS_TRACE=2): additionally per-phase search timing
+   * (lock wait, param prep, H2D, cuvsCagraSearch enqueue, device sync,
+   * D2H) to attribute observer-context overhead (~6ms) vs sim (~2.3ms). */
   static int cached = -1;
   if (cached < 0) {
     const char* v = getenv("SEEKDB_CUVS_TRACE");
-    cached = (v && v[0] == '1') ? 1 : 0;
+    cached = (v && atoi(v) > 0) ? atoi(v) : 0;
   }
   return cached;
 }
@@ -110,6 +114,75 @@ static long now_us(void)
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return (long)ts.tv_sec * 1000000L + ts.tv_nsec / 1000L;
+}
+
+/* Enable the RMM pool memory resource (process-global, once, opt-in only —
+ * see the crash note inside). The default cuda_memory_resource backs every
+ * temporary allocation inside cuvsCagraSearch with a raw hipMalloc/Free pair,
+ * which carries an implicit device sync and ~100us+ per call; a small pool
+ * carves search workspace from one up-front chunk instead. */
+static void sk_enable_rmm_pool(void)
+{
+  static int done = 0;
+  if (done) return;
+  done = 1;
+  /* Default OFF: cuvsRMMPoolMemoryResourceEnable segfaults the seekdb
+   * observer at first search (null upstream in owning_wrapper<pool>::
+   * do_allocate; works in the standalone sim). Opt in via
+   * SEEKDB_CUVS_RMM_POOL=1 (or "init,max" percents). */
+  const char* pe = getenv("SEEKDB_CUVS_RMM_POOL");
+  if (!pe || atoi(pe) <= 0) return;
+  int init_pct = 2, max_pct = 75;
+  if (strchr(pe, ',')) sscanf(pe, "%d,%d", &init_pct, &max_pct);
+  /* Warm the cuvs/CUDA machinery first (MR singleton, primary context): in a
+   * fresh observer process the pool enable ran on a virgin cuvs state and the
+   * pool's upstream ended up NULL -> segfault in do_allocate at first search.
+   * A throwaway resource + one roundtrip reproduces the simulator's
+   * build-then-search warm ordering. */
+  {
+    cuvsResources_t warm = 0;
+    if (cuvsResourcesCreate(&warm) == CUVS_SUCCESS) {
+      void* p = 0;
+      if (cuvsRMMAlloc(warm, &p, 1LL << 20) == CUVS_SUCCESS)
+        cuvsRMMFree(warm, p, 1LL << 20);
+      cuvsResourcesDestroy(warm);
+    }
+  }
+  if (cuvsRMMPoolMemoryResourceEnable(init_pct, max_pct, false) != CUVS_SUCCESS)
+    fprintf(stderr, "[seekdb_cuvs] rmm pool enable failed (ignored)\n");
+}
+
+/* One-shot raw-submission micro-bench (SEEKDB_CUVS_TRACE=3, first search).
+ * Attributes the observer-only ~2ms CPU-side tax inside cuvsCagraSearch to an
+ * operation class: async submit (memcpyAsync/memsetAsync) vs RMM alloc churn. */
+static void sk_micro_bench(sk_cuvs_index* h)
+{
+  const int N = 200;
+  /* Scratch: stay strictly inside q_dev (dim*4 bytes) — memset'ing ids_dev
+   * (topk*4) overflows the device heap at topk<128 and faults. */
+  const size_t bsz = h->dim * 4 < 512 ? (size_t)h->dim * 4 : 512;
+  long a = now_us();
+  for (int i = 0; i < N; i++)
+    cudaMemcpyAsync(h->q_dev, h->q_dev, bsz, cudaMemcpyDeviceToDevice, 0);
+  long b = now_us();
+  cudaStreamSynchronize(0);
+  long c = now_us();
+  for (int i = 0; i < N; i++)
+    cudaMemsetAsync(h->q_dev, 0, bsz, 0);
+  long d = now_us();
+  cudaStreamSynchronize(0);
+  long e = now_us();
+  long f = now_us();
+  for (int i = 0; i < 50; i++) {
+    void* p = 0;
+    if (cuvsRMMAlloc(h->res, &p, 4LL << 20) == CUVS_SUCCESS) {
+      cuvsRMMFree(h->res, p, 4LL << 20);
+    }
+  }
+  long g = now_us();
+  fprintf(stderr, "[seekdb_cuvs] micro memcpyAsync=%.2fus/call memsetAsync=%.2fus/call "
+          "rmm_alloc_free_4MB=%.1fus/call (syncs %ld+%ldus)\n",
+          (double)(b - a) / N, (double)(d - c) / N, (double)(g - f) / 50.0, c - b, e - d);
 }
 
 static long env_long(const char* name, long def, long lo, long hi)
@@ -412,6 +485,7 @@ void* seekdb_cuvs_build(const float* base, long n, long dim)
   if (!h) return NULL;
   pthread_mutex_init(&h->mu, NULL);
   if (cuvsResourcesCreate(&h->res) != CUVS_SUCCESS) { free(h); return NULL; }
+  sk_enable_rmm_pool();
 
   DLManagedTensor dset; long ds[2] = {n, dim};
   memset(&dset, 0, sizeof(dset));
@@ -498,6 +572,108 @@ fail_res: cuvsResourcesDestroy(h->res); free(h);
   return NULL;
 }
 
+/* Core single-row search (runs under h->mu, or on the dedicated worker). */
+static int sk_search_one(sk_cuvs_index* h, const float* query, long topk,
+                         unsigned int* out_ids, float* out_dist, long t0)
+{
+  const int tl2 = trace_enabled() >= 2;
+  int rc = 0;
+  long tm = tl2 ? now_us() : 0;                      /* after lock */
+  if (ensure_staging(h, topk) != 0) return 20;
+  if (tune_search_params(h, topk) != 0) return 21;
+  { /* one-shot micro-bench at first search (TRACE=3) */
+    static int micro_done = 0;
+    if (trace_enabled() >= 3 && !micro_done) { micro_done = 1; sk_micro_bench(h); }
+  }
+  long t1 = tl2 ? now_us() : 0;
+  if (cudaMemcpy(h->q_dev, query, sizeof(float) * h->dim, cudaMemcpyDefault) != cudaSuccess) return 22;
+  long t2 = tl2 ? now_us() : 0;
+  {
+    DLManagedTensor qt, nt, dt; long qs[2] = {1, h->dim}, nsh[2] = {1, topk}, dsh[2] = {1, topk};
+    memset(&qt, 0, sizeof(qt));
+    qt.dl_tensor.data = h->q_dev; qt.dl_tensor.device.device_type = kDLCUDA; qt.dl_tensor.device.device_id = 0;
+    qt.dl_tensor.ndim = 2; qt.dl_tensor.dtype.code = kDLFloat; qt.dl_tensor.dtype.bits = 32; qt.dl_tensor.dtype.lanes = 1;
+    qt.dl_tensor.shape = qs; qt.dl_tensor.strides = 0; qt.dl_tensor.byte_offset = 0;
+    nt = qt; nt.dl_tensor.data = h->ids_dev; nt.dl_tensor.dtype.code = kDLUInt; nt.dl_tensor.shape = nsh;
+    dt = qt; dt.dl_tensor.data = h->dist_dev; dt.dl_tensor.dtype.code = kDLFloat; dt.dl_tensor.shape = dsh;
+    cuvsFilter f; f.type = NO_FILTER; f.addr = (uintptr_t)0;
+    if (cuvsCagraSearch(h->res, h->sp, h->idx, &qt, &nt, &dt, f) != CUVS_SUCCESS) return 23;
+    long t3 = tl2 ? now_us() : 0;                  /* search enqueued on cuVS stream */
+    /* Wait for the cuVS-stream search kernel before reading results back;
+     * without this the D2H memcpy races the kernel at 250K scale. */
+    cudaDeviceSynchronize();
+    long t4 = tl2 ? now_us() : 0;                  /* device drained */
+    if (cudaMemcpy(out_ids, h->ids_dev, sizeof(unsigned) * topk, cudaMemcpyDefault) != cudaSuccess) return 24;
+    if (out_dist) cudaMemcpy(out_dist, h->dist_dev, sizeof(float) * topk, cudaMemcpyDefault);
+    if (tl2) {
+      long t5 = now_us();
+      fprintf(stderr, "[seekdb_cuvs] phases topk=%ld lock=%.3f prep=%.3f h2d=%.3f cagra=%.3f devsync=%.3f d2h=%.3f\n",
+              topk, (tm - t0) / 1000.0, (t1 - tm) / 1000.0, (t2 - t1) / 1000.0,
+              (t3 - t2) / 1000.0, (t4 - t3) / 1000.0, (t5 - t4) / 1000.0);
+    }
+  }
+  return rc;
+}
+
+/* Dedicated search worker (SK_BRIDGE_WORKER=1): the observer's ReqWorker
+ * threads carry SQL-session state that inflates every GPU driver call
+ * (memcpyAsync submit 1us -> 15us measured); a bridge-owned thread that only
+ * ever runs searches keeps the HIP runtime's per-thread dispatch state hot. */
+typedef struct {
+  pthread_mutex_t mu;
+  pthread_cond_t cv_work, cv_done;
+  sk_cuvs_index* h;
+  const float* q; long topk; unsigned int* ids; float* dist;
+  int rc, has_work, shutdown;
+} sk_worker_t;
+static sk_worker_t g_wk;
+static pthread_t g_wk_tid;
+static int g_wk_started = 0;
+
+static void* sk_worker_main(void* arg)
+{
+  sk_worker_t* w = (sk_worker_t*)arg;
+  pthread_setname_np(pthread_self(), "sksearch");
+  pthread_mutex_lock(&w->mu);
+  for (;;) {
+    while (!w->has_work && !w->shutdown)
+      pthread_cond_wait(&w->cv_work, &w->mu);
+    if (w->shutdown) break;
+    long t0 = trace_enabled() ? now_us() : 0;
+    w->rc = sk_search_one(w->h, w->q, w->topk, w->ids, w->dist, t0);
+    w->has_work = 0;
+    pthread_cond_broadcast(&w->cv_done);
+  }
+  pthread_mutex_unlock(&w->mu);
+  return NULL;
+}
+
+static int worker_mode(void)
+{
+  /* Default ON: the observer's ReqWorker threads carry SQL-session state that
+   * inflates every GPU driver call 10-15x (measured: memcpyAsync submit
+   * 1us->15.5us, search 5.0ms->2.5ms when moved off that thread). Env
+   * SK_BRIDGE_WORKER=0 opts out for A/B. */
+  static int m = -1;
+  if (m < 0) {
+    const char* e = getenv("SK_BRIDGE_WORKER");
+    m = (e && atoi(e) == 0) ? 0 : 1;
+  }
+  return m;
+}
+
+static int sk_worker_start(void)
+{
+  if (g_wk_started) return 0;
+  pthread_mutex_init(&g_wk.mu, NULL);
+  pthread_cond_init(&g_wk.cv_work, NULL);
+  pthread_cond_init(&g_wk.cv_done, NULL);
+  g_wk.has_work = 0; g_wk.shutdown = 0;
+  if (pthread_create(&g_wk_tid, NULL, sk_worker_main, &g_wk) != 0) return -1;
+  g_wk_started = 1;
+  return 0;
+}
+
 int seekdb_cuvs_search(void* handle, const float* query, long nq, long topk,
                        unsigned int* out_ids, float* out_dist)
 {
@@ -510,24 +686,17 @@ int seekdb_cuvs_search(void* handle, const float* query, long nq, long topk,
   /* Single-row path is the only one seekdb issues (4096 x nq=1); batch calls
    * fall back to the allocation-per-call path so buffer sizing stays simple. */
   if (nq == 1) {
-    if (ensure_staging(h, topk) != 0) { rc = 20; goto unlock; }
-    if (tune_search_params(h, topk) != 0) { rc = 21; goto unlock; }
-    if (cudaMemcpy(h->q_dev, query, sizeof(float) * h->dim, cudaMemcpyDefault) != cudaSuccess) { rc = 22; goto unlock; }
-    {
-      DLManagedTensor qt, nt, dt; long qs[2] = {1, h->dim}, nsh[2] = {1, topk}, dsh[2] = {1, topk};
-      memset(&qt, 0, sizeof(qt));
-      qt.dl_tensor.data = h->q_dev; qt.dl_tensor.device.device_type = kDLCUDA; qt.dl_tensor.device.device_id = 0;
-      qt.dl_tensor.ndim = 2; qt.dl_tensor.dtype.code = kDLFloat; qt.dl_tensor.dtype.bits = 32; qt.dl_tensor.dtype.lanes = 1;
-      qt.dl_tensor.shape = qs; qt.dl_tensor.strides = 0; qt.dl_tensor.byte_offset = 0;
-      nt = qt; nt.dl_tensor.data = h->ids_dev; nt.dl_tensor.dtype.code = kDLUInt; nt.dl_tensor.shape = nsh;
-      dt = qt; dt.dl_tensor.data = h->dist_dev; dt.dl_tensor.dtype.code = kDLFloat; dt.dl_tensor.shape = dsh;
-      cuvsFilter f; f.type = NO_FILTER; f.addr = (uintptr_t)0;
-      if (cuvsCagraSearch(h->res, h->sp, h->idx, &qt, &nt, &dt, f) != CUVS_SUCCESS) { rc = 23; goto unlock; }
-      /* Wait for the cuVS-stream search kernel before reading results back;
-       * without this the D2H memcpy races the kernel at 250K scale. */
-      cudaDeviceSynchronize();
-      if (cudaMemcpy(out_ids, h->ids_dev, sizeof(unsigned) * topk, cudaMemcpyDefault) != cudaSuccess) { rc = 24; goto unlock; }
-      if (out_dist) cudaMemcpy(out_dist, h->dist_dev, sizeof(float) * topk, cudaMemcpyDefault);
+    if (worker_mode() && sk_worker_start() == 0) {
+      pthread_mutex_lock(&g_wk.mu);
+      g_wk.h = h; g_wk.q = query; g_wk.topk = topk;
+      g_wk.ids = out_ids; g_wk.dist = out_dist;
+      g_wk.has_work = 1;
+      pthread_cond_broadcast(&g_wk.cv_work);
+      while (g_wk.has_work) pthread_cond_wait(&g_wk.cv_done, &g_wk.mu);
+      rc = g_wk.rc;
+      pthread_mutex_unlock(&g_wk.mu);
+    } else {
+      rc = sk_search_one(h, query, topk, out_ids, out_dist, t0);
     }
   } else {
     float* qd = 0; unsigned* nd = 0; float* dd = 0;
@@ -612,6 +781,7 @@ void* seekdb_cuvs_deserialize(const char* filename, long n, long dim)
   if (!index) return NULL;
   pthread_mutex_init(&index->mu, NULL);
   if (cuvsResourcesCreate(&index->res) != CUVS_SUCCESS) goto fail;
+  sk_enable_rmm_pool();
   if (cuvsCagraIndexParamsCreate(&index->ip) != CUVS_SUCCESS) goto fail_res;
   load_build_params(index->ip);
   if (cuvsCagraIndexCreate(&index->idx) != CUVS_SUCCESS) goto fail_ip;
