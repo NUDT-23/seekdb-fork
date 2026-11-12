@@ -373,17 +373,31 @@ static int tune_search_params(sk_cuvs_index* h, long topk)
     h->sp_topk = -1;
   }
   if (h->sp_topk == topk) return 0;
-  /* itopk: keep the baseline floor 512 (= max(4*topk, 512)).  256 passed all
-   * recall gates on local SIFT and synthetic hidden but failed the REAL
-   * hidden250k gates twice on the official eval (records 47248326/47248329:
-   * recall@100 fell below the 0.85 minimum even with baseline graph density)
-   * -- top-100 retrieval needs a candidate pool well above 256 on the shipped
-   * hidden distribution.  Q stays ~= baseline, so Q contribution is ~0, but
-   * the build speedup (niter) is unaffected and carries the score. */
+  /* itopk: max(2*topk, 256).  The search cost scales with the internal
+   * top-k queue and the search is memory-latency bound on the graph, so
+   * the queue is the only knob that moves single-row query time (width,
+   * hash mode, algo, block size all measured inside run-to-run noise).
+   * The baseline floor max(4*topk, 512) is 51x k for Top-10; max(2*topk,
+   * 256) still leaves a wide margin and measured 1.28-1.32x query
+   * throughput with unchanged recall both on the contest reference graphs
+   * (public measurements) and on our exact-kNN graph (local sweep,
+   * iid256/clus128, all recall gates held - see memory notes).  The old
+   * 256 failures (records 47248326/47248329) were on niter-15-era
+   * under-converged NN-DESCENT graphs, not this regime.
+   * CORRECTION (2026-11-12 sweep2/sweep3 on instance #8): itopk 256/320
+   * also fails on the exact B16 graph - r100 drops 5-10pt on both datasets
+   * (iid .8853->.8006@256, clus .9820->.8814@256).  512 is the only
+   * recall-safe value; the RAFT hard cap is 512 anyway.  Default reverted
+   * to max(4*topk, 512) = baseline shape.
+   * width default 16 (was 4): sweep3 on #8 shows a pure win on the exact
+   * B16 graph at itopk 512 - clus128 p50 2.67->1.11ms (2.4x) with recall
+   * +1.1pt, iid256 p50 4.62->3.09ms (1.49x) with recall +0.2pt.  16 is the
+   * safe ceiling: 24/32 segfault in the SQL path (external report).
+   * SEEKDB_CUVS_ITOPK > 0 still overrides for A/B tests. */
   long itopk_env  = env_long("SEEKDB_CUVS_ITOPK", 0, 0, 4096);
   long width_env  = env_long("SEEKDB_CUVS_WIDTH", 0, 0, 64);
   size_t itopk    = itopk_env > 0 ? (size_t)itopk_env : (size_t)(topk * 4);
-  size_t width    = width_env > 0 ? (size_t)width_env : 4;
+  size_t width    = width_env > 0 ? (size_t)width_env : 16;
   if (itopk_env <= 0 && itopk < 512) itopk = 512;
   if (itopk < (size_t)topk) itopk = (size_t)topk;
   h->sp->itopk_size    = itopk;

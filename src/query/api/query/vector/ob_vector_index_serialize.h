@@ -198,7 +198,11 @@ public:
   int serialize(void *index, ObOStreamBuf::CbParam &cb_param, ObOStreamBuf::Callback &cb, const int64_t capacity = DEFAULT_OUTBUF_CAPACITY);
   int deserialize(void *&index, ObIStreamBuf::CbParam &cb_param, ObIStreamBuf::Callback &cb);
 private:
-  static const int64_t DEFAULT_OUTBUF_CAPACITY = 2LL * 1024LL * 1024LL; // 2MB
+  // 8MB (was 2MB): the vector index snapshot is written as one large LOB;
+  // a 2MB stream buffer forced ~350 LOB appends for a 250K x 256d index,
+  // each a separate write.  8MB cuts the append count ~4x inside the timed
+  // CREATE INDEX window.
+  static const int64_t DEFAULT_OUTBUF_CAPACITY = 8LL * 1024LL * 1024LL; // 8MB
 
 private:
   bool is_inited_;

@@ -369,7 +369,19 @@ int ObDDLTaskUtil::generate_build_replica_sql(const int64_t data_table_id,
     ObArray<int64_t> select_column_ids;
     ObArray<int64_t> order_column_ids;
     bool is_shadow_column = false;
-    const int64_t real_parallelism = ObDDLTaskUtil::get_real_parallelism(parallelism);
+    int64_t real_parallelism = ObDDLTaskUtil::get_real_parallelism(parallelism);
+    // AMD contest: the vector-index snapshot backfill is an INSERT..SELECT..ORDER BY
+    // over the whole vector column. With parallel(1) the SORT spills to tmp files
+    // (~225 spills for 250K x 256d) and dominates the timed CREATE INDEX window.
+    // Scope the PX boost to vector snapshot aux tables only; SEEKDB_DDL_PX_PARALLEL
+    // overrides (<=0 keeps stock parallelism).
+    if (OB_NOT_NULL(dest_table_schema) && dest_table_schema->is_vec_index_snapshot_data_type()) {
+      const char *px_env = getenv("SEEKDB_DDL_PX_PARALLEL");
+      const int64_t px = OB_ISNULL(px_env) ? 8 : atoll(px_env);
+      if (px > 0) {
+        real_parallelism = ObDDLTaskUtil::get_real_parallelism(px);
+      }
+    }
     const bool is_rowkey_doc_aux_table = dest_table_schema->is_rowkey_doc_id();
     uint64_t doc_id_col_id = OB_INVALID_ID;
     uint64_t ft_id_col_id = OB_INVALID_ID;
