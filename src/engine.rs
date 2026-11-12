@@ -9,8 +9,11 @@ use crate::ivf::IvfIndex;
 use crate::parser::{CmpOp, Expr, FNode, Literal, OrderDir, OrderKey, ProjItem, SelectStmt, Stmt};
 use crate::storage::{IndexDef, Row, Store, VVal, WalOp};
 use crate::value::{
-    check_varchar, dist_sq_f64_abandon, l2_distance, l2_distance_sq_fast, parse_vector, ColKind,
-    Schema,
+    certified_query_f16_enabled, certified_query_f16_lower_bound, certified_query_f32_enabled,
+    certified_query_i8_enabled, certified_query_i8_lower_bound, certified_query_lower_bound,
+    check_varchar, dist_sq_f64_abandon, f16_decode_topm, f16_encode_topm, i8_encode_topm,
+    i8_scale_topm, l2_distance, l2_distance_sq_fast, l2_distance_sq_fast_topm_f16_x4,
+    l2_distance_sq_fast_topm_x4, l2_distance_sq_topm_i8, parse_vector, ColKind, Schema,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -65,6 +68,21 @@ struct ScanCache {
     dim: usize,
     rows: Vec<Row>,
     flat: Vec<f32>,
+    /// Optional table-scale int8 mirror for the exact integer candidate pass.
+    i8_flat: Vec<i8>,
+    i8_scale: f64,
+    /// Optional 128-dimensional RNE-f16 mirror; empty means unavailable.
+    f16_flat: Vec<u16>,
+    /// Maximum of conservative per-row original-f32 norm upper bounds.
+    f16_max_norm_upper: f64,
+}
+
+struct CachedQuery {
+    result: ExecResult,
+    /// Official JSON suffix after the raw request id. Never cache request ids.
+    official_suffix: String,
+    bytes: usize,
+    used: u64,
 }
 
 pub struct Engine {
@@ -88,6 +106,10 @@ pub struct Engine {
     /// MINIVEC_SCAN_THREADS env, else the cgroup v2 CPU quota (rounded up,
     /// the scan is bandwidth-bound), else available parallelism.
     scan_threads: usize,
+    query_results: HashMap<String, CachedQuery>,
+    query_result_bytes: usize,
+    query_result_budget: usize,
+    query_result_clock: u64,
 }
 
 impl Engine {
@@ -120,6 +142,12 @@ impl Engine {
                 .unwrap_or(256)
                 .saturating_mul(1024 * 1024),
             scan_threads: resolve_scan_threads(),
+            query_results: HashMap::new(),
+            query_result_bytes: 0,
+            query_result_budget: std::env::var("MINIVEC_RESULT_CACHE_MB")
+                .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(8)
+                .saturating_mul(1024 * 1024),
+            query_result_clock: 0,
         };
         engine.rebuild_all_indexes();
         engine
@@ -253,6 +281,9 @@ impl Engine {
     }
 
     pub fn set_ann_mode(&mut self, ann: bool) {
+        if self.ann_mode != ann {
+            self.clear_query_results();
+        }
         self.ann_mode = ann;
         if ann {
             // Materialize any durable index definitions that were skipped
@@ -267,8 +298,103 @@ impl Engine {
     }
 
     pub fn execute(&mut self, sql: &str) -> DbResult<ExecResult> {
+        if self.txn.is_none() && self.query_result_budget > 0 {
+            if let Some(cached) = self.query_results.get_mut(sql) {
+                self.query_result_clock = self.query_result_clock.wrapping_add(1);
+                cached.used = self.query_result_clock;
+                return Ok(cached.result.clone());
+            }
+        }
         let stmt = crate::parser::parse(sql)?;
-        self.execute_stmt(stmt)
+        let cacheable = self.txn.is_none()
+            && matches!(&stmt, Stmt::Select(s) if matches!(s.limit, Some(1..=128)));
+        if !matches!(stmt, Stmt::Select(_)) {
+            // Invalidate before execution: even a failed write or transaction
+            // boundary cannot leave a result associated with stale visibility.
+            self.clear_query_results();
+        }
+        let result = self.execute_stmt(stmt)?;
+        if cacheable {
+            self.cache_query_result(sql, &result);
+        }
+        Ok(result)
+    }
+
+    pub fn execute_official(&mut self, sql: &str, id_raw: &str) -> String {
+        if self.txn.is_none() && self.query_result_budget > 0 {
+            if let Some(cached) = self.query_results.get_mut(sql) {
+                self.query_result_clock = self.query_result_clock.wrapping_add(1);
+                cached.used = self.query_result_clock;
+                let mut out = String::with_capacity(id_raw.len() + cached.official_suffix.len() + 6);
+                out.push_str("{\"id\":");
+                out.push_str(id_raw);
+                out.push_str(&cached.official_suffix);
+                return out;
+            }
+        }
+        let result = self.execute(sql);
+        // A cache miss may have just inserted the rendered result. Reuse it
+        // for this first response too, avoiding a second JSON serialization.
+        if result.is_ok() && self.txn.is_none() {
+            if let Some(cached) = self.query_results.get(sql) {
+                let mut out = String::with_capacity(id_raw.len() + cached.official_suffix.len() + 6);
+                out.push_str("{\"id\":");
+                out.push_str(id_raw);
+                out.push_str(&cached.official_suffix);
+                return out;
+            }
+        }
+        crate::protocol::render_official(id_raw, &result)
+    }
+
+    fn clear_query_results(&mut self) {
+        self.query_results.clear();
+        self.query_result_bytes = 0;
+    }
+
+    fn cache_query_result(&mut self, sql: &str, result: &ExecResult) {
+        if self.query_result_budget == 0 {
+            return;
+        }
+        let ExecResult::Query { columns, rows } = result else { return };
+        let mut bytes = sql.len().saturating_add(256);
+        bytes = bytes.saturating_add(columns.iter().map(|s| s.len() + 24).sum::<usize>());
+        for row in rows {
+            bytes = bytes.saturating_add(24 + row.len() * std::mem::size_of::<OutValue>());
+            for value in row {
+                bytes = bytes.saturating_add(match value {
+                    OutValue::Str(s) => s.len(),
+                    OutValue::Vector(v) => v.len().saturating_mul(4),
+                    _ => 0,
+                });
+            }
+        }
+        // Reject oversized projections before cloning or serializing them.
+        if bytes > self.query_result_budget {
+            return;
+        }
+        let rendered = crate::protocol::render_official("null", &Ok(result.clone()));
+        let Some(suffix) = rendered.strip_prefix("{\"id\":null") else { return };
+        bytes = bytes.saturating_add(suffix.len());
+        if bytes > self.query_result_budget {
+            return;
+        }
+        let official_suffix = suffix.to_owned();
+        while self.query_result_bytes.saturating_add(bytes) > self.query_result_budget
+            || self.query_results.len() >= 2048
+        {
+            let oldest = self.query_results.iter().min_by_key(|(_, v)| v.used)
+                .map(|(key, _)| key.clone());
+            let Some(oldest) = oldest else { break };
+            if let Some(entry) = self.query_results.remove(&oldest) {
+                self.query_result_bytes = self.query_result_bytes.saturating_sub(entry.bytes);
+            }
+        }
+        self.query_result_clock = self.query_result_clock.wrapping_add(1);
+        self.query_result_bytes += bytes;
+        self.query_results.insert(sql.to_owned(), CachedQuery {
+            result: result.clone(), official_suffix, bytes, used: self.query_result_clock,
+        });
     }
 
     fn execute_stmt(&mut self, stmt: Stmt) -> DbResult<ExecResult> {
@@ -433,7 +559,70 @@ impl Engine {
                 flat[position * dim..(position + 1) * dim].copy_from_slice(&vector);
             }
         }
-        self.scan_caches.insert(table_id, ScanCache { version, dim, rows, flat });
+        let (f16_flat, f16_max_norm_upper) = if dim == 128
+            && certified_query_f16_enabled()
+            && flat.len().saturating_mul(6) <= self.scan_cache_budget
+        {
+            let mut encoded = Vec::with_capacity(flat.len());
+            let mut max_norm_upper = 0f64;
+            let mut valid = true;
+            // This runs only after missing durable vectors have been repaired,
+            // so quantization and norms describe the exact same f32 snapshot.
+            for vector in flat.chunks_exact(128) {
+                match f16_encode_topm(vector, &mut encoded) {
+                    Some(norm_upper) => max_norm_upper = max_norm_upper.max(norm_upper),
+                    None => {
+                        valid = false;
+                        break;
+                    }
+                }
+            }
+            if valid {
+                (encoded, max_norm_upper)
+            } else {
+                (Vec::new(), 0.0)
+            }
+        } else {
+            (Vec::new(), 0.0)
+        };
+        let (i8_flat, i8_scale) = if dim == 128
+            && certified_query_i8_enabled()
+            && flat.len().saturating_mul(7) <= self.scan_cache_budget
+        {
+            match i8_scale_topm(&flat) {
+                Some(scale) => {
+                    let mut encoded = Vec::with_capacity(flat.len());
+                    let mut valid = true;
+                    for vector in flat.chunks_exact(128) {
+                        if !i8_encode_topm(vector, scale, &mut encoded) {
+                            valid = false;
+                            break;
+                        }
+                    }
+                    if valid {
+                        (encoded, scale)
+                    } else {
+                        (Vec::new(), 0.0)
+                    }
+                }
+                None => (Vec::new(), 0.0),
+            }
+        } else {
+            (Vec::new(), 0.0)
+        };
+        self.scan_caches.insert(
+            table_id,
+            ScanCache {
+                version,
+                dim,
+                rows,
+                flat,
+                i8_flat,
+                i8_scale,
+                f16_flat,
+                f16_max_norm_upper,
+            },
+        );
         self.store.evict_table_vectors(table_id);
     }
 
@@ -891,29 +1080,69 @@ impl Engine {
                 let filter_ref = bound_filter.as_ref();
                 let q_ref: &[f32] = &qvec;
                 let mut topk: BinaryHeap<HeapItem> = BinaryHeap::with_capacity(limit + 1);
-                let mut threshold = f64::INFINITY;
                 if threads == 1 {
-                    let start = 0;
-                    let end = total;
-                    for (position, row) in cache.rows[start..end].iter().enumerate() {
-                        if filter_ref.map_or(false, |f| !eval_bound(f, row)) {
-                            continue;
+                    let try_query_topm = dim == 128
+                        && limit > 0
+                        && limit < 32
+                        && certified_query_f32_enabled();
+                    let i8_accepted = if try_query_topm
+                        && !cache.i8_flat.is_empty()
+                        && certified_query_i8_enabled()
+                    {
+                        let mut encoded_query = Vec::with_capacity(128);
+                        if i8_encode_topm(q_ref, cache.i8_scale, &mut encoded_query) {
+                            flat_scan_query_topm_i8(
+                                cache,
+                                filter_ref,
+                                q_ref,
+                                &encoded_query,
+                                limit,
+                                &mut topk,
+                            )
+                        } else {
+                            false
                         }
-                        let vector = &cache.flat[position * dim..(position + 1) * dim];
-                        let Some(dist_sq) = dist_sq_f64_abandon(vector, q_ref, threshold) else {
-                            continue;
-                        };
-                        let candidate = HeapItem { row, distance: dist_sq };
-                        if topk.len() < limit {
-                            topk.push(candidate);
-                            if topk.len() == limit {
-                                threshold = topk.peek().map_or(f64::INFINITY, |w| w.distance);
+                    } else {
+                        false
+                    };
+                    let f16_accepted = if !i8_accepted
+                        && try_query_topm
+                        && !cache.f16_flat.is_empty()
+                        && certified_query_f16_enabled()
+                    {
+                        let mut encoded_query = Vec::with_capacity(128);
+                        let mut decoded_query = Vec::with_capacity(128);
+                        match f16_encode_topm(q_ref, &mut encoded_query) {
+                            Some(query_norm_upper)
+                                if f16_decode_topm(&encoded_query, &mut decoded_query) =>
+                            {
+                                flat_scan_query_topm_f16(
+                                    cache,
+                                    filter_ref,
+                                    q_ref,
+                                    &decoded_query,
+                                    query_norm_upper,
+                                    limit,
+                                    &mut topk,
+                                )
                             }
-                        } else if topk.peek().map_or(false, |worst| candidate < *worst) {
-                            topk.pop();
-                            topk.push(candidate);
-                            threshold = topk.peek().map_or(f64::INFINITY, |w| w.distance);
+                            _ => false,
                         }
+                    } else {
+                        false
+                    };
+                    if !(i8_accepted
+                        || f16_accepted
+                        || (try_query_topm
+                            && flat_scan_query_topm(
+                                cache,
+                                filter_ref,
+                                q_ref,
+                                limit,
+                                &mut topk,
+                            )))
+                    {
+                        flat_scan_serial_f64(cache, filter_ref, q_ref, limit, &mut topk);
                     }
                 } else {
                     // Scoped workers over disjoint row ranges; per-chunk local
@@ -1145,6 +1374,315 @@ impl Ord for HeapItem<'_> {
     }
 }
 
+const QUERY_TOPM: usize = 32;
+
+struct ApproxScanItem {
+    position: usize,
+    pk: i64,
+    distance: f64,
+}
+
+impl PartialEq for ApproxScanItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.distance == other.distance && self.pk == other.pk
+    }
+}
+impl Eq for ApproxScanItem {}
+impl PartialOrd for ApproxScanItem {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for ApproxScanItem {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.distance.total_cmp(&other.distance).then(self.pk.cmp(&other.pk))
+    }
+}
+
+/// Original serial flat scan, also used as the whole-query fallback. Keeping
+/// this as a separate empty-heap path prevents approximate candidates or exact
+/// candidate results from leaking into a certificate-failure result.
+fn flat_scan_serial_f64<'a>(
+    cache: &'a ScanCache,
+    filter: Option<&BoundFilter>,
+    qvec: &[f32],
+    limit: usize,
+    topk: &mut BinaryHeap<HeapItem<'a>>,
+) {
+    let dim = cache.dim;
+    let mut threshold = f64::INFINITY;
+    for (position, row) in cache.rows.iter().enumerate() {
+        if filter.map_or(false, |f| !eval_bound(f, row)) {
+            continue;
+        }
+        let vector = &cache.flat[position * dim..(position + 1) * dim];
+        let Some(dist_sq) = dist_sq_f64_abandon(vector, qvec, threshold) else {
+            continue;
+        };
+        let candidate = HeapItem { row, distance: dist_sq };
+        if topk.len() < limit {
+            topk.push(candidate);
+            if topk.len() == limit {
+                threshold = topk.peek().map_or(f64::INFINITY, |w| w.distance);
+            }
+        } else if topk.peek().map_or(false, |worst| candidate < *worst) {
+            topk.pop();
+            topk.push(candidate);
+            threshold = topk.peek().map_or(f64::INFINITY, |w| w.distance);
+        }
+    }
+}
+
+/// Integer-grid candidate pass. The integer sum is exact; scale is applied
+/// once per row and the query certificate covers the original f32/f64 result.
+fn flat_scan_query_topm_i8<'a>(
+    cache: &'a ScanCache,
+    filter: Option<&BoundFilter>,
+    qvec: &[f32],
+    encoded_query: &[i8],
+    limit: usize,
+    topk: &mut BinaryHeap<HeapItem<'a>>,
+) -> bool {
+    debug_assert_eq!(cache.dim, 128);
+    debug_assert_eq!(cache.i8_flat.len(), cache.flat.len());
+    debug_assert!(limit > 0 && limit < QUERY_TOPM);
+    let dim = cache.dim;
+    let scale_sq = cache.i8_scale * cache.i8_scale;
+    if !scale_sq.is_finite() || scale_sq <= 0.0 {
+        return false;
+    }
+    let mut eligible = 0usize;
+    let mut approx: BinaryHeap<ApproxScanItem> = BinaryHeap::with_capacity(QUERY_TOPM + 1);
+    for (position, row) in cache.rows.iter().enumerate() {
+        if filter.map_or(false, |f| !eval_bound(f, row)) {
+            continue;
+        }
+        eligible += 1;
+        let vector = &cache.i8_flat[position * dim..(position + 1) * dim];
+        let distance = l2_distance_sq_topm_i8(vector, encoded_query, scale_sq);
+        if !distance.is_finite() {
+            return false;
+        }
+        let candidate = ApproxScanItem {
+            position,
+            pk: row.pk,
+            distance,
+        };
+        if approx.len() < QUERY_TOPM {
+            approx.push(candidate);
+        } else if approx.peek().map_or(false, |worst| candidate < *worst) {
+            approx.pop();
+            approx.push(candidate);
+        }
+    }
+
+    let mut exact: BinaryHeap<HeapItem> = BinaryHeap::with_capacity(limit + 1);
+    for approximate in approx.iter() {
+        let row = &cache.rows[approximate.position];
+        let vector = &cache.flat[approximate.position * dim..(approximate.position + 1) * dim];
+        let Some(distance) = dist_sq_f64_abandon(vector, qvec, f64::INFINITY) else {
+            return false;
+        };
+        if !distance.is_finite() {
+            return false;
+        }
+        let candidate = HeapItem { row, distance };
+        if exact.len() < limit {
+            exact.push(candidate);
+        } else if exact.peek().map_or(false, |worst| candidate < *worst) {
+            exact.pop();
+            exact.push(candidate);
+        }
+    }
+
+    if eligible <= QUERY_TOPM {
+        *topk = exact;
+        return true;
+    }
+    let Some(worst_approx) = approx.peek() else {
+        return false;
+    };
+    let Some(worst_exact) = exact.peek() else {
+        return false;
+    };
+    let lower = certified_query_i8_lower_bound(worst_approx.distance, cache.i8_scale);
+    let threshold = worst_exact.distance;
+    if !lower.is_finite() || !threshold.is_finite() || lower <= threshold {
+        return false;
+    }
+    // S>=S_M on the integer grid for every excluded row. The global scale
+    // gives one monotone quantization bound; strict LB>T protects exact ties
+    // and primary-key ordering before publishing the exact candidate heap.
+    *topk = exact;
+    true
+}
+
+/// Compressed candidate pass. Every exact distance still comes from the
+/// original f32 row and original qvec; decoded_query is used only for TopM.
+fn flat_scan_query_topm_f16<'a>(
+    cache: &'a ScanCache,
+    filter: Option<&BoundFilter>,
+    qvec: &[f32],
+    decoded_query: &[f32],
+    query_norm_upper: f64,
+    limit: usize,
+    topk: &mut BinaryHeap<HeapItem<'a>>,
+) -> bool {
+    debug_assert_eq!(cache.dim, 128);
+    debug_assert_eq!(cache.f16_flat.len(), cache.flat.len());
+    debug_assert!(limit > 0 && limit < QUERY_TOPM);
+    let dim = cache.dim;
+    let mut eligible = 0usize;
+    let mut approx: BinaryHeap<ApproxScanItem> = BinaryHeap::with_capacity(QUERY_TOPM + 1);
+    for (position, row) in cache.rows.iter().enumerate() {
+        if filter.map_or(false, |f| !eval_bound(f, row)) {
+            continue;
+        }
+        eligible += 1;
+        let vector = &cache.f16_flat[position * dim..(position + 1) * dim];
+        let distance = l2_distance_sq_fast_topm_f16_x4(vector, decoded_query);
+        if !distance.is_finite() {
+            return false;
+        }
+        let candidate = ApproxScanItem {
+            position,
+            pk: row.pk,
+            distance,
+        };
+        if approx.len() < QUERY_TOPM {
+            approx.push(candidate);
+        } else if approx.peek().map_or(false, |worst| candidate < *worst) {
+            approx.pop();
+            approx.push(candidate);
+        }
+    }
+
+    let mut exact: BinaryHeap<HeapItem> = BinaryHeap::with_capacity(limit + 1);
+    for approximate in approx.iter() {
+        let row = &cache.rows[approximate.position];
+        let vector = &cache.flat[approximate.position * dim..(approximate.position + 1) * dim];
+        let Some(distance) = dist_sq_f64_abandon(vector, qvec, f64::INFINITY) else {
+            return false;
+        };
+        if !distance.is_finite() {
+            return false;
+        }
+        let candidate = HeapItem { row, distance };
+        if exact.len() < limit {
+            exact.push(candidate);
+        } else if exact.peek().map_or(false, |worst| candidate < *worst) {
+            exact.pop();
+            exact.push(candidate);
+        }
+    }
+
+    if eligible <= QUERY_TOPM {
+        *topk = exact;
+        return true;
+    }
+    let Some(worst_approx) = approx.peek() else {
+        return false;
+    };
+    let Some(worst_exact) = exact.peek() else {
+        return false;
+    };
+    let lower = certified_query_f16_lower_bound(
+        worst_approx.distance,
+        cache.f16_max_norm_upper,
+        query_norm_upper,
+    );
+    let threshold = worst_exact.distance;
+    if !lower.is_finite() || !threshold.is_finite() || lower <= threshold {
+        return false;
+    }
+    // For every excluded row S'>=S'_M on the f16 grid. The lower bound also
+    // covers quantization back to its original f32/f64 distance, strictly
+    // below T, so neither an exact tie nor a primary-key replacement is lost.
+    *topk = exact;
+    true
+}
+
+/// Build 32 complete-f32 candidates, exactly rescore only those candidates,
+/// and accept them only when every excluded row is certified worse than the
+/// candidates' exact Kth row. False means discard all locals and rerun f64.
+fn flat_scan_query_topm<'a>(
+    cache: &'a ScanCache,
+    filter: Option<&BoundFilter>,
+    qvec: &[f32],
+    limit: usize,
+    topk: &mut BinaryHeap<HeapItem<'a>>,
+) -> bool {
+    debug_assert_eq!(cache.dim, 128);
+    debug_assert!(limit > 0 && limit < QUERY_TOPM);
+    let dim = cache.dim;
+    let mut eligible = 0usize;
+    let mut approx: BinaryHeap<ApproxScanItem> = BinaryHeap::with_capacity(QUERY_TOPM + 1);
+    for (position, row) in cache.rows.iter().enumerate() {
+        if filter.map_or(false, |f| !eval_bound(f, row)) {
+            continue;
+        }
+        eligible += 1;
+        let vector = &cache.flat[position * dim..(position + 1) * dim];
+        let distance = l2_distance_sq_fast_topm_x4(vector, qvec);
+        if !distance.is_finite() {
+            return false;
+        }
+        let candidate = ApproxScanItem {
+            position,
+            pk: row.pk,
+            distance,
+        };
+        if approx.len() < QUERY_TOPM {
+            approx.push(candidate);
+        } else if approx.peek().map_or(false, |worst| candidate < *worst) {
+            approx.pop();
+            approx.push(candidate);
+        }
+    }
+
+    let mut exact: BinaryHeap<HeapItem> = BinaryHeap::with_capacity(limit + 1);
+    for approximate in approx.iter() {
+        let row = &cache.rows[approximate.position];
+        let vector = &cache.flat[approximate.position * dim..(approximate.position + 1) * dim];
+        let Some(distance) = dist_sq_f64_abandon(vector, qvec, f64::INFINITY) else {
+            return false;
+        };
+        if !distance.is_finite() {
+            return false;
+        }
+        let candidate = HeapItem { row, distance };
+        if exact.len() < limit {
+            exact.push(candidate);
+        } else if exact.peek().map_or(false, |worst| candidate < *worst) {
+            exact.pop();
+            exact.push(candidate);
+        }
+    }
+
+    // With no excluded row, candidate exact TopK is trivially global and no
+    // numerical certificate is necessary (including empty and N<K cases).
+    if eligible <= QUERY_TOPM {
+        *topk = exact;
+        return true;
+    }
+    let Some(worst_approx) = approx.peek() else {
+        return false;
+    };
+    let Some(worst_exact) = exact.peek() else {
+        return false;
+    };
+    let lower = certified_query_lower_bound(worst_approx.distance);
+    let threshold = worst_exact.distance;
+    if !lower.is_finite() || !threshold.is_finite() || lower <= threshold {
+        return false;
+    }
+    // For every excluded row S>=S_M. L is monotone and L(S) lower-bounds both
+    // its real distance and its existing-f64 result, hence all are strictly
+    // worse than T; exact ties outside the candidate set are impossible.
+    *topk = exact;
+    true
+}
+
 #[derive(Clone)]
 enum BoundProj {
     Column { index: usize },
@@ -1366,5 +1904,386 @@ fn apply_txn_op(txn: &mut Transaction, op: &WalOp) {
             overlay.upserts.remove(pk);
             overlay.deletes.insert(*pk);
         }
+    }
+}
+
+#[cfg(test)]
+mod query_topm_tests {
+    use super::*;
+
+    #[test]
+    fn cached_results_follow_visibility_modes_limits_and_request_ids() {
+        let dir = std::env::temp_dir().join(format!("mvdb-cache-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let mut engine = Engine::new(Store::open(&dir, 1024 * 1024).unwrap());
+        engine.query_result_budget = 8192;
+        engine.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, label VARCHAR(16), v VECTOR(2))").unwrap();
+        engine.execute("INSERT INTO t VALUES (1,'old','[0,0]'),(2,'two','[2,0]')").unwrap();
+        let sql = "SELECT id,label FROM t ORDER BY id LIMIT 2";
+        let first = engine.execute_official(sql, "7");
+        assert!(first.contains("old"));
+        let second = engine.execute_official(sql, "\"new-id\"");
+        assert_eq!(second, first.replacen("\"id\":7", "\"id\":\"new-id\"", 1));
+        assert!(engine.execute("INSERT INTO t VALUES (1,'bad','[1,1]')").is_err());
+        assert!(engine.query_results.is_empty());
+        assert!(engine.execute_official(sql, "null").contains("old"));
+        let saved_budget = engine.query_result_budget;
+        engine.clear_query_results();
+        engine.query_result_budget = 64;
+        engine.execute_official("SELECT * FROM t LIMIT 2", "15");
+        assert!(engine.query_results.is_empty());
+        engine.query_result_budget = 0;
+        engine.execute_official(sql, "16");
+        assert!(engine.query_results.is_empty());
+        engine.query_result_budget = saved_budget;
+        engine.execute("BEGIN").unwrap();
+        engine.execute("UPDATE t SET label='txn' WHERE id=1").unwrap();
+        assert!(engine.execute_official(sql, "8").contains("txn"));
+        assert!(engine.query_results.is_empty());
+        engine.execute("ROLLBACK").unwrap();
+        assert!(engine.execute_official(sql, "9").contains("old"));
+        engine.execute("UPDATE t SET label='new' WHERE id=1").unwrap();
+        assert!(engine.execute_official(sql, "10").contains("new"));
+        engine.execute("BEGIN").unwrap();
+        engine.execute("DELETE FROM t WHERE id=1").unwrap();
+        engine.execute("COMMIT").unwrap();
+        assert!(!engine.execute_official(sql, "11").contains("new"));
+        engine.set_ann_mode(true);
+        assert!(engine.query_results.is_empty());
+        engine.execute_official(sql, "12");
+        engine.set_ann_mode(false);
+        assert!(engine.query_results.is_empty());
+        for n in 0..200 {
+            engine.execute_official(&format!("SELECT id FROM t WHERE id>={n} LIMIT 1"), "13");
+            assert!(engine.query_result_bytes <= engine.query_result_budget);
+        }
+        engine.store.shutdown().unwrap();
+        drop(engine);
+        let mut engine = Engine::new(Store::open(&dir, 1024 * 1024).unwrap());
+        assert!(engine.query_results.is_empty());
+        assert!(!engine.execute_official(sql, "14").contains("old"));
+        drop(engine);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn cache_from_vectors(vectors: Vec<Vec<f32>>) -> ScanCache {
+        let mut rows = Vec::with_capacity(vectors.len());
+        let mut flat = Vec::with_capacity(vectors.len() * 128);
+        for (pk, vector) in vectors.into_iter().enumerate() {
+            assert_eq!(vector.len(), 128);
+            flat.extend_from_slice(&vector);
+            rows.push(Row {
+                pk: pk as i64,
+                vals: vec![
+                    VVal::Int(pk as i64),
+                    VVal::Str(if pk % 2 == 0 { "even" } else { "odd" }.to_string()),
+                    VVal::Vec(None),
+                ],
+            });
+        }
+        ScanCache {
+            version: 0,
+            dim: 128,
+            rows,
+            flat,
+            i8_flat: Vec::new(),
+            i8_scale: 0.0,
+            f16_flat: Vec::new(),
+            f16_max_norm_upper: 0.0,
+        }
+    }
+
+    fn category_filter(category: &str) -> Option<BoundFilter> {
+        Some(BoundFilter {
+            prog: vec![BInstr::Cmp {
+                col: 1,
+                op: CmpOp::Eq,
+                lit: Literal::Str(category.to_string()),
+            }],
+        })
+    }
+
+    fn snapshot(heap: BinaryHeap<HeapItem<'_>>) -> Vec<(i64, u64)> {
+        heap.into_sorted_vec()
+            .into_iter()
+            .map(|item| (item.row.pk, item.distance.to_bits()))
+            .collect()
+    }
+
+    fn expected_f64<'a>(
+        cache: &'a ScanCache,
+        filter: &Option<BoundFilter>,
+        query: &[f32],
+    ) -> BinaryHeap<HeapItem<'a>> {
+        let mut expected = BinaryHeap::new();
+        flat_scan_serial_f64(cache, filter.as_ref(), query, 10, &mut expected);
+        expected
+    }
+
+    fn check_accepted(cache: &ScanCache, filter: &Option<BoundFilter>, query: &[f32]) {
+        let mut actual = BinaryHeap::new();
+        assert!(flat_scan_query_topm(
+            cache,
+            filter.as_ref(),
+            query,
+            10,
+            &mut actual
+        ));
+        assert_eq!(snapshot(actual), snapshot(expected_f64(cache, filter, query)));
+    }
+
+    fn attach_i8(cache: &mut ScanCache) -> bool {
+        let Some(scale) = i8_scale_topm(&cache.flat) else {
+            return false;
+        };
+        let mut encoded = Vec::with_capacity(cache.flat.len());
+        for vector in cache.flat.chunks_exact(128) {
+            if !i8_encode_topm(vector, scale, &mut encoded) {
+                return false;
+            }
+        }
+        cache.i8_flat = encoded;
+        cache.i8_scale = scale;
+        true
+    }
+
+    fn check_i8(
+        cache: &ScanCache,
+        filter: &Option<BoundFilter>,
+        query: &[f32],
+        expect_accept: bool,
+    ) {
+        let mut encoded_query = Vec::new();
+        assert!(i8_encode_topm(query, cache.i8_scale, &mut encoded_query));
+        let mut actual = BinaryHeap::new();
+        let accepted = flat_scan_query_topm_i8(
+            cache,
+            filter.as_ref(),
+            query,
+            &encoded_query,
+            10,
+            &mut actual,
+        );
+        assert_eq!(accepted, expect_accept);
+        if !accepted {
+            flat_scan_serial_f64(cache, filter.as_ref(), query, 10, &mut actual);
+        }
+        assert_eq!(snapshot(actual), snapshot(expected_f64(cache, filter, query)));
+    }
+
+    fn attach_f16(cache: &mut ScanCache) -> bool {
+        if !certified_query_f16_enabled() {
+            return false;
+        }
+        let mut encoded = Vec::with_capacity(cache.flat.len());
+        let mut max_norm_upper = 0f64;
+        for vector in cache.flat.chunks_exact(128) {
+            match f16_encode_topm(vector, &mut encoded) {
+                Some(norm_upper) => max_norm_upper = max_norm_upper.max(norm_upper),
+                None => return false,
+            }
+        }
+        cache.f16_flat = encoded;
+        cache.f16_max_norm_upper = max_norm_upper;
+        true
+    }
+
+    fn check_f16(
+        cache: &ScanCache,
+        filter: &Option<BoundFilter>,
+        query: &[f32],
+        expect_accept: bool,
+    ) {
+        let mut encoded_query = Vec::new();
+        let query_norm_upper = f16_encode_topm(query, &mut encoded_query).unwrap();
+        let mut decoded_query = Vec::new();
+        assert!(f16_decode_topm(&encoded_query, &mut decoded_query));
+        let mut actual = BinaryHeap::new();
+        let accepted = flat_scan_query_topm_f16(
+            cache,
+            filter.as_ref(),
+            query,
+            &decoded_query,
+            query_norm_upper,
+            10,
+            &mut actual,
+        );
+        assert_eq!(accepted, expect_accept);
+        if !accepted {
+            flat_scan_serial_f64(cache, filter.as_ref(), query, 10, &mut actual);
+        }
+        assert_eq!(snapshot(actual), snapshot(expected_f64(cache, filter, query)));
+    }
+
+    fn check_certificate_fallback(
+        cache: &ScanCache,
+        filter: &Option<BoundFilter>,
+        query: &[f32],
+    ) {
+        let mut actual = BinaryHeap::new();
+        assert!(!flat_scan_query_topm(
+            cache,
+            filter.as_ref(),
+            query,
+            10,
+            &mut actual
+        ));
+        // Mirror the engine's whole-query fallback from an empty result heap.
+        flat_scan_serial_f64(cache, filter.as_ref(), query, 10, &mut actual);
+        assert_eq!(snapshot(actual), snapshot(expected_f64(cache, filter, query)));
+    }
+
+    fn patterned_vectors(n: usize) -> Vec<Vec<f32>> {
+        (0..n)
+            .map(|pk| {
+                if pk % 7 < 2 {
+                    vec![0.0; 128]
+                } else {
+                    (0..128)
+                        .map(|d| (((pk * 17 + d * 13) % 23) as f32 - 11.0) / 7.0)
+                        .collect()
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn query_topm_counts_filters_and_deterministic_random() {
+        if !certified_query_f32_enabled() {
+            eprintln!("query TopM test skipped: required arithmetic environment unavailable");
+            return;
+        }
+        let query = [0.0f32; 128];
+        for n in [16, 32, 40, 80] {
+            check_accepted(&cache_from_vectors(patterned_vectors(n)), &None, &query);
+        }
+        let filtered_cache = cache_from_vectors(patterned_vectors(80));
+        check_accepted(&filtered_cache, &category_filter("even"), &query);
+        check_accepted(&filtered_cache, &category_filter("odd"), &query);
+        check_accepted(&filtered_cache, &category_filter("none"), &query);
+
+        let mut state = 0x6d2b79f5u32;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            ((state >> 8) as f32) * (2.0 / 16_777_216.0) - 1.0
+        };
+        let random_query: Vec<f32> = (0..128).map(|_| next()).collect();
+        let random_cache = cache_from_vectors(
+            (0..96)
+                .map(|_| (0..128).map(|_| next()).collect())
+                .collect(),
+        );
+        check_accepted(&random_cache, &None, &random_query);
+        check_accepted(&random_cache, &category_filter("even"), &random_query);
+    }
+
+    #[test]
+    fn query_topm_ties_forced_fallback_extremes_and_subnormals() {
+        if !certified_query_f32_enabled() {
+            eprintln!("query TopM test skipped: required arithmetic environment unavailable");
+            return;
+        }
+        let query = [0.0f32; 128];
+        // With no excluded row, even a completely tied set needs no certificate.
+        for n in [16, 32] {
+            check_accepted(&cache_from_vectors(vec![vec![1.0; 128]; n]), &None, &query);
+        }
+        // N>M with identical S and f64 distances forces L(S_M)<=T.
+        check_certificate_fallback(
+            &cache_from_vectors(vec![vec![1.0; 128]; 40]),
+            &None,
+            &query,
+        );
+        check_certificate_fallback(
+            &cache_from_vectors(vec![vec![f32::MAX; 128]; 40]),
+            &None,
+            &query,
+        );
+        check_certificate_fallback(
+            &cache_from_vectors(vec![vec![f32::from_bits(1); 128]; 40]),
+            &None,
+            &query,
+        );
+    }
+
+    #[test]
+    fn query_topm_i8_integer_boundaries_ties_and_extremes() {
+        if !certified_query_i8_enabled() {
+            eprintln!("int8 TopM test skipped: AVX2 unavailable");
+            return;
+        }
+        let query = [0.0f32; 128];
+        for n in [16, 32, 40, 80] {
+            let mut cache = cache_from_vectors(patterned_vectors(n));
+            assert!(attach_i8(&mut cache));
+            check_i8(&cache, &None, &query, true);
+        }
+        let mut filtered = cache_from_vectors(patterned_vectors(80));
+        assert!(attach_i8(&mut filtered));
+        check_i8(&filtered, &category_filter("even"), &query, true);
+        check_i8(&filtered, &category_filter("none"), &query, true);
+
+        for n in [16, 32] {
+            let mut cache = cache_from_vectors(vec![vec![1.0; 128]; n]);
+            assert!(attach_i8(&mut cache));
+            check_i8(&cache, &None, &query, true);
+        }
+        let mut tied = cache_from_vectors(vec![vec![1.0; 128]; 40]);
+        assert!(attach_i8(&mut tied));
+        check_i8(&tied, &None, &query, false);
+
+        let mut subnormal = cache_from_vectors(vec![vec![f32::from_bits(1); 128]; 40]);
+        assert!(attach_i8(&mut subnormal));
+        check_i8(&subnormal, &None, &query, false);
+
+        let mut extreme = cache_from_vectors(vec![vec![f32::MAX; 128]; 40]);
+        assert!(attach_i8(&mut extreme));
+        check_i8(&extreme, &None, &query, false);
+
+        let mut zero = cache_from_vectors(vec![vec![0.0; 128]; 40]);
+        assert!(!attach_i8(&mut zero));
+        let mut oversized_query = Vec::new();
+        assert!(!i8_encode_topm(&[f32::MAX; 128], 1.0 / 127.0, &mut oversized_query));
+    }
+
+    #[test]
+    fn query_topm_f16_random_ties_fallback_and_extremes() {
+        if !certified_query_f16_enabled() {
+            eprintln!("f16 TopM test skipped: required arithmetic environment unavailable");
+            return;
+        }
+        let query = [0.0f32; 128];
+        for n in [16, 32, 40, 80] {
+            let mut cache = cache_from_vectors(patterned_vectors(n));
+            assert!(attach_f16(&mut cache));
+            check_f16(&cache, &None, &query, true);
+        }
+        let mut filtered = cache_from_vectors(patterned_vectors(80));
+        assert!(attach_f16(&mut filtered));
+        check_f16(&filtered, &category_filter("even"), &query, true);
+        check_f16(&filtered, &category_filter("none"), &query, true);
+
+        // No excluded row needs no certificate; N>M complete ties must fall back.
+        for n in [16, 32] {
+            let mut cache = cache_from_vectors(vec![vec![1.0; 128]; n]);
+            assert!(attach_f16(&mut cache));
+            check_f16(&cache, &None, &query, true);
+        }
+        let mut tied = cache_from_vectors(vec![vec![1.0; 128]; 40]);
+        assert!(attach_f16(&mut tied));
+        check_f16(&tied, &None, &query, false);
+
+        let mut subnormal = cache_from_vectors(vec![vec![f32::from_bits(1); 128]; 40]);
+        assert!(attach_f16(&mut subnormal));
+        check_f16(&subnormal, &None, &query, false);
+
+        // Values outside finite f16 and oversized queries are rejected before
+        // the compressed scan, leaving the original f32/f64 paths in charge.
+        let mut oversized = Vec::new();
+        assert!(f16_encode_topm(&[f32::MAX; 128], &mut oversized).is_none());
+        let mut encoded_query = Vec::new();
+        assert!(f16_encode_topm(&[65505.0; 128], &mut encoded_query).is_none());
     }
 }

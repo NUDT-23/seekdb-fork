@@ -241,11 +241,10 @@ fn run_official(mut engine: Engine, mut out: io::StdoutLock<'static>) {
                 let ann = request.search_mode.as_deref() == Some("ann");
                 engine.set_ann_mode(ann);
                 let sql = request.sql.clone().unwrap_or_default();
-                let result = match split_statements(&sql).into_iter().next() {
-                    Some(stmt) => engine.execute(stmt),
-                    None => Ok(ExecResult::Ok { affected_rows: None }),
-                };
-                render_official(&request.id_raw, &result)
+                match split_statements(&sql).into_iter().next() {
+                    Some(stmt) => engine.execute_official(stmt, &request.id_raw),
+                    None => render_official(&request.id_raw, &Ok(ExecResult::Ok { affected_rows: None })),
+                }
             } else {
                 format!(
                     "{{\"id\":{},\"ok\":false,\"error\":{{\"code\":\"UNSUPPORTED_OP\",\"message\":\"unsupported operation\"}}}}",

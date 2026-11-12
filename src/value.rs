@@ -83,17 +83,20 @@ pub fn fmt_f32(f: f32) -> String {
 /// - conversion to f32 must stay finite (reject overflow),
 /// - NaN and Infinity spellings are rejected.
 pub fn parse_vector(text: &str, expect_dim: Option<u32>) -> DbResult<Vec<f32>> {
-    let mut out = Vec::new();
+    // A component needs at least one input byte. Bounding the reservation by
+    // the text size preserves the fast path without trusting an unbounded DDL
+    // dimension (a hostile VECTOR(u32::MAX) must not request a 16 GiB Vec).
+    let capacity = expect_dim.map_or(16, |dim| dim as usize).min(text.len().max(1));
+    let mut out = Vec::with_capacity(capacity);
     if !text.trim().is_empty() {
         for part in text.split(',') {
             let p = part.trim();
             if p.is_empty() {
                 return Err(DbError::InvalidVector);
             }
-            let lower = p.to_ascii_lowercase();
-            if lower.contains("nan") || lower.contains("inf") {
-                return Err(DbError::InvalidVector);
-            }
+            // from_str accepts every supported NaN/Infinity spelling as a
+            // non-finite value; malformed mixed spellings still fail parsing.
+            // Checking the parsed value avoids one lowercase String per component.
             let d: f64 = p.parse().map_err(|_| DbError::InvalidVector)?;
             if !d.is_finite() {
                 return Err(DbError::InvalidVector);
@@ -359,4 +362,440 @@ pub fn l2_distance_sq_fast(a: &[f32], b: &[f32]) -> f64 {
         }
     }
     l2_distance_sq_f32(a, b)
+}
+
+/// TopM-only 128-dimensional f32 squared distance. Four independent FMA
+/// chains shorten the dependency chain; the certified query bound permits
+/// this different nonnegative accumulation grouping. ANN keeps using the
+/// unchanged `l2_distance_sq_fast` implementation above.
+pub fn l2_distance_sq_fast_topm_x4(a: &[f32], b: &[f32]) -> f64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // Keep the same per-row feature dispatch as the accepted TopM kernel.
+        if a.len() == 128
+            && b.len() == 128
+            && std::arch::is_x86_feature_detected!("avx2")
+        {
+            return unsafe { dist_sq_avx2_topm_x4(a, b) as f64 };
+        }
+    }
+    l2_distance_sq_f32(a, b)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dist_sq_avx2_topm_x4(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::x86_64::{
+        _mm256_add_ps, _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_setzero_ps, _mm256_storeu_ps,
+        _mm256_sub_ps,
+    };
+    debug_assert_eq!(a.len(), 128);
+    debug_assert_eq!(b.len(), 128);
+    let (mut acc0, mut acc1, mut acc2, mut acc3) = (
+        _mm256_setzero_ps(),
+        _mm256_setzero_ps(),
+        _mm256_setzero_ps(),
+        _mm256_setzero_ps(),
+    );
+    let mut i = 0usize;
+    while i < 128 {
+        for block in 0..4 {
+            let va = _mm256_loadu_ps(a.as_ptr().add(i + block * 8));
+            let vb = _mm256_loadu_ps(b.as_ptr().add(i + block * 8));
+            let d = _mm256_sub_ps(va, vb);
+            match block {
+                0 => acc0 = _mm256_fmadd_ps(d, d, acc0),
+                1 => acc1 = _mm256_fmadd_ps(d, d, acc1),
+                2 => acc2 = _mm256_fmadd_ps(d, d, acc2),
+                _ => acc3 = _mm256_fmadd_ps(d, d, acc3),
+            }
+        }
+        i += 32;
+    }
+    // Combine the four chains, then use the same single horizontal sum as the
+    // accepted TopM kernel; each chain executed exactly four FMA operations.
+    let acc = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
+    let mut tmp = [0f32; 8];
+    _mm256_storeu_ps(tmp.as_mut_ptr(), acc);
+    tmp.iter().sum()
+}
+
+pub fn certified_query_i8_enabled() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::arch::is_x86_feature_detected!("avx2")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+/// First pass of int8 cache construction: choose one scale for the whole
+/// repaired snapshot so every excluded row has the same quantization bound.
+pub fn i8_scale_topm(flat: &[f32]) -> Option<f64> {
+    if flat.len() % 128 != 0 || !certified_query_i8_enabled() {
+        return None;
+    }
+    let mut max_abs = 0f64;
+    for &value in flat {
+        let value = value as f64;
+        if !value.is_finite() {
+            return None;
+        }
+        max_abs = max_abs.max(value.abs());
+    }
+    if max_abs <= 0.0 {
+        return None;
+    }
+    let scale = max_abs / 127.0;
+    if scale.is_finite() && scale > 0.0 {
+        Some(scale)
+    } else {
+        None
+    }
+}
+
+/// Second pass: encode with the already fixed table scale. f64 division and
+/// round keep the actual error within scale*(1/2+tiny); the certificate's
+/// 1e-12 slack covers the division/scale rounding and tie behavior.
+pub fn i8_encode_topm(vector: &[f32], scale: f64, out: &mut Vec<i8>) -> bool {
+    if vector.len() != 128 || !scale.is_finite() || scale <= 0.0 {
+        return false;
+    }
+    for &value in vector {
+        let value = value as f64;
+        if !value.is_finite() {
+            return false;
+        }
+        let quantized = (value / scale).round();
+        if !quantized.is_finite() || quantized.abs() > 127.0 {
+            return false;
+        }
+        out.push(quantized as i8);
+    }
+    true
+}
+
+/// Exact integer squared distance on the quantized grid, scaled once in f64.
+pub fn l2_distance_sq_topm_i8(a: &[i8], b: &[i8], scale_sq: f64) -> f64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if a.len() == 128 && b.len() == 128 && std::arch::is_x86_feature_detected!("avx2") {
+            let sum = unsafe { dist_sq_avx2_topm_i8(a, b) };
+            return (sum as f64) * scale_sq;
+        }
+    }
+    f64::NAN
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dist_sq_avx2_topm_i8(a: &[i8], b: &[i8]) -> i32 {
+    use std::arch::x86_64::{
+        __m128i, _mm256_add_epi32, _mm256_cvtepi8_epi16, _mm256_madd_epi16,
+        _mm256_setzero_si256, _mm256_storeu_si256, _mm256_sub_epi16, _mm_loadu_si128,
+    };
+    debug_assert_eq!(a.len(), 128);
+    debug_assert_eq!(b.len(), 128);
+    let (mut acc0, mut acc1, mut acc2, mut acc3) = (
+        _mm256_setzero_si256(),
+        _mm256_setzero_si256(),
+        _mm256_setzero_si256(),
+        _mm256_setzero_si256(),
+    );
+    let mut i = 0usize;
+    while i < 128 {
+        for block in 0..4 {
+            let offset = i + block * 16;
+            let va = _mm256_cvtepi8_epi16(_mm_loadu_si128(
+                a.as_ptr().add(offset) as *const __m128i,
+            ));
+            let vb = _mm256_cvtepi8_epi16(_mm_loadu_si128(
+                b.as_ptr().add(offset) as *const __m128i,
+            ));
+            let d = _mm256_sub_epi16(va, vb);
+            // Inputs are [-127,127], so d is [-255,255]. Each madd pair and
+            // the final 128-dimensional sum (<=8,323,200) fit signed i32.
+            let squared = _mm256_madd_epi16(d, d);
+            match block {
+                0 => acc0 = _mm256_add_epi32(acc0, squared),
+                1 => acc1 = _mm256_add_epi32(acc1, squared),
+                2 => acc2 = _mm256_add_epi32(acc2, squared),
+                _ => acc3 = _mm256_add_epi32(acc3, squared),
+            }
+        }
+        i += 64;
+    }
+    let acc = _mm256_add_epi32(_mm256_add_epi32(acc0, acc1), _mm256_add_epi32(acc2, acc3));
+    let mut lanes = [0i32; 8];
+    _mm256_storeu_si256(lanes.as_mut_ptr().cast(), acc);
+    lanes.iter().sum()
+}
+
+/// Conservative original-distance lower bound from the exact integer grid.
+pub fn certified_query_i8_lower_bound(s: f64, scale: f64) -> f64 {
+    if !s.is_finite() || s < 0.0 || !scale.is_finite() || scale <= 0.0 {
+        return f64::NAN;
+    }
+    // Cover scale^2 and the final f64 multiplication. This is intentionally
+    // looser than two-ulp error and does not assume any f32 accumulation.
+    let grid_lower = next_down_f64(s * (1.0 - 1.0 / 1_125_899_906_842_624.0));
+    // Both the row and query have per-component error <=scale/2+tiny.
+    // Minkowski therefore gives a single global L2 error sqrt(128)*scale.
+    let error_upper = next_up_f64(128f64.sqrt() * scale * (1.0 + 1e-12));
+    if !grid_lower.is_finite() || grid_lower <= 0.0 || !error_upper.is_finite() {
+        return f64::NAN;
+    }
+    let grid_root = next_down_f64(grid_lower.sqrt());
+    let original_root = next_down_f64(grid_root - error_upper);
+    if !original_root.is_finite() || original_root <= 0.0 {
+        return f64::NAN;
+    }
+    let original_lower = next_down_f64(original_root * original_root);
+    certified_query_lower_bound(original_lower)
+}
+
+/// F16C compression is optional; the original f32 flat cache remains the
+/// source for exact rescoring and for every fallback path.
+pub fn certified_query_f16_enabled() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        certified_query_f32_enabled() && std::arch::is_x86_feature_detected!("f16c")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+/// Append the RNE f16 encoding and return a conservative upper bound for the
+/// original f32 vector's Euclidean norm. Rejecting any component above the
+/// largest finite f16 avoids per-query overflow surprises.
+pub fn f16_encode_topm(vector: &[f32], out: &mut Vec<u16>) -> Option<f64> {
+    if vector.len() != 128 || !certified_query_f16_enabled() {
+        return None;
+    }
+    let mut norm_sq = 0f64;
+    for &value in vector {
+        let value = value as f64;
+        if !value.is_finite() || value.abs() > 65504.0 {
+            return None;
+        }
+        norm_sq += value * value;
+    }
+    // The 128-term f64 sum and sqrt have many orders of magnitude more
+    // precision than this slack; nextUp makes the upper-bound intent explicit.
+    let norm_upper = next_up_f64(norm_sq.sqrt() * (1.0 + 1e-12));
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use std::arch::x86_64::{
+            __m128i, _mm256_cvtps_ph, _mm256_loadu_ps, _mm_storeu_si128,
+            _MM_FROUND_TO_NEAREST_INT,
+        };
+        let mut encoded = [0u16; 8];
+        for chunk in vector.chunks_exact(8) {
+            let values = _mm256_loadu_ps(chunk.as_ptr());
+            let half = _mm256_cvtps_ph(values, _MM_FROUND_TO_NEAREST_INT);
+            _mm_storeu_si128(encoded.as_mut_ptr() as *mut __m128i, half);
+            out.extend_from_slice(&encoded);
+        }
+    }
+    Some(norm_upper)
+}
+
+/// Decode a query's f16 grid back to f32 once per query. Row decoding stays in
+/// the distance kernel; the query side can then use ordinary aligned-width
+/// f32 loads without repeating sixteen conversion instructions per row.
+pub fn f16_decode_topm(encoded: &[u16], out: &mut Vec<f32>) -> bool {
+    if encoded.len() != 128 || !certified_query_f16_enabled() {
+        return false;
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use std::arch::x86_64::{
+            __m128i, _mm256_cvtph_ps, _mm256_storeu_ps, _mm_loadu_si128,
+        };
+        for chunk in encoded.chunks_exact(8) {
+            let half = _mm_loadu_si128(chunk.as_ptr() as *const __m128i);
+            let values = _mm256_cvtph_ps(half);
+            let start = out.len();
+            out.resize(start + 8, 0.0);
+            _mm256_storeu_ps(out.as_mut_ptr().add(start), values);
+        }
+    }
+    true
+}
+
+/// Complete-f32 distance over a compressed row and an already decoded query.
+/// NaN requests the f32 TopM fallback; it is never an exact query result.
+pub fn l2_distance_sq_fast_topm_f16_x4(a: &[u16], b: &[f32]) -> f64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if a.len() == 128
+            && b.len() == 128
+            && std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("f16c")
+        {
+            return unsafe { dist_sq_avx2_topm_f16_x4(a, b) as f64 };
+        }
+    }
+    f64::NAN
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn dist_sq_avx2_topm_f16_x4(a: &[u16], b: &[f32]) -> f32 {
+    use std::arch::x86_64::{
+        __m128i, _mm256_add_ps, _mm256_cvtph_ps, _mm256_fmadd_ps, _mm256_loadu_ps,
+        _mm256_setzero_ps, _mm256_storeu_ps, _mm256_sub_ps, _mm_loadu_si128,
+    };
+    debug_assert_eq!(a.len(), 128);
+    debug_assert_eq!(b.len(), 128);
+    let (mut acc0, mut acc1, mut acc2, mut acc3) = (
+        _mm256_setzero_ps(),
+        _mm256_setzero_ps(),
+        _mm256_setzero_ps(),
+        _mm256_setzero_ps(),
+    );
+    let mut i = 0usize;
+    while i < 128 {
+        for block in 0..4 {
+            let half = _mm_loadu_si128(a.as_ptr().add(i + block * 8) as *const __m128i);
+            let va = _mm256_cvtph_ps(half);
+            let vb = _mm256_loadu_ps(b.as_ptr().add(i + block * 8));
+            let d = _mm256_sub_ps(va, vb);
+            match block {
+                0 => acc0 = _mm256_fmadd_ps(d, d, acc0),
+                1 => acc1 = _mm256_fmadd_ps(d, d, acc1),
+                2 => acc2 = _mm256_fmadd_ps(d, d, acc2),
+                _ => acc3 = _mm256_fmadd_ps(d, d, acc3),
+            }
+        }
+        i += 32;
+    }
+    let acc = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
+    let mut tmp = [0f32; 8];
+    _mm256_storeu_ps(tmp.as_mut_ptr(), acc);
+    tmp.iter().sum()
+}
+
+/// Lower-bound the original f64 distance from a compressed candidate pass.
+/// L0 first covers f32 accumulation on the f16 grid. RNE normal-component
+/// error is at most 2^-11 |x_i|; f16 subnormals add at most 2^-25 per
+/// component. Minkowski and the reverse triangle inequality then bound every
+/// original row, including rows excluded from the candidate heap.
+pub fn certified_query_f16_lower_bound(
+    s: f64,
+    max_row_norm_upper: f64,
+    query_norm_upper: f64,
+) -> f64 {
+    let grid_lower = certified_query_lower_bound(s);
+    if !grid_lower.is_finite()
+        || grid_lower < 0.0
+        || !max_row_norm_upper.is_finite()
+        || !query_norm_upper.is_finite()
+        || max_row_norm_upper < 0.0
+        || query_norm_upper < 0.0
+    {
+        return f64::NAN;
+    }
+    let quantization = (1.0f64 / 2048.0).mul_add(
+        max_row_norm_upper + query_norm_upper,
+        2.0 * 128f64.sqrt() * (1.0 / 33_554_432.0),
+    );
+    let error_upper = next_up_f64(quantization * (1.0 + 1e-12));
+    let grid_root = next_down_f64(grid_lower.sqrt());
+    let original_root = next_down_f64(grid_root - error_upper);
+    if !original_root.is_finite() || original_root <= 0.0 {
+        return f64::NAN;
+    }
+    let original_lower = next_down_f64(original_root * original_root);
+    // Reuse the much looser f64 factor from the f32 certificate to cover the
+    // original kernel's accumulation error and primary-key equality margin.
+    certified_query_lower_bound(original_lower)
+}
+
+/// Whether the query-level f32 candidate pass has the arithmetic environment
+/// required by its certified error bound.
+pub fn certified_query_f32_enabled() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        return std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("fma")
+            && unsafe { std::arch::x86_64::_mm_getcsr() } & 0xe040 == 0;
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+/// Rust 1.85-compatible IEEE-754 nextDown.
+#[inline]
+fn next_down_f64(x: f64) -> f64 {
+    if x.is_nan() || x == f64::NEG_INFINITY {
+        return x;
+    }
+    if x == 0.0 {
+        return -f64::from_bits(1);
+    }
+    let bits = x.to_bits();
+    if x > 0.0 {
+        f64::from_bits(bits - 1)
+    } else {
+        f64::from_bits(bits + 1)
+    }
+}
+
+/// Rust 1.85-compatible IEEE-754 nextUp.
+#[inline]
+fn next_up_f64(x: f64) -> f64 {
+    if x.is_nan() || x == f64::INFINITY {
+        return x;
+    }
+    if x == 0.0 {
+        return f64::from_bits(1);
+    }
+    let bits = x.to_bits();
+    if x > 0.0 {
+        f64::from_bits(bits + 1)
+    } else {
+        f64::from_bits(bits - 1)
+    }
+}
+
+/// Conservative lower bound for both the real 128-dimensional squared
+/// distance and the existing f64 kernel, from its complete f32 approximation.
+#[inline]
+pub fn certified_query_lower_bound(s: f64) -> f64 {
+    next_down_f64(s.mul_add(0.99996, -3e-43))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vector_reservation_is_bounded_by_input_size() {
+        assert!(matches!(
+            parse_vector("1,2", Some(u32::MAX)),
+            Err(DbError::DimensionMismatch)
+        ));
+        assert!(matches!(
+            parse_vector("", Some(u32::MAX)),
+            Err(DbError::DimensionMismatch)
+        ));
+        assert_eq!(parse_vector("1,2", Some(2)).unwrap(), vec![1.0, 2.0]);
+    }
+
+    #[test]
+    fn malformed_nan_and_infinity_spellings_are_rejected() {
+        for text in ["1nan,0", "nan1,0", "1inf,0", "infinityx,0", "0x1p3,0"] {
+            assert!(matches!(
+                parse_vector(text, Some(2)),
+                Err(DbError::InvalidVector)
+            ));
+        }
+    }
 }

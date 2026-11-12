@@ -196,16 +196,19 @@ fn parse_string(b: &[u8], i: &mut usize) -> Option<String> {
     }
     *i += 1;
     let mut out = String::new();
+    let mut span = *i;
     loop {
         if *i >= b.len() {
             return None;
         }
         match b[*i] {
             b'"' => {
+                out.push_str(std::str::from_utf8(&b[span..*i]).ok()?);
                 *i += 1;
                 return Some(out);
             }
             b'\\' => {
+                out.push_str(std::str::from_utf8(&b[span..*i]).ok()?);
                 *i += 1;
                 if *i >= b.len() {
                     return None;
@@ -223,7 +226,6 @@ fn parse_string(b: &[u8], i: &mut usize) -> Option<String> {
                         *i += 1;
                         let hi = parse_hex4(b, i)?;
                         let cp = if (0xD800..0xDC00).contains(&hi) {
-                            // Surrogate pair: expect a trailing \uXXXX low surrogate.
                             if *i + 1 < b.len() && b[*i] == b'\\' && b[*i + 1] == b'u' {
                                 *i += 2;
                                 let lo = parse_hex4(b, i)?;
@@ -232,30 +234,26 @@ fn parse_string(b: &[u8], i: &mut usize) -> Option<String> {
                                 }
                                 0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)
                             } else {
-                                return None; // lone leading surrogate
+                                return None;
                             }
                         } else if (0xDC00..0xE000).contains(&hi) {
-                            return None; // lone trailing surrogate
+                            return None;
                         } else {
                             hi
                         };
                         out.push(char::from_u32(cp)?);
-                        continue; // parse_hex4 already advanced past the digits
+                        span = *i;
+                        continue;
                     }
                     _ => return None,
                 }
                 *i += 1;
+                span = *i;
             }
-            _ => {
-                // Copy one UTF-8 encoded char verbatim (input is valid UTF-8
-                // because it came from a Rust String).
-                let ch_len = utf8_len(b[*i]);
-                if *i + ch_len > b.len() {
-                    return None;
-                }
-                out.push_str(std::str::from_utf8(&b[*i..*i + ch_len]).ok()?);
-                *i += ch_len;
-            }
+            // Quote and backslash are ASCII and cannot occur inside a UTF-8
+            // continuation byte, so byte scanning can defer the UTF-8 check
+            // and copy to one complete span instead of one char at a time.
+            _ => *i += 1,
         }
     }
 }
@@ -277,18 +275,6 @@ fn parse_hex4(b: &[u8], i: &mut usize) -> Option<u32> {
     }
     *i += 4;
     Some(v)
-}
-
-fn utf8_len(first: u8) -> usize {
-    if first < 0x80 {
-        1
-    } else if first < 0xE0 {
-        2
-    } else if first < 0xF0 {
-        3
-    } else {
-        4
-    }
 }
 
 #[cfg(test)]
@@ -353,5 +339,26 @@ mod tests {
         assert!(matches!(parse("{\"id\":1}"), Parsed::Bad(_))); // no op
         assert!(matches!(parse("{\"id\":1,\"op\":\"x\"} trailing"), Parsed::Bad(_)));
         assert!(matches!(parse(""), Parsed::Bad(_)));
+    }
+
+    #[test]
+    fn string_escape_boundaries() {
+        let valid = [
+            (r#"{"id":1,"op":"execute","sql":""}"#, ""),
+            (r#"{"id":1,"op":"execute","sql":"a\/b"}"#, "a/b"),
+            (r#"{"id":1,"op":"execute","sql":"a\b\f"}"#, "a\u{08}\u{0c}"),
+            (r#"{"id":1,"op":"execute","sql":"a\u0000b"}"#, "a\0b"),
+            (r#"{"id":1,"op":"execute","sql":"\n你好🎉"}"#, "\n你好🎉"),
+        ];
+        for (line, expected) in valid {
+            match parse(line) {
+                Parsed::Ok(req) => assert_eq!(req.sql.unwrap(), expected),
+                _ => panic!("expected valid JSON: {line:?}"),
+            }
+        }
+        for sql in [r#"\uD800"#, r#"\uDC00"#, r#"\uD800\uD800"#] {
+            let line = format!(r#"{{"id":1,"op":"execute","sql":"{sql}"}}"#);
+            assert!(matches!(parse(&line), Parsed::Bad(_)), "accepted {sql}");
+        }
     }
 }
