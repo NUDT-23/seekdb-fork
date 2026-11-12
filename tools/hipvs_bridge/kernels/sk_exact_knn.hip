@@ -552,8 +552,22 @@ extern "C" long sk_exact_graph_build(const float* h_base, long n, int dim, int k
    * already contiguous (row-major), zero-copy operand. */
   {
     hipblasHandle_t bh = NULL;
+    void *blas_ws = NULL;
     if (hipblasCreate(&bh) != HIPBLAS_STATUS_SUCCESS)
       { fprintf(stderr, "[sk_knn] hipblas create failed\n"); goto fail_gpu; }
+    /* Pin the hipBLAS workspace to a fixed user-owned 64MB buffer. The
+     * library default workspace scales with device memory; the eval box
+     * (W7900D, ROCm 7.2.4) has a larger default than our local 7.2.1
+     * measurement environment, which blew the relative_vram_limit gate
+     * (d6e1c17). 64MB is ample for our GemmEx shape (no split-k). */
+    if (hipMalloc(&blas_ws, (size_t)64 << 20) != hipSuccess || !blas_ws) {
+      fprintf(stderr, "[sk_knn] hipblas workspace alloc failed\n");
+      hipblasDestroy(bh); goto fail_gpu;
+    }
+    if (hipblasSetWorkspace(bh, blas_ws, (size_t)64 << 20) != HIPBLAS_STATUS_SUCCESS) {
+      fprintf(stderr, "[sk_knn] hipblas set workspace failed\n");
+      hipFree(blas_ws); hipblasDestroy(bh); goto fail_gpu;
+    }
     const float alpha_f = 1.f, beta_f = 0.f;
     for (long cs = 0; cs < n; cs += alloc_rows) {
       long rows = (cs + alloc_rows <= n) ? alloc_rows : (n - cs);
@@ -566,12 +580,13 @@ extern "C" long sk_exact_graph_build(const float* h_base, long n, int dim, int k
           &beta_f, SC, HIPBLAS_R_32F, (int)n,
           HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT);
       if (gs != HIPBLAS_STATUS_SUCCESS)
-        { fprintf(stderr, "[sk_knn] hipblas gemm failed st=%d\n", (int)gs); hipblasDestroy(bh); goto fail_gpu; }
+        { fprintf(stderr, "[sk_knn] hipblas gemm failed st=%d\n", (int)gs); hipblasDestroy(bh); hipFree(blas_ws); goto fail_gpu; }
       hipLaunchKernelGGL(sk_topk_kernel, dim3((unsigned)rows), dim3(SK_THREADS), 0, 0,
                          SC, xn, G, cs, n, k, K);
-      if (hipGetLastError() != hipSuccess) { fprintf(stderr, "[sk_knn] topk launch failed\n"); hipblasDestroy(bh); goto fail_gpu; }
+      if (hipGetLastError() != hipSuccess) { fprintf(stderr, "[sk_knn] topk launch failed\n"); hipblasDestroy(bh); hipFree(blas_ws); goto fail_gpu; }
     }
     hipblasDestroy(bh);
+    hipFree(blas_ws);
   }
   if (hipDeviceSynchronize() != hipSuccess) { fprintf(stderr, "[sk_knn] device sync failed\n"); goto fail_gpu; }
 
