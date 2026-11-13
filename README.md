@@ -266,3 +266,24 @@ remain local, with no new formal submission or E/Prompt score prediction.
 A one-time formal submission is authorized for2026-11-13 20:00Asia/Shanghai,
 regardless of the local score estimate. This version is prepared for that run;
 its official admission, E and Prompt results are not yet known.
+
+
+Post-submission update (2026-11-13): d8d9b057 passed MySQL; official E2686.990441,
+Prompt4.5. Those results do not include the following local policy fix. Only
+completed compressed candidate passes now train mirror-failure counters;
+queries outside the representation range use exact fallback without retiring
+a usable table mirror. Two changing-range workload seeds improve Docker
+query time14.49%/12.99%, with ordinary uniform/Gaussian workloads flat.
+27units,20public cases,6extended groups and deep-input/restart checks pass.
+The platform performance regression remains unexplained; no E projection.
+
+
+Evening candidate (2026-11-13): use the original query/cache paths with
+resident original vectors and serialized-only official responses. Compressed
+SQL cache keys, adaptive mirror retirement and static runtime are withdrawn
+from this candidate after the formal performance regression. Relative to
+015651fb8, Docker queries change−0.4406%, writes+1.8575%, and container
+peak falls14.3621% in matched local tests.21units,20public cases,6extended
+groups and deep-input/restart checks pass. Earlier sprint descriptions above
+are historical experiments. Prompt source records from the valid4.5 version
+remain intact. A new official score is pending.
