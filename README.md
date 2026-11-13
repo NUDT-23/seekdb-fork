@@ -222,7 +222,7 @@ limits and exact internal evidence references in both synchronized JSON copies.
 1. The official protocol is now published (`STDIO_PROTOCOL.md`, commit `f4d4e2665`) and fully implemented; the frozen platform-side error-code mapping (`config.json "error_codes"`) is still empty locally, so error codes beyond the public cases' vocabulary are our semantic names (the judge currently only requires a non-empty `error.code` string).
 2. IVF-Flat ANN is implemented (deterministic k-means, inverted lists, incremental maintenance, restart rebuild) but recall on 128-dim uniform benchmark data is ~0.84, below the 0.95 bar, so submission mode is exact scanning. IVF remains enabled for `search_mode:"ann"` on smaller/clusterable datasets.
 3. Single-client and single-transaction limits are intentional. No network protocol, NULL, joins, aggregates, distributed execution or concurrent transaction support is provided.
-4. The certified TopM acceleration is restricted to serial, 128-dimensional flat-cache TopK with K<32 and a default IEEE arithmetic environment; f16 additionally requires F16C and int8 requires AVX2 plus enough cache budget for the mirrors. Int8's table-wide scale can be ineffective on skewed data, and duplicate-heavy or otherwise certificate-failing inputs pay for one or more candidate passes before the full f64 fallback. WSL and local Docker gains are controlled local measurements only; the current platform score remains E=3516.901115 from commit `48a23c603` until a later formal evaluation.
+4. The certified TopM acceleration is restricted to serial, 128-dimensional flat-cache TopK with K<32 and a default IEEE arithmetic environment; f16 additionally requires F16C and int8 requires AVX2 plus enough cache budget for the mirrors. Int8's table-wide scale can be ineffective on skewed data, and duplicate-heavy or otherwise certificate-failing inputs pay for one or more candidate passes before the full f64 fallback. WSL and local Docker gains are controlled local measurements only; the latest formal performance result is E=3769.381119 from commit `015651fb8` (MySQL admission passed). That submission has no valid numeric Prompt result; its specific review failure or pending status is not exposed in the result-detail API. The earlier commit `48a23c603` had valid Prompt raw3.5.
 
 Submission preparation on 2026-11-12: final source matches the retained validated
 candidate. Fresh checks pass 20 release units, 20 public official cases, six
@@ -230,3 +230,39 @@ extended groups, deep inputs, durable readback/forced checkpoints and 20 random
 crash cycles. Commit uses actual serialized row lengths without a second
 dictionary pass. Learning materials are identical UTF-8 JSON copies below
 128 KiB with exact internal evidence references; no new score is predicted.
+
+
+The local 2026-11-13 learning-material revision preserves every student prompt,
+Agent conversation and experiment output from the submitted material, removes
+repeated summaries and rule text, and includes twelve measured candidate experiment chains,
+phase diagnostics and an attributed accepted technical plan. Both
+conversation.json copies are synchronized. This
+material revision is not formally submitted and has no predicted Prompt score.
+Eleven experiment chains were rejected, including lossless exponent compression
+whose disk-read cost outweighed its modest resource benefit. The user accepted the working tree combination as the next local optimization
+baseline: resident original-vector snapshots combined with serialized-only
+official result caching. In three host-sampled container comparisons its peak
+median fell from 18,124,800 to 16,035,840 bytes (-11.5254%); Docker query time
+regressed 1.0136% and 1.3208% on two independent seeds, so no query speedup is
+claimed. The candidate passes 21 release units, 20 public cases, six extended
+groups and deep-input/restart checks. It is not a formal submission, and these
+local measurements do not predict platform E.
+
+
+The local sprint adds semantic vector cache keys with full collision checks,
+a generic static runtime, and snapshot-local adaptive candidate mirrors.
+After four int8 certificate failures the engine replaces that mirror with
+f16 when supported and within budget; four f16 failures release that mirror.
+Original f32 values and the exact f32-certificate/f64 fallback stay available.
+Independent distribution tests expose a workload dependency: Gaussian and
+unit-sphere data benefit, while uniform data is approximately flat.
+Direct Docker query gains against accepted residentpayload (12 pairs, seed20261225): uniform +1.9636%, gaussian +20.9314%, sphere +19.6526%.
+Final checks pass26 units,20 public cases,6 extended groups, deep-input restart,
+durable readback and forced checkpoints. The preceding adaptive+static build
+also passes a2.25GB logical-vector crash/restart chain under2GiB in303.90s;
+the final change affects128-dimensional candidate mirrors only. All results
+remain local, with no new formal submission or E/Prompt score prediction.
+
+A one-time formal submission is authorized for2026-11-13 20:00Asia/Shanghai,
+regardless of the local score estimate. This version is prepared for that run;
+its official admission, E and Prompt results are not yet known.
