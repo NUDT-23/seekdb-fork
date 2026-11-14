@@ -372,3 +372,65 @@ extended, parallel, and deep/restart checks. No fresh multi-GiB recovery is
 claimed for this artifact. Both learning-material copies contain 130957 bytes
 and 111 valid references, preserving the original valid-4.5 core and student
 words. Submission authorization adds no student technical explanation.
+
+
+Latest formal observation (2026-11-14): commit8e5b65de4 was accepted at15:40
+Asia/Shanghai before the16:00 deadline,task47253784. MySQL passed;
+E3396.585802,down11.586% fromac85bab. Prompt has no valid numeric result.
+The result API supplies no specific invalidity reason,material-read status,
+review rounds orT/B/M breakdown. No causal claim or E5000 forecast follows.
+The submitted frozen artifact subsequently has recorded passing2.25GB recovery
+(283.465s,9checks,oom_kill0). Submission evidence:parent workspace
+minivec/submit-1600-20261114/receipt.json and result.json.
+The independent PK-only snapshot-header follow-up passed29units and90fresh
+container truth/WAL/response checks but failed its predeclared memory/time
+gates,so it remains archived under minivec/pk-snapshot-20261114. Engine source
+still matches the submitted artifact. Local learning materials now record
+these actual results,with the original4.5core/student words preserved.
+
+Dual-session optimization follow-up (2026-11-14): three isolated source copies
+tested selective vector reads, request-local streaming buffers, and a shared
+full-row/vector decoder. Each passed31 release units;234 new container runs
+passed independent full-f64 truth and paired WAL/response checks. All three
+failed their declared peak-memory caps and remain archived. A later timestamp
+audit also found peer test completions inside two timing windows; resource
+isolation was not established, so raw speed ratios cannot select a winner or
+establish stable gains. No implementation source was copied back and no new
+formal submission occurred. Evidence and corrections are in parent workspace
+minivec/race-20261114/README.md and overlap-audit.json. The next heavy test needs
+explicit peer acknowledgment of the shared benchmark lock. Local materials
+record the corrected limitations while preserving the original4.5core.
+
+Bounded-block follow-up (2026-11-14): isolated V1 passed its small screen and
+resident checks but failed complete capacity-boundary resource gates due to
+excess file reads. A private scan-reader revision plus reviewed invalidation
+fixes passed32units and exact truth/WAL/response checks in54 fresh containers,
+but failed its fixed5% peak cap (legacy128 group:+7.250%). The reported peak
+already existed after load; existing memory.stat fields do not explain the
+delta, and same-binary A/A fluctuations are similar in size. No precise cause
+is established and the failed gate remains. A separate real65552x512 default
+budget diagnostic (four pairs,including shutdown/recovery) did not reproduce
+V1 read amplification:paired query time-26.881%,whole-lifecycle peak-2.575%,
+physical I/O-1.976%. This does not pass the candidate or predict official E.
+Main implementation remains unchanged;final downstream acceptance is unrun.
+Evidence:parent minivec/block-scan-final-20261114/review.json and
+minivec/block-boundary-diagnostic-20261114/results.json.
+Baseline-only scheduling controls then ran32containers:both unrestricted and
+fixed-two-CPU protocols failed their declared peak-precision target. Additional
+quiet snapshots did not explain the accounting residual;the first runtime was
+not explicitly prewarmed and all results are retained. These controls do not
+reverse the candidate failure. Evidence:parent minivec/memory-controls-20261114.
+Both local Prompt copies now contain131071bytes and111valid references,with
+the original4.5core and every student word unchanged. New results are attributed
+to the Agent;post-core summaries were compacted with full prior material archived.
+
+
+Tonight's authorized submission preparation (2026-11-14): restore the exact
+implementation and build inputs of official ac85bab5046f09117aa05652d7d3cbcf936762c3,
+which passed formal MySQL and recorded E3841.678288/Prompt4.5. This follows
+today's E3396.585802 result from8e5b65de4 and the subsequent rejected prototypes.
+All optimization commits and isolated experiments remain archived. This is a
+regular forward commit;no history rewrite. Prompt materials retain the full
+original valid4.5core/student words,include the actual failed experiments,and
+restore an informative material summary. Prompt invalidity's actual cause is
+unknown;no score improvement is predicted. Submission is not yet accepted.
