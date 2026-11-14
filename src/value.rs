@@ -533,6 +533,64 @@ pub unsafe fn dist_sq_avx2_topm_i8(a: &[i8], b: &[i8]) -> i32 {
     lanes.iter().sum()
 }
 
+/// The same table-scale error proof as int8, with a finer [-8191,8191] grid.
+pub fn i14_encode_topm(vector: &[f32], scale: f64, out: &mut Vec<i16>) -> bool {
+    if vector.len() != 128 || !scale.is_finite() || scale <= 0.0 { return false; }
+    for &value in vector {
+        let quantized = ((value as f64) / scale).round();
+        if !quantized.is_finite() || quantized.abs() > 8191.0 { return false; }
+        out.push(quantized as i16);
+    }
+    true
+}
+
+/// Exact squared grid distance. Both inputs must be encoded in [-8191,8191].
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn dist_sq_avx2_topm_i14(a: &[i16], b: &[i16]) -> u64 {
+    use std::arch::x86_64::{
+        _mm256_add_epi32, _mm256_loadu_si256, _mm256_madd_epi16,
+        _mm256_setzero_si256, _mm256_storeu_si256, _mm256_sub_epi16,
+    };
+    debug_assert_eq!(a.len(), 128);
+    debug_assert_eq!(b.len(), 128);
+    debug_assert!(a.iter().chain(b).all(|v| (-8191..=8191).contains(v)));
+    let (mut acc0, mut acc1, mut acc2, mut acc3) = (
+        _mm256_setzero_si256(), _mm256_setzero_si256(),
+        _mm256_setzero_si256(), _mm256_setzero_si256(),
+    );
+    for i in (0..128).step_by(64) {
+        for block in 0..4 {
+            let offset = i + block * 16;
+            let va = _mm256_loadu_si256(a.as_ptr().add(offset).cast());
+            let vb = _mm256_loadu_si256(b.as_ptr().add(offset).cast());
+            let d = _mm256_sub_epi16(va, vb);
+            // |d|<=16382; each pair<=536739848<i32::MAX. Each final
+            // lane sums 16 squares<=4293918784<u32::MAX. add_epi32 is
+            // modular, so reinterpret its final lanes as unsigned, not i32.
+            let squared = _mm256_madd_epi16(d, d);
+            match block {
+                0 => acc0 = _mm256_add_epi32(acc0, squared),
+                1 => acc1 = _mm256_add_epi32(acc1, squared),
+                2 => acc2 = _mm256_add_epi32(acc2, squared),
+                _ => acc3 = _mm256_add_epi32(acc3, squared),
+            }
+        }
+    }
+    let acc = _mm256_add_epi32(_mm256_add_epi32(acc0, acc1), _mm256_add_epi32(acc2, acc3));
+    let mut lanes = [0u32; 8];
+    _mm256_storeu_si256(lanes.as_mut_ptr().cast(), acc);
+    lanes.iter().map(|&v| v as u64).sum()
+}
+
+/// At8191, f64 division rounding is below2^-40 grid units per operand.
+/// Budget more than twice that in the Minkowski error, independently of
+/// the separate f32/f64-kernel slack. Only the error scale is inflated;
+/// the caller's squared grid distance retains its actual table scale.
+pub fn certified_query_i14_lower_bound(s: f64, scale: f64) -> f64 {
+    certified_query_i8_lower_bound(s, scale * (1.0 + 4e-12))
+}
+
 /// Conservative original-distance lower bound from the exact integer grid.
 pub fn certified_query_i8_lower_bound(s: f64, scale: f64) -> f64 {
     if !s.is_finite() || s < 0.0 || !scale.is_finite() || scale <= 0.0 {
@@ -775,6 +833,56 @@ pub fn certified_query_lower_bound(s: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn i14_simd_matches_u64_at_unsigned_lane_boundary() {
+        if !certified_query_i8_enabled() { return; }
+        #[cfg(target_arch = "x86_64")]
+        {
+            let mut seed = 0x140014008191u64;
+            for case in 0..1028 {
+                let mut a = [0i16; 128];
+                let mut b = [0i16; 128];
+                for i in 0..128 {
+                    seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+                    a[i] = match case { 0 => -8191, 1 => 8191, 2 => if i%2==0 {8191} else {-8191}, _ => (seed % 16383) as i16 - 8191 };
+                    seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+                    b[i] = match case { 0 => 8191, 1 => -8191, 2 => -a[i], _ => (seed % 16383) as i16 - 8191 };
+                }
+                let expected: u64 = a.iter().zip(b).map(|(&x,y)| {
+                    let d = x as i64 - y as i64; (d*d) as u64
+                }).sum();
+                assert_eq!(unsafe { dist_sq_avx2_topm_i14(&a, &b) }, expected);
+                if case < 3 { assert_eq!(expected, 34351350272); }
+            }
+        }
+    }
+
+    #[test]
+    fn i14_encoding_and_certificate_cover_f32_truth() {
+        if !certified_query_i8_enabled() || !certified_query_f32_enabled() { return; }
+        #[cfg(target_arch = "x86_64")]
+        for maximum in [f32::from_bits(1), 1e-30, 1e-5, 1.0, 1000.0, f32::MAX] {
+            let scale = maximum as f64 / 8191.0;
+            for step in 0..32 {
+                let a: Vec<f32> = (0..128).map(|i| maximum * (((i*37+step*71)%257) as f32 / 128.0 - 1.0)).collect();
+                let b: Vec<f32> = (0..128).map(|i| maximum * (((i*19+step*47)%257) as f32 / 128.0 - 1.0)).collect();
+                let mut ea = Vec::new(); let mut eb = Vec::new();
+                assert!(i14_encode_topm(&a, scale, &mut ea));
+                assert!(i14_encode_topm(&b, scale, &mut eb));
+                for (raw, encoded) in a.iter().zip(&ea).chain(b.iter().zip(&eb)) {
+                    assert!(((*raw as f64) - (*encoded as f64)*scale).abs() <= scale*(0.5+2e-12));
+                }
+                let s = unsafe { dist_sq_avx2_topm_i14(&ea, &eb) } as f64 * scale * scale;
+                let lower = certified_query_i14_lower_bound(s, scale);
+                let truth: f64 = a.iter().zip(&b).map(|(&x,&y)| { let d=x as f64-y as f64; d*d }).sum();
+                assert!(lower.is_nan() || lower <= truth, "lower={lower} truth={truth}");
+            }
+        }
+        for query in [[f32::NAN; 128], [f32::INFINITY; 128], [8192.0; 128]] {
+            assert!(!i14_encode_topm(&query, 1.0, &mut Vec::new()));
+        }
+    }
 
     #[test]
     fn vector_reservation_is_bounded_by_input_size() {

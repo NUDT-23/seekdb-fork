@@ -77,7 +77,7 @@ Both the `--command` (local binary) and `--image` (Docker) runs pass 20/20 publi
 - `UPDATE` (including vector values) and `DELETE`; primary-key updates are rejected.
 - `BEGIN`, `COMMIT`, `ROLLBACK`; autocommit outside an explicit transaction.
 
-Distance TopK filters first, then selects the K smallest distances. Ties always use ascending primary key. Exact mode returns distances accumulated in float64; ANN mode uses a float32 accumulator over stored float32 vectors. On the serial 128-dimensional flat-cache path, TopM=32 candidates are rescored from component zero with the original f64 kernel and accepted only when every excluded row is certified strictly worse than the exact Kth candidate. Candidate scanning has three certified levels: a table-scaled int8 mirror using exact integer SIMD, an RNE-f16 mirror, and the original full-f32 TopM pass. Int8 reads 128 bytes per row and f16 reads 256; both use quantization-aware lower bounds. Int8 uses one table-wide scale, so an all-zero table, an out-of-range query or an inadequate distance gap rejects that level. Each snapshot keeps one compressed mirror: int8 when available, otherwise f16. Its failure falls back to f32 and then the original full f64 scan, always discarding intermediate heaps. Thus exact distances, row selection and primary-key ties are unchanged. Other dimensions, parallel scans, transactions and K>=32 use the original path. Small-table ANN may probe IVF lists; larger tables fall back to bounded exact scanning.
+Distance TopK filters first, then selects the K smallest distances. Ties always use ascending primary key. Exact mode returns distances accumulated in float64; ANN mode uses a float32 accumulator over stored float32 vectors. On the serial 128-dimensional flat-cache path, TopM=32 candidates are rescored from component zero with the original f64 kernel and accepted only when every excluded row is certified strictly worse than the exact Kth candidate. Candidate scanning uses a table-scaled int8 or signed-14-bit i16 mirror with exact integer SIMD, an RNE-f16 mirror, and the original full-f32 TopM pass. Int8 reads 128 bytes per row and f16 reads 256; both use quantization-aware lower bounds. Int8 uses one table-wide scale, so an all-zero table, an out-of-range query or an inadequate distance gap rejects that level. Each serial snapshot keeps one compressed mirror, calibrated from up to eight table rows: prefer int8 when at most one probe fails, then test i14, and compare f16 if i14 remains inadequate. Each actual query still proves its own result. Its failure falls back to f32 and then the original full f64 scan, always discarding intermediate heaps. Thus exact distances, row selection and primary-key ties are unchanged. Other dimensions, parallel scans, transactions and K>=32 use the original path. Small-table ANN may probe IVF lists; larger tables fall back to bounded exact scanning.
 
 Unsupported SQL fails explicitly rather than being reinterpreted. The implementation rejects NULL, JOIN, aggregation, subqueries, ALTER/DROP, primary-key updates, unsupported scalar types, and nested transactions.
 
@@ -222,7 +222,7 @@ limits and exact internal evidence references in both synchronized JSON copies.
 1. The official protocol is now published (`STDIO_PROTOCOL.md`, commit `f4d4e2665`) and fully implemented; the frozen platform-side error-code mapping (`config.json "error_codes"`) is still empty locally, so error codes beyond the public cases' vocabulary are our semantic names (the judge currently only requires a non-empty `error.code` string).
 2. IVF-Flat ANN is implemented (deterministic k-means, inverted lists, incremental maintenance, restart rebuild) but recall on 128-dim uniform benchmark data is ~0.84, below the 0.95 bar, so submission mode is exact scanning. IVF remains enabled for `search_mode:"ann"` on smaller/clusterable datasets.
 3. Single-client and single-transaction limits are intentional. No network protocol, NULL, joins, aggregates, distributed execution or concurrent transaction support is provided.
-4. The certified TopM acceleration is restricted to serial, 128-dimensional flat-cache TopK with K<32 and a default IEEE arithmetic environment; f16 additionally requires F16C and int8 requires AVX2 plus enough cache budget for the mirrors. Int8's table-wide scale can be ineffective on skewed data, and duplicate-heavy or otherwise certificate-failing inputs pay for one or more candidate passes before the full f64 fallback. WSL and local Docker gains are controlled local measurements only; the latest formal performance result is E=3769.381119 from commit `015651fb8` (MySQL admission passed). That submission has no valid numeric Prompt result; its specific review failure or pending status is not exposed in the result-detail API. The earlier commit `48a23c603` had valid Prompt raw3.5.
+4. The certified TopM acceleration is restricted to serial, 128-dimensional flat-cache TopK with K<32 and a default IEEE arithmetic environment; f16 additionally requires F16C and int8 requires AVX2 plus enough cache budget for the mirrors. Int8's table-wide scale can be ineffective on skewed data, and duplicate-heavy or otherwise certificate-failing inputs pay for one or more candidate passes before the full f64 fallback. WSL and local Docker gains are controlled local measurements only; the latest formal result is E=3841.678288 and Prompt=4.5 from commit `ac85bab5` (MySQL admission passed). The historical `015651fb8` result was E=3769.381119 with no valid numeric Prompt result; its specific review failure was not exposed in the result-detail API. The earlier commit `48a23c603` had valid Prompt raw3.5.
 
 Submission preparation on 2026-11-12: final source matches the retained validated
 candidate. Fresh checks pass 20 release units, 20 public official cases, six
@@ -287,3 +287,88 @@ peak falls14.3621% in matched local tests.21units,20public cases,6extended
 groups and deep-input/restart checks pass. Earlier sprint descriptions above
 are historical experiments. Prompt source records from the valid4.5 version
 remain intact. A new official score is pending.
+
+
+Latest formal result (ac85bab5, submitted2026-11-13 23:57 Asia/Shanghai):
+MySQL passed,E3841.678288,Prompt4.5. A subsequent local candidate selects
+one certified mirror using eight deterministic table-row probes at snapshot
+construction. It keeps int8 if at most one probe fails; otherwise it tests
+f16 and retains the mirror with more successful certificates, dropping both
+if neither succeeds. Later query order cannot change this choice. Each
+query still needs its own strict certificate or the original f32/f64 fallback.
+Two local seeds pass independent truth and exact output comparisons across
+six distributions;22units,20public,6extended and deep/restart checks pass.
+See minivec/nextday-20261114 in the parent workspace for measurements.
+This candidate is not formally submitted;E5000/Prompt15 remain unmet.
+
+
+Local i14 follow-up (not formally submitted): a finer [-8191,8191] grid stored
+in i16 avoids f16 decode on snapshots where int8 is inadequate. AVX2 lane
+sums are reinterpreted as u32 and reduced to u64; full-range tests cover
+the signed boundary. Original-f32 rescoring and strict certificates remain.
+Against calibrated-final, two Gaussian Docker seeds improve5.82%/8.31%;
+held-out sphere7.02%,clustered12.74%,uniform-0.61%. Whole-cgroup peak
+changes uniform-1.53%/Gaussian+1.63%;write-1.10%,all WAL hashes equal.
+26units,20public Docker cases,6extended and deep/restart checks pass.
+See parent workspace minivec/widegrid-20261114/review.json for raw runs.
+Formal E remains3841.678288,Prompt4.5;local gains do not forecast E5000.
+
+
+Final local proof refinement:the i14 error allowance explicitly covers f64
+division at grid magnitude8191,independently of the existing f32 slack.
+All correctness/performance/resource gates were rerun on the final binary;
+Gaussian Docker gains vs calibrated-final:+6.54%/+7.81% on two seeds.
+Held-out U/G/S/T/O/C query gains:+0.52/+7.81/+7.29/+0.41/+0.46/+12.77%;whole-cgroup U/G peaks:-1.59/+0.07%.
+26units,20public,6extended,deep/restart pass;all write WAL hashes match.
+Shared immutable row prototype was rejected:queries-3.59%/-3.71%,with
+only1.97%/6.27%peak reduction. It was never copied into this repo.
+Current artifacts and full measurements:parent workspace
+minivec/widegrid-proof-20261114/README.md and review.json. No formal submission.
+
+
+Latest local follow-up: snapshot f32-candidate dispatch and exact zero-distance
+early stop with an out-of-line full-f64 fallback. Every accepted candidate
+still needs its per-query certificate. Unique ascending PKs justify the
+zero-threshold stop. Docker ties gains on three seeds:+27.12/+25.84/+25.00%;
+held-out U/G/S/T/O/C:-0.72/+1.24/+0.19/+25.84/+0.40/+2.78% vs widegrid-proof. Other ordinary
+distribution results are small;no official E extrapolation.28units,20public,
+6extended,parallel/deep/restart pass;all12write WAL hashes equal.
+Shared column-value arrays were rejected after outlier/sphere regression.
+Full evidence:parent workspace minivec/dispatch-split-20261114/review.json.
+Formal commit and scores unchanged;no new formal submission.
+
+Latest structural follow-up (workspace artifacts dated2026-11-14):the retained
+implementation is still dispatch-split. An isolated lossless cache-key prototype
+failed its initial ties-time gate. A combined compact-key/borrowed single-buffer
+JSON prototype passed32units and independent query truths, with roughly5–8%
+lower cgroup peak across two resource seeds. It failed the predeclared write-time
+gate (-5.18% ratio of independent medians), so neither prototype was copied here.
+Paired write estimates are less negative but inconclusive;all12WAL hashes match.
+Full downstream regression was not run after that failure. Complete evidence is
+in the parent workspace minivec/compact-response-20261114/review.json.
+The two Prompt material files now record the student's actual structural question
+and attributed Agent experiments:130730bytes,110valid references;the original
+valid4.5core remains intact. No new student postinterpretation or acceptance is
+claimed. Formal ac85bab5 remains MySQL passed,E3841.678288,Prompt4.5;no new
+submission or E/Prompt forecast was made.
+
+
+Submission preparation (2026-11-14, before 16:00 Asia/Shanghai): the user
+authorized one attempt with the retained dispatch-split artifact, followed by
+continued optimization. Its executable SHA256 is
+52f13723cc3fe65ff551b7acc5f0b4695a0dfcc8f0bb29e223005fc40e52a459.
+The latest direct comparison uses the actual submitted ac85bab executable,
+156 sequential fresh containers, two seeds, and six distributions. Query time
+gains are uniform +0.116%, Gaussian +32.072%, sphere +31.882%, ties +26.904%,
+outlier +10.708%, clustered +22.330%. Physical I/O is unchanged; Gaussian,
+sphere, and clustered query peaks increase about 7–11%. Sphere write wall
+time regresses 2.354%; same-binary controls show write-time variability, so
+the regression cause and nonregression remain unresolved. This comparison
+includes initialization, load, preparation, disjoint warmup and primary-query
+resource costs, with a shared local device and warm runtime pages. It is not
+an official E forecast. Evidence is in parent minivec/direct-costs-20261114.
+The frozen source previously passed 28 release units, 20 public Docker cases,
+extended, parallel, and deep/restart checks. No fresh multi-GiB recovery is
+claimed for this artifact. Both learning-material copies contain 130957 bytes
+and 111 valid references, preserving the original valid-4.5 core and student
+words. Submission authorization adds no student technical explanation.

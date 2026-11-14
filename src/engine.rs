@@ -12,7 +12,7 @@ use crate::value::{
     certified_query_f16_enabled, certified_query_f16_lower_bound, certified_query_f32_enabled,
     certified_query_i8_enabled, certified_query_i8_lower_bound, certified_query_lower_bound,
     check_varchar, dist_sq_f64_abandon, f16_decode_topm, f16_encode_topm, i8_encode_topm,
-    i8_scale_topm, l2_distance, l2_distance_sq_fast, l2_distance_sq_fast_topm_f16_x4,
+    i8_scale_topm, i14_encode_topm, certified_query_i14_lower_bound, l2_distance, l2_distance_sq_fast, l2_distance_sq_fast_topm_f16_x4,
     l2_distance_sq_fast_topm_x4, parse_vector, ColKind, Schema,
 };
 
@@ -74,10 +74,14 @@ struct ScanCache {
     /// Optional table-scale int8 mirror for the exact integer candidate pass.
     i8_flat: Vec<i8>,
     i8_scale: f64,
+    i14_flat: Vec<i16>,
+    i14_scale: f64,
     /// Optional 128-dimensional RNE-f16 mirror; empty means unavailable.
     f16_flat: Vec<u16>,
     /// Maximum of conservative per-row original-f32 norm upper bounds.
     f16_max_norm_upper: f64,
+    /// Snapshot-local performance heuristic;failed/omitted candidates use f64.
+    use_f32_candidates: bool,
     filtered_positions: std::cell::RefCell<Option<(Vec<BInstr>, Rc<Vec<usize>>)>>,
 }
 
@@ -601,12 +605,17 @@ impl Engine {
                     true
                 });
                 if valid {
-                    self.scan_caches.insert(table_id, ScanCache {
+                    let mut cache = ScanCache {
                         version, dim, rows, flat: Vec::new(), originals,
                         i8_flat: encoded, i8_scale: scale,
+                        i14_flat: Vec::new(), i14_scale: 0.0,
                         f16_flat: Vec::new(), f16_max_norm_upper: 0.0,
-                        filtered_positions: std::cell::RefCell::new(None),
-                    });
+                        use_f32_candidates: true,
+                filtered_positions: std::cell::RefCell::new(None),
+                    };
+                    calibrate_candidate_mirror(&mut cache);
+                    calibrate_f32_dispatch(&mut cache);
+                    self.scan_caches.insert(table_id, cache);
                     self.store.evict_table_vectors(table_id);
                     return;
                 }
@@ -689,9 +698,7 @@ impl Engine {
         } else {
             (Vec::new(), 0.0)
         };
-        self.scan_caches.insert(
-            table_id,
-            ScanCache {
+        let mut cache = ScanCache {
                 version,
                 dim,
                 rows,
@@ -699,11 +706,14 @@ impl Engine {
                 originals: Vec::new(),
                 i8_flat,
                 i8_scale,
+                i14_flat: Vec::new(), i14_scale: 0.0,
                 f16_flat,
                 f16_max_norm_upper,
+                use_f32_candidates: true,
                 filtered_positions: std::cell::RefCell::new(None),
-            },
-        );
+            };
+        if self.scan_threads == 1 { calibrate_candidate_mirror(&mut cache); calibrate_f32_dispatch(&mut cache); }
+        self.scan_caches.insert(table_id, cache);
         self.store.evict_table_vectors(table_id);
     }
 
@@ -1186,7 +1196,14 @@ impl Engine {
                     } else {
                         false
                     };
-                    let f16_accepted = if !i8_accepted
+                    let i14_accepted = if !i8_accepted && try_query_topm
+                        && !cache.i14_flat.is_empty() && certified_query_i8_enabled()
+                    {
+                        let mut encoded_query = Vec::with_capacity(128);
+                        i14_encode_topm(q_ref, cache.i14_scale, &mut encoded_query)
+                            && flat_scan_query_topm_i14(cache, filter_ref, q_ref, &encoded_query, limit, &mut topk)
+                    } else { false };
+                    let f16_accepted = if !i8_accepted && !i14_accepted
                         && try_query_topm
                         && !cache.f16_flat.is_empty()
                         && certified_query_f16_enabled()
@@ -1213,8 +1230,10 @@ impl Engine {
                         false
                     };
                     if !(i8_accepted
+                        || i14_accepted
                         || f16_accepted
                         || (try_query_topm
+                            && cache.use_f32_candidates
                             && flat_scan_query_topm(
                                 cache,
                                 filter_ref,
@@ -1483,6 +1502,8 @@ impl Ord for ApproxScanItem {
 /// Original serial flat scan, also used as the whole-query fallback. Keeping
 /// this as a separate empty-heap path prevents approximate candidates or exact
 /// candidate results from leaking into a certificate-failure result.
+// Keep fallback control flow out of the hot compressed-candidate query body.
+#[inline(never)]
 fn flat_scan_serial_f64<'a>(
     cache: &'a ScanCache,
     filter: Option<&BoundFilter>,
@@ -1507,13 +1528,117 @@ fn flat_scan_serial_f64<'a>(
             topk.push(candidate);
             if topk.len() == limit {
                 threshold = topk.peek().map_or(f64::INFINITY, |w| w.distance);
+                // A full heap with kth distance0 is globally optimal. Rows
+                // and cached filter positions are in ascending unique PK
+                // order, so no future row can win an equal-distance tie.
+                if threshold == 0.0 { break; }
             }
         } else if topk.peek().map_or(false, |worst| candidate < *worst) {
             topk.pop();
             topk.push(candidate);
             threshold = topk.peek().map_or(f64::INFINITY, |w| w.distance);
+                // A full heap with kth distance0 is globally optimal. Rows
+                // and cached filter positions are in ascending unique PK
+                // order, so no future row can win an equal-distance tie.
+                if threshold == 0.0 { break; }
         }
     }
+}
+
+/// Select a bounded optional mirror once per immutable snapshot. Probes use
+/// evenly spaced original rows, never request history. Every later query still
+/// proves its own result with the unchanged certificate/full-precision fallback.
+fn calibrate_candidate_mirror(cache: &mut ScanCache) {
+    if cache.dim != 128 || cache.i8_flat.is_empty() || !certified_query_f32_enabled() {
+        return;
+    }
+    let count = cache.rows.len().min(8);
+    if count == 0 { return; }
+    let queries: Vec<Vec<f32>> = (0..count)
+        .map(|i| cache.vector(i * cache.rows.len() / count).to_vec()).collect();
+    let i8_success = queries.iter().filter(|query| {
+        let mut encoded = Vec::with_capacity(128);
+        let mut topk = BinaryHeap::new();
+        i8_encode_topm(query, cache.i8_scale, &mut encoded)
+            && flat_scan_query_topm_i8(cache, None, query, &encoded, 10, &mut topk)
+    }).count();
+    // Keep the smaller/faster integer mirror when at most one probe fails.
+    if i8_success + 1 >= count { return; }
+    cache.i8_flat = Vec::new();
+    cache.i14_scale = cache.i8_scale * (127.0 / 8191.0);
+    let attach_i14 = |cache: &mut ScanCache| {
+        let mut encoded = Vec::with_capacity(cache.rows.len() * cache.dim);
+        for i in 0..cache.rows.len() {
+            if !i14_encode_topm(cache.vector(i), cache.i14_scale, &mut encoded) { return false; }
+        }
+        cache.i14_flat = encoded;
+        true
+    };
+    let i14_success = if attach_i14(cache) {
+        queries.iter().filter(|query| {
+            let mut encoded = Vec::with_capacity(128);
+            let mut topk = BinaryHeap::new();
+            i14_encode_topm(query, cache.i14_scale, &mut encoded)
+                && flat_scan_query_topm_i14(cache, None, query, &encoded, 10, &mut topk)
+        }).count()
+    } else { 0 };
+    if i14_success + 1 >= count { return; }
+    cache.i14_flat = Vec::new();
+    let mut encoded = Vec::with_capacity(cache.rows.len() * cache.dim);
+    let mut norm = 0f64;
+    let f16_valid = certified_query_f16_enabled() && (0..cache.rows.len()).all(|i| {
+        match f16_encode_topm(cache.vector(i), &mut encoded) {
+            Some(value) => { norm = norm.max(value); true }
+            None => false,
+        }
+    });
+    let mut f16_success = 0usize;
+    if f16_valid {
+        cache.f16_flat = encoded;
+        cache.f16_max_norm_upper = norm;
+        f16_success = queries.iter().filter(|query| {
+            let mut encoded_query = Vec::with_capacity(128);
+            let mut decoded_query = Vec::with_capacity(128);
+            let mut topk = BinaryHeap::new();
+            match f16_encode_topm(query, &mut encoded_query) {
+                Some(query_norm) if f16_decode_topm(&encoded_query, &mut decoded_query) =>
+                    flat_scan_query_topm_f16(cache, None, query, &decoded_query, query_norm, 10, &mut topk),
+                _ => false,
+            }
+        }).count();
+    } else {
+        drop(encoded);
+    }
+    if f16_success > i8_success && f16_success > i14_success { return; }
+    cache.f16_flat = Vec::new();
+    cache.f16_max_norm_upper = 0.0;
+    if i14_success > i8_success {
+        attach_i14(cache);
+        return;
+    }
+    if i8_success > 0 {
+        let mut encoded = Vec::with_capacity(cache.rows.len() * cache.dim);
+        for i in 0..cache.rows.len() {
+            if !i8_encode_topm(cache.vector(i), cache.i8_scale, &mut encoded) { return; }
+        }
+        cache.i8_flat = encoded;
+    }
+}
+
+/// If no compressed mirror survives,probe the original f32 candidate pass.
+/// Skipping it is always exact:the ordinary full-f64 scan handles the query.
+/// Probe success predicts cost only;any actual accepted f32 pass still needs
+/// its own strict certificate. Request history never changes this flag.
+fn calibrate_f32_dispatch(cache: &mut ScanCache) {
+    if cache.dim != 128 || cache.rows.len() <= QUERY_TOPM
+        || !cache.i8_flat.is_empty() || !cache.i14_flat.is_empty()
+        || !cache.f16_flat.is_empty() || !certified_query_f32_enabled() { return; }
+    let count=cache.rows.len().min(8);
+    cache.use_f32_candidates=(0..count).any(|i| {
+        let query=cache.vector(i*cache.rows.len()/count);
+        let mut topk=BinaryHeap::new();
+        flat_scan_query_topm(cache,None,query,10,&mut topk)
+    });
 }
 
 /// Integer-grid candidate pass. The integer sum is exact; scale is applied
@@ -1598,6 +1723,88 @@ fn flat_scan_query_topm_i8<'a>(
     true
 }
 
+/// Integer-grid candidate pass. The integer sum is exact; scale is applied
+/// once per row and the query certificate covers the original f32/f64 result.
+fn flat_scan_query_topm_i14<'a>(
+    cache: &'a ScanCache,
+    filter: Option<&BoundFilter>,
+    qvec: &[f32],
+    encoded_query: &[i16],
+    limit: usize,
+    topk: &mut BinaryHeap<HeapItem<'a>>,
+) -> bool {
+    debug_assert_eq!(cache.dim, 128);
+    debug_assert_eq!(cache.i14_flat.len(), cache.rows.len() * cache.dim);
+    debug_assert!(limit > 0 && limit < QUERY_TOPM);
+    let dim = cache.dim;
+    let scale_sq = cache.i14_scale * cache.i14_scale;
+    if !scale_sq.is_finite() || scale_sq <= 0.0 {
+        return false;
+    }
+    let mut eligible = 0usize;
+    let mut approx: BinaryHeap<(u64, i64, usize)> = BinaryHeap::with_capacity(QUERY_TOPM + 1);
+    let positions = filter.and_then(|f| cache.positions(f));
+    let count = positions.as_ref().map_or(cache.rows.len(), |p| p.len());
+    for index in 0..count {
+        let position = positions.as_ref().map_or(index, |p| p[index]);
+        let row = &cache.rows[position];
+        if positions.is_none() && filter.map_or(false, |f| !eval_bound(f, row)) { continue; }
+        eligible += 1;
+        let vector = &cache.i14_flat[position * dim..(position + 1) * dim];
+        #[cfg(target_arch = "x86_64")]
+        let distance = unsafe { crate::value::dist_sq_avx2_topm_i14(vector, encoded_query) };
+        #[cfg(not(target_arch = "x86_64"))]
+        let distance: u64 = vector.iter().zip(encoded_query).map(|(&x,&y)| { let d=x as i64-y as i64; (d*d) as u64 }).sum();
+        let candidate = (distance, row.pk, position);
+        if approx.len() < QUERY_TOPM {
+            approx.push(candidate);
+        } else if approx.peek().map_or(false, |worst| candidate < *worst) {
+            approx.pop();
+            approx.push(candidate);
+        }
+    }
+
+    let mut exact: BinaryHeap<HeapItem> = BinaryHeap::with_capacity(limit + 1);
+    for approximate in approx.iter() {
+        let row = &cache.rows[approximate.2];
+        let vector = cache.vector(approximate.2);
+        let Some(distance) = dist_sq_f64_abandon(vector, qvec, f64::INFINITY) else {
+            return false;
+        };
+        if !distance.is_finite() {
+            return false;
+        }
+        let candidate = HeapItem { row, distance };
+        if exact.len() < limit {
+            exact.push(candidate);
+        } else if exact.peek().map_or(false, |worst| candidate < *worst) {
+            exact.pop();
+            exact.push(candidate);
+        }
+    }
+
+    if eligible <= QUERY_TOPM {
+        *topk = exact;
+        return true;
+    }
+    let Some(worst_approx) = approx.peek() else {
+        return false;
+    };
+    let Some(worst_exact) = exact.peek() else {
+        return false;
+    };
+    let lower = certified_query_i14_lower_bound((worst_approx.0 as f64) * scale_sq, cache.i14_scale);
+    let threshold = worst_exact.distance;
+    if !lower.is_finite() || !threshold.is_finite() || lower <= threshold {
+        return false;
+    }
+    // S>=S_M on the integer grid for every excluded row. The global scale
+    // gives one monotone quantization bound; strict LB>T protects exact ties
+    // and primary-key ordering before publishing the exact candidate heap.
+    *topk = exact;
+    true
+}
+
 /// Compressed candidate pass. Every exact distance still comes from the
 /// original f32 row and original qvec; decoded_query is used only for TopM.
 fn flat_scan_query_topm_f16<'a>(
@@ -1610,7 +1817,7 @@ fn flat_scan_query_topm_f16<'a>(
     topk: &mut BinaryHeap<HeapItem<'a>>,
 ) -> bool {
     debug_assert_eq!(cache.dim, 128);
-    debug_assert_eq!(cache.f16_flat.len(), cache.flat.len());
+    debug_assert_eq!(cache.f16_flat.len(), cache.rows.len() * cache.dim);
     debug_assert!(limit > 0 && limit < QUERY_TOPM);
     let dim = cache.dim;
     let mut eligible = 0usize;
@@ -1998,6 +2205,46 @@ mod query_topm_tests {
     use super::*;
 
     #[test]
+    fn exact_zero_threshold_stop_keeps_smallest_filtered_primary_keys() {
+        let vectors=(0..1000).map(|pk| vec![if pk%13==5 {0.0} else {3.0};128]).collect();
+        let cache=cache_from_vectors(vectors);
+        for even_only in [false,true] {
+            let filter=if even_only {category_filter("even")} else {None};
+            for k in [1,10,31] {
+                let mut actual=BinaryHeap::new();
+                flat_scan_serial_f64(&cache,filter.as_ref(),&[0.0;128],k,&mut actual);
+                let expected:Vec<(i64,u64)>=(0..1000).filter(|pk| pk%13==5 && (!even_only || pk%2==0))
+                    .take(k).map(|pk| (pk,0.0f64.to_bits())).collect();
+                assert_eq!(snapshot(actual),expected);
+            }
+        }
+        let mut empty=BinaryHeap::new();
+        flat_scan_serial_f64(&cache,category_filter("none").as_ref(),&[0.0;128],10,&mut empty);
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn f32_dispatch_calibration_skips_unprovable_ties() {
+        if !certified_query_f32_enabled() { return; }
+        let mut distinct=cache_from_vectors(patterned_vectors(80));
+        calibrate_f32_dispatch(&mut distinct);
+        assert!(distinct.use_f32_candidates);
+        let mut tied=cache_from_vectors(vec![vec![1.0;128];80]);
+        calibrate_f32_dispatch(&mut tied);
+        assert!(!tied.use_f32_candidates);
+        for query in [[0.0;128],[1.0;128],[f32::MAX;128]] {
+            for filter in [None,category_filter("even"),category_filter("none")] {
+                let mut actual=BinaryHeap::new();
+                if !(tied.use_f32_candidates && flat_scan_query_topm(&tied,filter.as_ref(),&query,10,&mut actual)) {
+                    flat_scan_serial_f64(&tied,filter.as_ref(),&query,10,&mut actual);
+                }
+                assert_eq!(snapshot(actual),snapshot(expected_f64(&tied,&filter,&query)));
+                assert!(!tied.use_f32_candidates);
+            }
+        }
+    }
+
+    #[test]
     fn one_compressed_mirror_preserves_exact_fallbacks() {
         let dir = std::env::temp_dir().join(format!("mvdb-singlemirror-{}-{}", std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
@@ -2014,7 +2261,9 @@ mod query_topm_tests {
         }
         let table = engine.resolve_table("t").unwrap().0;
         if certified_query_i8_enabled() {
-            assert!(!engine.scan_caches[&table].i8_flat.is_empty());
+            // Identical rows cannot pass either strict TopM certificate.
+            assert!(engine.scan_caches[&table].i8_flat.is_empty());
+            assert!(engine.scan_caches[&table].i14_flat.is_empty());
             assert!(engine.scan_caches[&table].f16_flat.is_empty());
         }
         engine.execute("UPDATE t SET v='[0,0]' WHERE id=0").unwrap_err();
@@ -2144,9 +2393,11 @@ mod query_topm_tests {
             originals: Vec::new(),
             i8_flat: Vec::new(),
             i8_scale: 0.0,
+            i14_flat: Vec::new(), i14_scale: 0.0,
             f16_flat: Vec::new(),
             f16_max_norm_upper: 0.0,
-            filtered_positions: std::cell::RefCell::new(None),
+            use_f32_candidates: true,
+                filtered_positions: std::cell::RefCell::new(None),
         }
     }
 
@@ -2403,6 +2654,93 @@ mod query_topm_tests {
         assert!(!attach_i8(&mut zero));
         let mut oversized_query = Vec::new();
         assert!(!i8_encode_topm(&[f32::MAX; 128], 1.0 / 127.0, &mut oversized_query));
+    }
+
+    #[test]
+    fn i14_k_boundaries_shared_originals_and_random_certificates() {
+        if !certified_query_i8_enabled() || !certified_query_f32_enabled() { return; }
+        let mut seed = 0x140014008192u64;
+        let mut random = || {
+            seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+            (seed >> 40) as f32 * (2.0 / 16777215.0) - 1.0
+        };
+        for count in [16,32,40,80,257] {
+            let vectors = (0..count).map(|_| (0..128).map(|_| random()).collect()).collect();
+            let mut cache = cache_from_vectors(vectors);
+            assert!(attach_i8(&mut cache));
+            cache.i14_scale = cache.i8_scale * (127.0/8191.0);
+            for v in cache.flat.chunks_exact(128) { assert!(i14_encode_topm(v, cache.i14_scale, &mut cache.i14_flat)); }
+            cache.i8_flat.clear();
+            cache.originals = cache.flat.chunks_exact(128).map(|v| Rc::new(v.to_vec())).collect();
+            cache.flat.clear();
+            let mut accepts = 0;
+            for _ in 0..12 {
+                let query: Vec<f32> = (0..128).map(|_| random() * 0.95).collect();
+                let mut encoded = Vec::new();
+                assert!(i14_encode_topm(&query, cache.i14_scale, &mut encoded));
+                for filter in [None, category_filter("even"), category_filter("none")] {
+                    for limit in [1,10,31] {
+                        let mut actual = BinaryHeap::new();
+                        if flat_scan_query_topm_i14(&cache, filter.as_ref(), &query, &encoded, limit, &mut actual) {
+                            accepts += 1;
+                        } else {
+                            assert!(actual.is_empty());
+                            flat_scan_serial_f64(&cache, filter.as_ref(), &query, limit, &mut actual);
+                        }
+                        let mut expected = BinaryHeap::new();
+                        flat_scan_serial_f64(&cache, filter.as_ref(), &query, limit, &mut expected);
+                        assert_eq!(snapshot(actual), snapshot(expected));
+                    }
+                }
+            }
+            assert!(accepts > 0);
+        }
+    }
+
+    #[test]
+    fn query_topm_i14_matches_f64_and_preserves_tie_fallback() {
+        if !certified_query_i8_enabled() { return; }
+        for vectors in [patterned_vectors(80), vec![vec![1.0;128];40],
+                        vec![vec![f32::from_bits(1);128];40], vec![vec![f32::MAX;128];40]] {
+            let mut cache = cache_from_vectors(vectors);
+            assert!(attach_i8(&mut cache));
+            cache.i14_scale = cache.i8_scale * (127.0/8191.0);
+            for v in cache.flat.chunks_exact(128) { assert!(i14_encode_topm(v, cache.i14_scale, &mut cache.i14_flat)); }
+            for filter in [None, category_filter("even"), category_filter("none")] {
+                for query in [[0.0;128], [0.012;128]] {
+                    let mut encoded = Vec::new();
+                    let mut actual = BinaryHeap::new();
+                    let accepted = i14_encode_topm(&query, cache.i14_scale, &mut encoded)
+                        && flat_scan_query_topm_i14(&cache, filter.as_ref(), &query, &encoded, 10, &mut actual);
+                    if accepted { assert_eq!(snapshot(actual), snapshot(expected_f64(&cache, &filter, &query))); }
+                    else { assert!(actual.is_empty()); }
+                }
+            }
+        }
+        let mut tied = cache_from_vectors(vec![vec![1.0;128];80]);
+        tied.i14_scale = 1.0/8191.0;
+        for v in tied.flat.chunks_exact(128) { assert!(i14_encode_topm(v, tied.i14_scale, &mut tied.i14_flat)); }
+        let mut actual = BinaryHeap::new();
+        assert!(!flat_scan_query_topm_i14(&tied, None, &[0.0;128], &[0;128], 10, &mut actual));
+        assert!(actual.is_empty());
+    }
+
+    #[test]
+    fn snapshot_calibration_retains_small_int8_and_retires_tied_mirrors() {
+        if !certified_query_i8_enabled() || !certified_query_f32_enabled() { return; }
+        let mut small = cache_from_vectors(patterned_vectors(16));
+        assert!(attach_i8(&mut small));
+        calibrate_candidate_mirror(&mut small);
+        assert!(!small.i8_flat.is_empty());
+        let mut tied = cache_from_vectors(vec![vec![1.0; 128]; 80]);
+        assert!(attach_i8(&mut tied));
+        tied.originals = tied.flat.chunks_exact(128).map(|v| Rc::new(v.to_vec())).collect();
+        tied.flat.clear();
+        calibrate_candidate_mirror(&mut tied);
+        assert!(tied.i8_flat.is_empty() && tied.i14_flat.is_empty() && tied.f16_flat.is_empty());
+        let mut topk = BinaryHeap::new();
+        flat_scan_serial_f64(&tied, None, &[0.0; 128], 10, &mut topk);
+        assert_eq!(snapshot(topk), snapshot(expected_f64(&tied, &None, &[0.0; 128])));
     }
 
     #[test]
