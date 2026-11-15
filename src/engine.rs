@@ -160,19 +160,23 @@ fn snapshot_columns(
             ColKind::Varchar(_) => {
                 let mut values = Vec::new();
                 let mut codes = Vec::with_capacity(pks.len());
-                let mut dictionary: HashMap<String, u8> = HashMap::new();
+                let mut dictionary: HashMap<&str, u8> = HashMap::new();
                 for pk in pks {
                     let VVal::Str(text) = &table.rows[pk].row.vals[col] else {
                         unreachable!("schema-checked VARCHAR snapshot value")
                     };
-                    if let Some(&code) = dictionary.get(text) {
+                    if let Some(&code) = dictionary.get(text.as_str()) {
                         codes.push(code);
                     } else if values.len() < 256 {
                         let code = values.len() as u8;
                         values.push(text.clone());
-                        dictionary.insert(text.clone(), code);
+                        dictionary.insert(text.as_str(), code);
                         codes.push(code);
                     } else {
+                        // Release partial dictionary state before allocating the full fallback.
+                        drop(dictionary);
+                        drop(values);
+                        drop(codes);
                         // Overflow loses only deduplication, never content.
                         return SnapshotColumn::Strings(pks.iter().map(|pk| {
                             match &table.rows[pk].row.vals[col] {

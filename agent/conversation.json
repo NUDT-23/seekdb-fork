@@ -1,12 +1,15 @@
 {
   "schema": "minivectordb-technical-decisions-v2",
-  "material_summary": "按技术问题组织判断、依据、确认、实测和取舍；保留历史技术原文及经审阅确认的解释，不保留普通聊天流水。",
-  "materials_scope": "2026-11-09至2026-11-15，本队轻向量数据库实现与验证。",
+  "material_summary": "按技术问题组织既有判断、依据、确认、实测和取舍，保留历史技术原文与复测顺序。新增字典诊断与修复验证均为Agent结果；已确认解释保持原文和真实来源。",
+  "materials_scope": "2026-11-09至2026-11-16，本队轻向量数据库实现、验证与既有材料整理。",
   "source_conventions": {
     "historical_user_statement": "既有记录中的真实技术追问、解释或确认，技术内容不改写。",
     "agent_draft_reviewed_and_confirmed_by_student": "Agent提供解释草稿，学生于本次会话审阅确认后纳入；不作为独立推导或亲自执行的记录。",
     "tool_result": "本队既有实验结果原文；本次整理未重新运行这些实验。",
-    "agent": "Agent提出的方案、执行说明或后续分析。"
+    "agent": "Agent提出的方案、执行说明或后续分析。",
+    "platform_result": "平台实际回执中的正式结果；只记录事实，不自动生成学生解释或因果归因。",
+    "historical_question_context": "既有学生问题及必要Agent背景；恢复上下文不等于主张评分资格。",
+    "agent_summary_of_tool_result": "Agent依据已执行工具记录整理的结果；不作为学生原话、亲自实施或理解证据。"
   },
   "review_confirmations": [
     {
@@ -14,7 +17,14 @@
       "date": "2026-11-15",
       "source": "student",
       "content": "我已经审阅了，可以作为解释写进正式材料",
-      "scope": "审阅确认测量边界、SoA取舍、ANN拒绝、WAL预触页假设四个主题的解释；WAL仅认可待验证方案。"
+      "scope": "审阅确认测量边界、SoA取舍、ANN拒绝、WAL预触页假设四个主题的解释；WAL仅认可待验证方案。",
+      "technical_record_ids": [
+        "measurement-boundary-correction",
+        "soa-whole-cost-tradeoff",
+        "ann-only-benefit-rejected",
+        "wal-pretouch-durability-plan"
+      ],
+      "attribution": "四个Agent起草解释共用一次学生审阅确认；不是四条独立用户原话，也不证明学生独立执行实验。"
     }
   ],
   "technical_records": [
@@ -62,19 +72,22 @@
           "source": "student",
           "authorship": "historical_user_statement",
           "historical_record_id": "user-13",
-          "content": "在wsl使用cargo会不会性能比较差"
-        },
-        {
-          "source": "student",
-          "authorship": "historical_user_statement",
-          "historical_record_id": "user-20",
-          "content": "也要考虑我们的wsl环境"
+          "content": "在wsl使用cargo会不会性能比较差",
+          "phase": "question_context"
         },
         {
           "source": "student",
           "authorship": "historical_user_statement",
           "historical_record_id": "user-19",
-          "content": "确认"
+          "content": "确认",
+          "phase": "pre_decision"
+        },
+        {
+          "source": "student",
+          "authorship": "historical_user_statement",
+          "historical_record_id": "user-20",
+          "content": "也要考虑我们的wsl环境",
+          "phase": "post_initial_result_redirect"
         }
       ],
       "validation": {
@@ -85,16 +98,52 @@
         {
           "pointer": "/experiments/12/output",
           "excerpt": "Median improvement +4.3995%, below the student's predeclared +5% threshold."
-        },
-        {
-          "pointer": "/experiments/1/output",
-          "excerpt": "Median improvement +2.0524%, below the unchanged +5% threshold."
         }
       ],
       "tradeoff_and_reflection": {
         "source": "agent",
         "content": "两个环境均未达到5%，拒绝并回退。环境之间的差异说明需要部署复测，但未单独隔离编译器因素；不能把WSL的改善直接外推为评测收益。"
-      }
+      },
+      "retest_result_evidence": [
+        {
+          "pointer": "/experiments/1/output",
+          "excerpt": "Median improvement +2.0524%, below the unchanged +5% threshold."
+        }
+      ],
+      "source_chain_id": "perf-ab-2026-11-11-scan-q64",
+      "chronology": [
+        {
+          "order": 1,
+          "kind": "student_question_context",
+          "source_record_id": "user-13"
+        },
+        {
+          "order": 2,
+          "kind": "student_pre_decision",
+          "source_record_id": "user-19"
+        },
+        {
+          "order": 3,
+          "kind": "agent_initial_result",
+          "experiment_id": "experiment-scan-q64-ab"
+        },
+        {
+          "order": 4,
+          "kind": "student_post_initial_result_redirect",
+          "source_record_id": "user-20"
+        },
+        {
+          "order": 5,
+          "kind": "agent_docker_retest_result",
+          "experiment_id": "experiment-scan-q64-docker-ab"
+        },
+        {
+          "order": 6,
+          "kind": "agent_final_decision",
+          "decision": "Close q64: both WSL and official-flags Docker medians were below the student's 5% threshold; source remains at baseline."
+        }
+      ],
+      "chronology_basis": "Original chain 1 plus source-record order; chain recorded_at is metadata only, not per-event time."
     },
     {
       "id": "protocol-allocation-retest",
@@ -109,19 +158,22 @@
           "source": "student",
           "authorship": "historical_user_statement",
           "historical_record_id": "user-16",
-          "content": "5%，其他的都同意"
+          "content": "5%，其他的都同意",
+          "phase": "pre_decision"
         },
         {
           "source": "student",
           "authorship": "historical_user_statement",
           "historical_record_id": "user-17",
-          "content": "修改实验方案"
+          "content": "修改实验方案",
+          "phase": "post_initial_result_redirect"
         },
         {
           "source": "student",
           "authorship": "historical_user_statement",
           "historical_record_id": "user-18",
-          "content": "同意"
+          "content": "同意",
+          "phase": "final_student_decision"
         }
       ],
       "validation": {
@@ -132,16 +184,47 @@
         {
           "pointer": "/experiments/2/output",
           "excerpt": "Median improvement -0.1068%, below the student's predeclared +5% threshold."
-        },
-        {
-          "pointer": "/experiments/3/output",
-          "excerpt": "The revised experiment measured +1.3836% median improvement, positive but below the unchanged +5% student threshold. The variant was rejected again and source changes were reverted."
         }
       ],
       "tradeoff_and_reflection": {
         "source": "agent",
         "content": "修正后的微小正收益仍未过预声明门，拒绝方案并恢复源码。两次测量属于同一修正链；学生贡献是选门槛和要求修正，实验设计与实现归Agent。"
-      }
+      },
+      "retest_result_evidence": [
+        {
+          "pointer": "/experiments/3/output",
+          "excerpt": "The revised experiment measured +1.3836% median improvement, positive but below the unchanged +5% student threshold. The variant was rejected again and source changes were reverted."
+        }
+      ],
+      "source_chain_id": "perf-ab-2026-11-11-protocol-allocation",
+      "chronology": [
+        {
+          "order": 1,
+          "kind": "student_pre_decision",
+          "source_record_id": "user-16"
+        },
+        {
+          "order": 2,
+          "kind": "agent_initial_result",
+          "experiment_id": "experiment-protocol-allocation-ab"
+        },
+        {
+          "order": 3,
+          "kind": "student_post_initial_result_redirect",
+          "source_record_id": "user-17"
+        },
+        {
+          "order": 4,
+          "kind": "agent_persistent_retest_result",
+          "experiment_id": "experiment-protocol-allocation-persistent-retest"
+        },
+        {
+          "order": 5,
+          "kind": "student_final_decision",
+          "source_record_id": "user-18"
+        }
+      ],
+      "chronology_basis": "Original chain 0; chain recorded_at is metadata only, not per-event time."
     },
     {
       "id": "int8-exact-certificate",
@@ -156,7 +239,8 @@
           "source": "student",
           "authorship": "historical_user_statement",
           "historical_record_id": "user-29",
-          "content": "1. 同意保留 int8 作为新的性能基线。 它在 WSL 和 Docker 中都超过了 5% 的验收门槛，精确差分和完整回归也都通过了。\n2. int8 更快，主要因为扫描的数据量更小。 每个分量从 f16 的 2 字节进一步降到 1 字节，每行 128 维只读取 128 字节，同时整数 SIMD 可以直接累加平方差，减少浮点转换和计算开销。\n   它不会改变 exact 结果，是因为 int8 只负责筛选 TopM 候选，不负责最终答案。候选会重新用原始 f32 数据和原 f64 内核计算距离；只有证书能严格证明候选外记录不可能进入 TopK 时才接受，否则就回退重新扫描，因此最终行、距离和主键并列顺序不变。\n3. 偏斜、聚簇、大量重复或并列的数据可能让证书失效。 如果表中的极端值把全局量化比例拉得过大，普通向量的量化误差就会增大；当第 K 名与第 M 名之间距离间隔不足时，也无法安全排除候选外记录。全零表、查询超出 int8 编码范围等情况同样不能直接加速。\n   这时应当放弃 int8，依次回退到 f16、f32 TopM，必要时执行原 f64 全扫。这样可能多付一次候选扫描、性能变慢，但正确性不能让步；f16 镜像也应保留，作为偏斜数据的第二级加速。"
+          "content": "1. 同意保留 int8 作为新的性能基线。 它在 WSL 和 Docker 中都超过了 5% 的验收门槛，精确差分和完整回归也都通过了。\n2. int8 更快，主要因为扫描的数据量更小。 每个分量从 f16 的 2 字节进一步降到 1 字节，每行 128 维只读取 128 字节，同时整数 SIMD 可以直接累加平方差，减少浮点转换和计算开销。\n   它不会改变 exact 结果，是因为 int8 只负责筛选 TopM 候选，不负责最终答案。候选会重新用原始 f32 数据和原 f64 内核计算距离；只有证书能严格证明候选外记录不可能进入 TopK 时才接受，否则就回退重新扫描，因此最终行、距离和主键并列顺序不变。\n3. 偏斜、聚簇、大量重复或并列的数据可能让证书失效。 如果表中的极端值把全局量化比例拉得过大，普通向量的量化误差就会增大；当第 K 名与第 M 名之间距离间隔不足时，也无法安全排除候选外记录。全零表、查询超出 int8 编码范围等情况同样不能直接加速。\n   这时应当放弃 int8，依次回退到 f16、f32 TopM，必要时执行原 f64 全扫。这样可能多付一次候选扫描、性能变慢，但正确性不能让步；f16 镜像也应保留，作为偏斜数据的第二级加速。这是我的回答，帮我记录",
+          "phase": "post_docker_retest_explanation"
         }
       ],
       "validation": {
@@ -167,20 +251,65 @@
         {
           "pointer": "/experiments/4/output",
           "excerpt": "WSL median improvement +12.6747296%, exceeding 5%."
-        },
-        {
-          "pointer": "/experiments/5/output",
-          "excerpt": "Docker median improvement +8.0577439%, also exceeding 5%."
-        },
-        {
-          "pointer": "/experiments/6/output",
-          "excerpt": "Unit tests passed 10/10; scan differential passed 128/128 lines; extended groups passed 6/6; official protocol checks passed 20/20."
         }
       ],
       "tradeoff_and_reflection": {
         "source": "agent",
         "content": "保留int8及精确重算/失败回退。带宽、SIMD、证书、偏斜及ties边界都来自同一段学生解释，作为一条技术链呈现；不拆成多个贡献实例。"
-      }
+      },
+      "retest_result_evidence": [
+        {
+          "pointer": "/experiments/5/output",
+          "excerpt": "Docker median improvement +8.0577439%, also exceeding 5%."
+        }
+      ],
+      "regression_result_evidence": [
+        {
+          "pointer": "/experiments/6/output",
+          "excerpt": "Unit tests passed 10/10; scan differential passed 128/128 lines; extended groups passed 6/6; official protocol checks passed 20/20."
+        }
+      ],
+      "source_chain_id": "perf-ab-2026-11-11-topm-i8-integer-certificate",
+      "chronology": [
+        {
+          "order": 1,
+          "kind": "student_pre_decision_goal_context",
+          "source_record_id": "user-27"
+        },
+        {
+          "order": 2,
+          "kind": "agent_initial_result",
+          "experiment_id": "experiment-topm-i8-wsl-ab"
+        },
+        {
+          "order": 3,
+          "kind": "agent_docker_retest_result",
+          "experiment_id": "experiment-topm-i8-docker-ab"
+        },
+        {
+          "order": 4,
+          "kind": "student_post_retest_explanation",
+          "source_record_id": "user-29"
+        }
+      ],
+      "chronology_basis": "Original chain 7; chain recorded_at is metadata only, not per-event time.",
+      "agent_followup_results": [
+        {
+          "source": "agent",
+          "experiment_id": "agent-sprint-20261113-distribution-routing",
+          "result_evidence": [
+            {
+              "pointer": "/experiments/25/output",
+              "excerpt": "依据：1000条诊断中int8接受数均匀998、高斯46、单位球面23、聚簇0、离群点0"
+            },
+            {
+              "pointer": "/experiments/25/output",
+              "excerpt": "这是Agent方案与验证，尚无新增学生事后解释。"
+            }
+          ],
+          "student_post_result_explanation": null
+        }
+      ]
     },
     {
       "id": "measure-before-rewrite",
@@ -330,7 +459,21 @@
       "tradeoff_and_reflection": {
         "source": "agent",
         "content": "协调者已集成src/engine.rs源码；本条记录随后审阅确认的取舍。时间仅表示新冻结门通过，不代表高精度或官方加速；保留旧SoA拒绝及官方B未知的边界。"
-      }
+      },
+      "platform_results": [
+        {
+          "source": "platform_result",
+          "experiment_id": "platform-soa-5749a119-20261115",
+          "result_evidence": [
+            {
+              "pointer": "/experiments/27/output",
+              "excerpt": "MySQL formal cases passed. E=2988.004010; Prompt=3.000000."
+            }
+          ],
+          "student_post_result_explanation": null,
+          "attribution": "Actual platform result recorded after the earlier confirmed draft; no new student explanation."
+        }
+      ]
     },
     {
       "id": "ann-only-benefit-rejected",
@@ -406,6 +549,186 @@
         "content": "真实预触页缩短了本地写入时间，但物理写入、峰值内存及多个查询/恢复阶段代价使冻结门失败，按原规则拒绝。专项正确性通过不能覆盖完整成本失败。两次不完整尝试始终排除，两个零分母项保持证据不足；不缩小窗口或改门重测，不合入候选。"
       },
       "student_explanation_time_context": "本条学生审阅确认发生于有效结果产生之前，原文保持当时的计划与预测；下方后续结果、分析与否决由Agent记录。"
+    },
+    {
+      "id": "task-goal-and-performance-question",
+      "topic": "任务目标与性能指标追问",
+      "status": "historical_question_context",
+      "proposal": {
+        "source": "agent",
+        "content": "Performance target derived from the statement (section 3.3): E = (E_write + 2*E_query)/3 with each E = 0.6*f(R_T) + 0.2*f(R_B) + 0.2*f(R_M) against a fixed baseline; Recall@10 >= 0.95 on both filtered and unfiltered query groups is a hard gate; B (data-device bytes) and M (container peak memory incl. page cache) are measured from startup through load, index preparation and warmup. So query time carries the largest weight, and index build costs count even when untimed. Student confirmed direction and asked to keep optimizing."
+      },
+      "student_contributions": [
+        {
+          "source": "student",
+          "authorship": "historical_user_statement",
+          "historical_record_id": "user-7",
+          "content": "能继续准备吗，这个的目标是什么，对性能有要求吗，有的话继续优化",
+          "phase": "question"
+        }
+      ],
+      "validation": {
+        "source": "agent",
+        "content": "恢复既有问题及公式背景；没有对应的新实验结果，也不据此主张评分单元。"
+      },
+      "result_evidence": [],
+      "tradeoff_and_reflection": {
+        "source": "agent",
+        "content": "这是历史问题与Agent背景记录，不补写学生技术解释，不把性能目标本身当作技术贡献。"
+      }
+    },
+    {
+      "id": "submission-success-and-oom-investigation",
+      "topic": "外部成功信息、提交成功率与超内存要求追问",
+      "status": "historical_question_context_agent_validated",
+      "proposal": {
+        "source": "agent",
+        "content": "External evidence review requested by the student: the official branch remained at f4d4e2665, forum topic 35653825 had no official reply, and public Python/C++ implementations plus a submission-monitoring repository contained no evidence of a 29/29 pass. Re-reading the statement then prioritized section 2.3: formal tests explicitly include datasets larger than the memory limit, and section 3.2 requires greater-than-memory processing and recovery. That requirement had not been directly tested at >2 GiB scale."
+      },
+      "student_contributions": [
+        {
+          "source": "student",
+          "authorship": "historical_user_statement",
+          "historical_record_id": "user-14",
+          "content": "能看到别的队是怎么成功的或者官方有做解释吗，你把保证成功率提上去再说",
+          "phase": "question"
+        }
+      ],
+      "validation": {
+        "source": "agent",
+        "content": "按保存结果排列：先复现首次exact查询rc=137，再记录有界扫描修复后的完整通过；不补写学生根因解释。"
+      },
+      "result_evidence": [
+        {
+          "pointer": "/experiments/8/output",
+          "excerpt": "BEFORE the bounded-scan fix, 1,100,000 rows x 512 dimensions (about 2.25 GB vector payload) loaded under the judge's 2 GiB/no-swap limits, then the first exact TopK query died with rc=137 (OOM-kill) and only the startup line on stderr."
+        },
+        {
+          "pointer": "/experiments/7/output",
+          "excerpt": "AFTER the fix, the identical 2.25 GB workload passed load, index definition, two exact TopK queries, one ANN TopK query, shutdown, same-directory restart, and exact+ANN queries after recovery."
+        }
+      ],
+      "tradeoff_and_reflection": {
+        "source": "agent",
+        "content": "问题背景与Agent复现/修复结果仅作历史上下文，不声称新增学生解释、评分资格或正式分数变化。"
+      },
+      "chronology": [
+        {
+          "order": 1,
+          "kind": "student_question",
+          "source_record_id": "user-14"
+        },
+        {
+          "order": 2,
+          "kind": "agent_context",
+          "source_pointer": "/technical_records/11/proposal/content"
+        },
+        {
+          "order": 3,
+          "kind": "agent_oom_reproduction",
+          "experiment_id": "experiment-oom-reproduction"
+        },
+        {
+          "order": 4,
+          "kind": "agent_fix_validation",
+          "experiment_id": "experiment-oom-fixed"
+        }
+      ]
+    },
+    {
+      "id": "structural-cost-audit",
+      "topic": "从整体成本结构追问长期未能突破的原因",
+      "status": "agent_results_awaiting_student_interpretation",
+      "proposal": {
+        "source": "agent",
+        "content": "Agent tests."
+      },
+      "student_contributions": [
+        {
+          "source": "student",
+          "authorship": "historical_user_statement",
+          "historical_record_id": "user-structural-question-20261114",
+          "content": "从第一性原理出发，我们的这个从整体有什么结构性的问题或者之前没有注意到或者被忽略的问题，导致我们一直没法突破5000分",
+          "phase": "question"
+        }
+      ],
+      "validation": {
+        "source": "agent",
+        "content": "恢复原chain 17的初始结果与复测关系；post_interpretation保持null，没有学生事后解释。"
+      },
+      "result_evidence": [
+        {
+          "pointer": "/experiments/11/output",
+          "excerpt": "Agent:cache8/0,6000truths:unique.547901/.541073s,M16248832/12591104B,repeats.436747/.542962s;reuse unknown."
+        }
+      ],
+      "retest_result_evidence": [
+        {
+          "pointer": "/experiments/26/output",
+          "excerpt": "Final invalidation/LIMIT0:32units/54containers truth/WAL/responses pass,query-46..47%,I/O equal;legacy128 M+7.250%fails5%cap."
+        }
+      ],
+      "post_interpretation": null,
+      "source_chain_id": "structural-cost-audit-20261114",
+      "chronology": [
+        {
+          "order": 1,
+          "kind": "student_question",
+          "source_record_id": "user-structural-question-20261114"
+        },
+        {
+          "order": 2,
+          "kind": "agent_initial_result",
+          "experiment_id": "agent-structural-cache-response-20261114"
+        },
+        {
+          "order": 3,
+          "kind": "agent_retest_result",
+          "experiment_id": "agent-bounded-block-lifecycle-20261114"
+        }
+      ],
+      "tradeoff_and_reflection": {
+        "source": "agent",
+        "content": "Lock ack;M gate failed,AA imprecise.No student interpretation."
+      }
+    },
+    {
+      "id": "dictionary-transient-peak-diagnostic",
+      "topic": "字符串字典构建的临时副本与峰值内存",
+      "status": "agent_candidate_validated_and_selected_no_new_student_explanation",
+      "student_contributions": [],
+      "proposal": {
+        "source": "agent",
+        "content": "检验字典值和拥有字符串键的重复克隆，以及溢出回退构造时的同时存活，是否能在规定类型的样本上提高完整峰值。"
+      },
+      "result_evidence": [
+        {
+          "pointer": "/experiments/28/output",
+          "excerpt": "256个长值后字典溢出的SoA减旧版生命周期峰值字节：12574720,12337152。"
+        },
+        {
+          "pointer": "/experiments/28/output",
+          "excerpt": "255个长值加重复短值、不溢出的SoA减旧版生命周期峰值字节：4726784,4509696。"
+        }
+      ],
+      "tradeoff_and_reflection": {
+        "source": "agent",
+        "content": "借用键移除每个不同字符串的额外拥有副本，回退前显式释放临时状态。固定压力样本的峰值改善与该机制相符；短字符串样本未见峰值增加。所有哈希工作仍在，不能推导任意数据下物理峰值或时间必然降低。通过冻结的功能和资源门槛后选择本候选，旧版加无WHERE修复仍作为未选回退保留。没有新增学生评分实例。"
+      },
+      "retest_result_evidence": [
+        {
+          "pointer": "/experiments/29/output",
+          "excerpt": "本地功能检查：release单元23/23、公开MySQL20/20、扩展6/6、协议20/20、无WHERE黑盒4组全部通过；这些协议检查不等同于平台正式MySQL准入结果。"
+        },
+        {
+          "pointer": "/experiments/29/output",
+          "excerpt": "预声明3种样本各2对交替，共12个生命周期；候选减修复后SoA对照的首次TopK后完整峰值字节：溢出样本-12169216、-12333056；不溢出长字符串样本-4669440、-4272128；短字符串对照-245760、0。六项预声明内存门槛全部通过。"
+        },
+        {
+          "pointer": "/experiments/29/output",
+          "excerpt": "原始响应逐条解析、哈希和预期TopK/投影比较通过；各对记录的持久化文件哈希相等。Root复核时临时WAL原始文件已不可用，因此未声称重新哈希这些原始WAL字节。快照字符串投影和溢出/重启语义由现有单元覆盖；资源样本的字符串投影无LIMIT，走普通行路径。"
+        }
+      ]
     }
   ],
   "evidence_index": [
@@ -437,21 +760,23 @@
         {
           "pointer": "/experiments/12/output",
           "excerpt": "Median improvement +4.3995%, below the student's predeclared +5% threshold."
-        },
-        {
-          "pointer": "/experiments/1/output",
-          "excerpt": "Median improvement +2.0524%, below the unchanged +5% threshold."
         }
       ],
       "deduplication": "本问题、验证和修正链只列一次；维度为阅读索引，未自评档位。",
       "additional_student_evidence": [
         {
           "pointer": "/technical_records/1/student_contributions/1/content",
-          "excerpt": "也要考虑我们的wsl环境"
+          "excerpt": "确认"
         },
         {
           "pointer": "/technical_records/1/student_contributions/2/content",
-          "excerpt": "确认"
+          "excerpt": "也要考虑我们的wsl环境"
+        }
+      ],
+      "retest_result_evidence": [
+        {
+          "pointer": "/experiments/1/output",
+          "excerpt": "Median improvement +2.0524%, below the unchanged +5% threshold."
         }
       ]
     },
@@ -467,10 +792,6 @@
         {
           "pointer": "/experiments/2/output",
           "excerpt": "Median improvement -0.1068%, below the student's predeclared +5% threshold."
-        },
-        {
-          "pointer": "/experiments/3/output",
-          "excerpt": "The revised experiment measured +1.3836% median improvement, positive but below the unchanged +5% student threshold. The variant was rejected again and source changes were reverted."
         }
       ],
       "deduplication": "本问题、验证和修正链只列一次；维度为阅读索引，未自评档位。",
@@ -482,6 +803,12 @@
         {
           "pointer": "/technical_records/2/student_contributions/2/content",
           "excerpt": "同意"
+        }
+      ],
+      "retest_result_evidence": [
+        {
+          "pointer": "/experiments/3/output",
+          "excerpt": "The revised experiment measured +1.3836% median improvement, positive but below the unchanged +5% student threshold. The variant was rejected again and source changes were reverted."
         }
       ]
     },
@@ -497,17 +824,21 @@
         {
           "pointer": "/experiments/4/output",
           "excerpt": "WSL median improvement +12.6747296%, exceeding 5%."
-        },
+        }
+      ],
+      "deduplication": "本问题、验证和修正链只列一次；维度为阅读索引，未自评档位。",
+      "retest_result_evidence": [
         {
           "pointer": "/experiments/5/output",
           "excerpt": "Docker median improvement +8.0577439%, also exceeding 5%."
-        },
+        }
+      ],
+      "regression_result_evidence": [
         {
           "pointer": "/experiments/6/output",
           "excerpt": "Unit tests passed 10/10; scan differential passed 128/128 lines; extended groups passed 6/6; official protocol checks passed 20/20."
         }
-      ],
-      "deduplication": "本问题、验证和修正链只列一次；维度为阅读索引，未自评档位。"
+      ]
     },
     {
       "unit": "measure-before-rewrite",
@@ -571,12 +902,7 @@
           "excerpt": "49,024个查询响应、490,240个距离数值均通过独立完整f64/稳定主键真值核验。"
         }
       ],
-      "deduplication": "本问题、验证和修正链只列一次；维度为阅读索引，未自评档位。",
-      "review_confirmation": {
-        "pointer": "/review_confirmations/0/content",
-        "excerpt": "我已经审阅了，可以作为解释写进正式材料"
-      },
-      "confirmation_scope": "四个不同技术主题共用本次审阅确认，不声称存在四条独立用户原话或学生独立执行实验。"
+      "deduplication": "本问题、验证和修正链只列一次；维度为阅读索引，未自评档位。"
     },
     {
       "unit": "soa-whole-cost-tradeoff",
@@ -601,11 +927,13 @@
         }
       ],
       "deduplication": "本问题、验证和修正链只列一次；维度为阅读索引，未自评档位。",
-      "review_confirmation": {
-        "pointer": "/review_confirmations/0/content",
-        "excerpt": "我已经审阅了，可以作为解释写进正式材料"
-      },
-      "confirmation_scope": "四个不同技术主题共用本次审阅确认，不声称存在四条独立用户原话或学生独立执行实验。"
+      "platform_result_evidence": [
+        {
+          "pointer": "/experiments/27/output",
+          "excerpt": "MySQL formal cases passed. E=2988.004010; Prompt=3.000000."
+        }
+      ],
+      "student_platform_result_explanation": null
     },
     {
       "unit": "ann-only-benefit-rejected",
@@ -625,12 +953,7 @@
           "excerpt": "初始唯一/恢复唯一/重复合计分别退化3.819231%/3.682831%/6.816848%，ties退化11.703510%"
         }
       ],
-      "deduplication": "本问题、验证和修正链只列一次；维度为阅读索引，未自评档位。",
-      "review_confirmation": {
-        "pointer": "/review_confirmations/0/content",
-        "excerpt": "我已经审阅了，可以作为解释写进正式材料"
-      },
-      "confirmation_scope": "四个不同技术主题共用本次审阅确认，不声称存在四条独立用户原话或学生独立执行实验。"
+      "deduplication": "本问题、验证和修正链只列一次；维度为阅读索引，未自评档位。"
     },
     {
       "unit": "wal-pretouch-durability-plan",
@@ -640,27 +963,10 @@
         "excerpt": "我认可验证WAL真实预触页的假设。仅fallocate与真实写零并同步不同：后者可能提前完成块初始化和extent转换，减少后续提交的元数据工作，但收益依赖文件系统。初始6MiB写零的同步只保证这些零已落盘，不保证以后覆盖进去的日志记录持久化；每次真实提交仍须在发布和ACK前完成同步。实验必须同时计入额外写入、启动时间、写入和查询窗口的B、峰值内存及恢复成本，并区分逻辑尾与物理容量；checkpoint后空WAL不能据此当成新库。当前只"
       },
       "contribution_source": "agent_draft_reviewed_and_confirmed_by_student",
-      "result_evidence": [
-        {
-          "pointer": "/experiments/24/output",
-          "excerpt": "配对中位改善（正数更好）：write_total +39.524798%，startup_write_total +37.278541%，counted_total +18.433694%；"
-        },
-        {
-          "pointer": "/experiments/24/output",
-          "excerpt": "完整生命周期物理写入增加116.882129%，生命周期峰值内存增加46.888567%。"
-        },
-        {
-          "pointer": "/experiments/24/output",
-          "excerpt": "冻结v2门共9项硬失败；DB CPU绝对改善0.363989%仍未过其A/A非劣下界。"
-        }
-      ],
+      "result_evidence": [],
       "deduplication": "本问题、验证和修正链只列一次；维度为阅读索引，未自评档位。",
-      "review_confirmation": {
-        "pointer": "/review_confirmations/0/content",
-        "excerpt": "我已经审阅了，可以作为解释写进正式材料"
-      },
-      "confirmation_scope": "四个不同技术主题共用本次审阅确认，不声称存在四条独立用户原话或学生独立执行实验。",
-      "result_attribution": "Agent在学生认可验证计划后执行并报告；尚无学生对新否决结果的事后解释，不追记为学生已经作出该解释。"
+      "result_attribution": "Agent在学生认可验证计划后执行并报告；尚无学生对新否决结果的事后解释，不追记为学生已经作出该解释。",
+      "retained_agent_result_location": "/technical_records/9/result_evidence"
     }
   ],
   "experiments": [
@@ -740,7 +1046,8 @@
       "id": "agent-structural-cache-response-20261114",
       "source": "tool_result",
       "command": "compact-response-20261114/review.json",
-      "output": "Agent:cache8/0 unique .547901/.541073s,M16248832/12591104B,repeat .436747/.542962s;reuse unknown. Bytekeys ties-4.15%;renderer alloc93->11,write-5.18%,paired-0.42%,CI[-6.04,+0.96].Reject."
+      "output": "Agent:cache8/0,6000truths:unique.547901/.541073s,M16248832/12591104B,repeats.436747/.542962s;reuse unknown.Byte-key31units,M-8.25/-7.45%,ties-4.15%reject.Renderer32units,alloc93->11,M-5..-8%,write-5.18%fails2%cap,paired-0.42%,CI[-6.04,+0.96]:reject.",
+      "chain_id": "structural-cost-audit-20261114"
     },
     {
       "id": "experiment-scan-q64-ab",
@@ -820,6 +1127,46 @@
       "source": "tool_result",
       "command": "复核storage-pretouch-20261115/result.json、coordinator-audit.json和report.md；本次材料整理只读取已保存结果，未重跑实验。",
       "output": "WAL真实预触页最终独立复核：REJECT_CANDIDATE_CONFIRMED，候选未集成、未提测。10个有效fresh生命周期，先前attempts1/2全部排除；40,320条查询响应在计时后通过完整f64/稳定PK真值核验，10个最终durable WAL逐文件hash及A/B配对字节一致，53/53 focused/crash检查通过。配对中位改善（正数更好）：write_total +39.524798%，startup_write_total +37.278541%，counted_total +18.433694%；query_total -2.290761%，initial_unique -4.779841%，recovery_unique -6.927632%，recovery_open_ready -19.870725%，shutdown_sum -23.359431%。完整生命周期物理写入增加116.882129%，生命周期峰值内存增加46.888567%。局部筛选T+B/3=0.564088671个百分点，低于预声明5个百分点门。冻结v2门共9项硬失败；DB CPU绝对改善0.363989%仍未过其A/A非劣下界。另有query-window物理写入和complete-lifecycle物理读取两项零分母，保留为证据不足，未并入9项硬失败，未替换为逻辑文件大小。425个索引产物、65,762,107字节已由协调者重hash。控制为44ffd886f的13个固定blob，候选仅storage.rs；有效驱动a7163d7642fddfa7b63e5b688ce60197b13f9ad0d20e66b06f600683e916c95c。这些是本地direct-pipe/shared-device数据，不是官方专用设备B或E。完整release回归因门失败未运行；此前排除尝试的原生持久化目录缺失限制不改变，也不作通过/失败推断。正式成绩仍E3666.888955/Prompt4.0。"
+    },
+    {
+      "id": "agent-sprint-20261113-distribution-routing",
+      "source": "tool_result",
+      "command": "本地冲刺，原生日志Rust1.99.1、Docker双方Rust1.85.1；完整日志sprint-20261113，所需结果在本字段内。",
+      "output": "判断：按实际证书失败切换候选路径。依据：1000条诊断中int8接受数均匀998、高斯46、单位球面23、聚簇0、离群点0；初版并列查询因重复缓存仅16次扫描，后续改唯一别名补齐1000条。首个诊断曾误用逐位精度比较六位小数协议，修正测试容差后通过。修正链：连续4次失败后跳过63次并重探；再试验释放int8、在预算内建立f16，f16连续4次失败则释放；原f32/f64路径仍保证精确。独立源码副本探针不参与计时。两个阶段各六种分布、每环境12组A/B、独立完整f64真值及旧响应通过。采用条件：最终组合对照和回归通过；这是Agent方案与验证，尚无新增学生事后解释。",
+      "chain_id": "perf-ab-2026-11-11-topm-i8-integer-certificate"
+    },
+    {
+      "id": "agent-bounded-block-lifecycle-20261114",
+      "source": "tool_result",
+      "command": "block-scan-final-20261114/README.md",
+      "output": "Agent:lock acknowledged.V1 small checks pass;boundary24fail,65552x512 R39.66->120.70MB,M+37.97%,B+47.92%:reject.Private RANDOM/gap<=64B V2:30units/screen54pass.Final invalidation/LIMIT0:32units/54containers truth/WAL/responses pass,query-46..47%,I/O equal;legacy128 M+7.250%fails5%cap.Downstream public/extended/deep/resident/boundary/large UNRUN;no unchanged replay.Peaks prequery,stats unexplained,AA-0.516..+7.237%,cause unknown.Separate newseed65552x512/default4pairs withshutdown/recovery truth/hashes:query-26.881%,whole T-7.628%,M-2.575%,B-1.976%,repeat+0.798%;V1 excess reads absent,gate unchanged.32baseline controls:unrestricted/fixed2CPU AA medianabs M5.293/3.539%,max39.937/13.145%;both miss2/5%precision,quiet samples unchanged.First runtime not prewarmed,all data kept;anonRSSmaxAA0.313%,cause unknown.Kimi originals T+14.27%reject;progressive M-4.546%miss5%,repeat T+3.794%reject.No retention/submission/student explanation.",
+      "chain_id": "structural-cost-audit-20261114"
+    },
+    {
+      "id": "platform-soa-5749a119-20261115",
+      "source": "platform_result",
+      "output": "MySQL formal cases passed. E=2988.004010; Prompt=3.000000. Formally evaluated commit 5749a119086d9106d0e239e171b16279b554b8b7; platform submission time 2026-11-15 23:36 Asia/Shanghai. No T/B/M breakdown or Prompt reasoning was exposed; no causal attribution or new student explanation exists.",
+      "commit_sha": "5749a119086d9106d0e239e171b16279b554b8b7",
+      "platform_submission_time": "2026-11-15 23:36",
+      "platform_submission_timezone": "Asia/Shanghai",
+      "result_observed_at": "2026-11-15T23:44:28.812449+08:00",
+      "receipt": "minivec/evening-submit-20261115/receipt.json",
+      "receipt_sha256": "440b3d482ca546078ed24d4524876a3f5679eff0fc53f6670b4de1fa82ebde01"
+    },
+    {
+      "id": "agent-dictionary-peak-d2-20261116",
+      "source": "agent_summary_of_tool_result",
+      "output": "Agent实际执行的D2：两个既有冻结二进制，三种固定样本各2对交替，共12个生命周期；N=10000、128维相同有限向量，首次exact TopK触发快照，无预热。\n短字符串对照的SoA减旧版生命周期峰值字节：-1069056,-1609728。\n256个长值后字典溢出的SoA减旧版生命周期峰值字节：12574720,12337152。\n255个长值加重复短值、不溢出的SoA减旧版生命周期峰值字节：4726784,4509696。\n每个长值32768 ASCII字节。预声明两个压力样本均观察到实际放大；TopK/投影结果与两版持久化文件哈希全部一致。memory.peak含装载，非重置的建快照专属窗口；首查询耗时不等同于稳态或官方T。正式数据分布未知，不能据此归因E2988或推算分数。没有新增学生事后解释。",
+      "result_json_sha256": "f23921176b7b9bc98837945d3b7af6471567dec8ddf2afd427b6e5ec371c16dd",
+      "student_post_result_explanation": null
+    },
+    {
+      "id": "agent-dictionary-lifetime-fix-validation-20261116",
+      "source": "agent_summary_of_tool_result",
+      "output": "Agent实际执行：固定5ea9父提交，仅在snapshot_columns借用&str字典键，并在构造完整Strings回退前释放dictionary、values和codes；其余12个源码/构建输入与父提交一致。\n本地功能检查：release单元23/23、公开MySQL20/20、扩展6/6、协议20/20、无WHERE黑盒4组全部通过；这些协议检查不等同于平台正式MySQL准入结果。\n预声明3种样本各2对交替，共12个生命周期；候选减修复后SoA对照的首次TopK后完整峰值字节：溢出样本-12169216、-12333056；不溢出长字符串样本-4669440、-4272128；短字符串对照-245760、0。六项预声明内存门槛全部通过。\n原始响应逐条解析、哈希和预期TopK/投影比较通过；各对记录的持久化文件哈希相等。Root复核时临时WAL原始文件已不可用，因此未声称重新哈希这些原始WAL字节。快照字符串投影和溢出/重启语义由现有单元覆盖；资源样本的字符串投影无LIMIT，走普通行路径。\n首次查询的墙钟时间只描述构造路径；memory.peak包含装载且未重置。官方字符串长度、频率和数据分布未知，本实验不预测官方T、E或Prompt，不归因上一轮E下降。Fable源码审查与Root证据复核后选择此候选，尚无本次平台成绩。没有新增学生事后解释。",
+      "validation_result_sha256": "404320f6cfa6c08fb0ab019aa05ba211878233ebf9e7d2cadaed43c4a7cf6a6d",
+      "root_review_sha256": "4375e5c599819e4750a438a326e6fad68cfce9ae626d4b4fec7520921535562a",
+      "student_post_result_explanation": null
     }
   ],
   "additional_experiment_context": {
@@ -832,11 +1179,235 @@
     "真实实施和验证主要由Agent完成；审阅确认不能代替亲自设计实验、独立推导或迁移验证的证据。",
     "本地部署、共享设备io.stat、A/A噪声与阶段窗口不等同于未知官方基线；不以本地百分比推算正式E。",
     "WAL预触页在审阅时只有验证计划，后续有效实验被拒绝；事前审阅原文保留，实际结果单独归属Agent。零区同步不能替代真实日志记录提交同步。",
-    "没有可核对的既往分维度评审报告；本地引用检查不能证明平台评审成功或保证Prompt目标。"
+    "没有可核对的既往分维度评审报告；本地引用检查不能证明平台评审成功或保证Prompt目标。",
+    "新平台结果与分布诊断均只记为实际平台/Agent后续结果；没有新增学生事后解释，也不建立成绩变化归因。",
+    "恢复的任务目标、提交成功率和结构性问题属于历史问题/上下文；本地结构与引用校验通过不代表平台评分资格或Prompt提升。"
   ],
   "submission_context": {
-    "source_commit_with_soa": "44ffd886f6a2093e0eb8dedec90b94d0264d2112",
-    "latest_formal_result": "MySQL pass; E3666.888955; Prompt4.0; commit5a51c258373c482b866462c0539c6adb20caeb0a",
-    "new_formal_result": null
-  }
+    "formally_evaluated_commit": "5749a119086d9106d0e239e171b16279b554b8b7",
+    "formally_evaluated_result": {
+      "mysql_formal_passed": true,
+      "E": 2988.00401,
+      "Prompt": 3.0,
+      "platform_submission_time": "2026-11-15 23:36",
+      "platform_submission_timezone": "Asia/Shanghai",
+      "result_observed_at": "2026-11-15T23:44:28.812449+08:00",
+      "receipt_sha256": "440b3d482ca546078ed24d4524876a3f5679eff0fc53f6670b4de1fa82ebde01",
+      "causal_attribution_established": false
+    },
+    "previous_better_formal_record": {
+      "commit": "5a51c258373c482b866462c0539c6adb20caeb0a",
+      "E": 3666.888955,
+      "Prompt": 4.0
+    },
+    "published_but_formally_unscored_commit": "5ea9e585f0a505beead3c82187155b3ffdc4942b",
+    "isolated_unselected_old_engine_plus_fix_candidate": {
+      "base_commit": "5ea9e585f0a505beead3c82187155b3ffdc4942b",
+      "old_engine_commit": "5a51c258373c482b866462c0539c6adb20caeb0a",
+      "patch_sha256": "3d15d7a0e188105ddfaafb867d8520f2539ab1f4c5090e4cef449abde11632bc",
+      "binary_sha256": "9d63cb7faf41b7b51f7047e99bfaeb65492f4334b713efac62f79dcf90cd2143",
+      "functional_validation_only": true,
+      "selected_applied_published_or_submitted": false
+    },
+    "material_state": "供本次源码提交使用的审核版；材料冻结时源码与材料已通过本地审查，尚未发布本次提交或正式提测。后续发布事实以独立发布回执为准。",
+    "local_validation_is_not_platform_score_or_eligibility_prediction": true,
+    "selected_dictionary_lifetime_candidate": {
+      "base_commit": "5ea9e585f0a505beead3c82187155b3ffdc4942b",
+      "engine_sha256": "6c6d56d45b439c44e75d81873ff455bcdd10be0e2e15175905b96ffe1d751442",
+      "binary_sha256": "5f054b8c68b0869bb52096d195c47f15f9fd9a3171536b74d4053a7b4c5ce88a",
+      "state_at_material_freeze": "root_reviewed_selected_for_source_and_material_commit_not_formally_scored",
+      "functional_checks": {
+        "release_units": 23,
+        "public": 20,
+        "extended": 6,
+        "protocol": 20,
+        "blackbox_groups": 4
+      },
+      "resource_lifecycles": 12,
+      "root_review_sha256": "4375e5c599819e4750a438a326e6fad68cfce9ae626d4b4fec7520921535562a",
+      "new_student_explanation": null
+    },
+    "published_but_formally_unscored_commit_scope": "该字段记录本次材料冻结前已发布的源码父提交；本次源码以selected_dictionary_lifetime_candidate中的哈希定位。",
+    "public_platform_retention_rule_observed": {
+      "source_url": "https://open.oceanbase.com/train/detail/21?questionId=600081",
+      "observed_date_timezone": "2026-11-16 Asia/Shanghai",
+      "text": "平台按当前榜比较同队的新旧整条成绩，只有两项排名分之和提高才替换；不拼接不同提交，也不用手动选版本。比赛期间为暂定榜。",
+      "account_specific_ranking_or_final_selection_verified": false
+    }
+  },
+  "source_records": [
+    {
+      "id": "accepted-plan-20261113-measure-before-rewrite",
+      "source": "student",
+      "authorship": "historical_user_statement",
+      "content": "认可，以后都用这种形式",
+      "source_snapshot": "previous-scored-material.json",
+      "source_pointer": "/technical_decisions/0/acceptance/content"
+    },
+    {
+      "id": "accepted-residentpayload-local-baseline",
+      "source": "student",
+      "authorship": "historical_user_statement",
+      "content": "认可",
+      "source_snapshot": "previous-scored-material.json",
+      "source_pointer": "/technical_decisions/1/acceptance/content"
+    },
+    {
+      "id": "user-13",
+      "source": "student",
+      "authorship": "historical_user_statement",
+      "content": "在wsl使用cargo会不会性能比较差",
+      "source_snapshot": "previous-scored-material.json",
+      "source_pointer": "/user_prompts/12/content"
+    },
+    {
+      "id": "user-14",
+      "source": "student",
+      "authorship": "historical_user_statement",
+      "content": "能看到别的队是怎么成功的或者官方有做解释吗，你把保证成功率提上去再说",
+      "source_snapshot": "previous-scored-material.json",
+      "source_pointer": "/user_prompts/13/content"
+    },
+    {
+      "id": "user-16",
+      "source": "student",
+      "authorship": "historical_user_statement",
+      "content": "5%，其他的都同意",
+      "source_snapshot": "previous-scored-material.json",
+      "source_pointer": "/user_prompts/15/content"
+    },
+    {
+      "id": "user-17",
+      "source": "student",
+      "authorship": "historical_user_statement",
+      "content": "修改实验方案",
+      "source_snapshot": "previous-scored-material.json",
+      "source_pointer": "/user_prompts/16/content"
+    },
+    {
+      "id": "user-18",
+      "source": "student",
+      "authorship": "historical_user_statement",
+      "content": "同意",
+      "source_snapshot": "previous-scored-material.json",
+      "source_pointer": "/user_prompts/17/content"
+    },
+    {
+      "id": "user-19",
+      "source": "student",
+      "authorship": "historical_user_statement",
+      "content": "确认",
+      "source_snapshot": "previous-scored-material.json",
+      "source_pointer": "/user_prompts/18/content"
+    },
+    {
+      "id": "user-20",
+      "source": "student",
+      "authorship": "historical_user_statement",
+      "content": "也要考虑我们的wsl环境",
+      "source_snapshot": "previous-scored-material.json",
+      "source_pointer": "/user_prompts/19/content"
+    },
+    {
+      "id": "user-27",
+      "source": "student",
+      "authorship": "historical_user_statement",
+      "content": "继续优化，目标双榜前十",
+      "source_snapshot": "previous-scored-material.json",
+      "source_pointer": "/user_prompts/26/content"
+    },
+    {
+      "id": "user-29",
+      "source": "student",
+      "authorship": "historical_user_statement",
+      "content": "1. 同意保留 int8 作为新的性能基线。 它在 WSL 和 Docker 中都超过了 5% 的验收门槛，精确差分和完整回归也都通过了。\n2. int8 更快，主要因为扫描的数据量更小。 每个分量从 f16 的 2 字节进一步降到 1 字节，每行 128 维只读取 128 字节，同时整数 SIMD 可以直接累加平方差，减少浮点转换和计算开销。\n   它不会改变 exact 结果，是因为 int8 只负责筛选 TopM 候选，不负责最终答案。候选会重新用原始 f32 数据和原 f64 内核计算距离；只有证书能严格证明候选外记录不可能进入 TopK 时才接受，否则就回退重新扫描，因此最终行、距离和主键并列顺序不变。\n3. 偏斜、聚簇、大量重复或并列的数据可能让证书失效。 如果表中的极端值把全局量化比例拉得过大，普通向量的量化误差就会增大；当第 K 名与第 M 名之间距离间隔不足时，也无法安全排除候选外记录。全零表、查询超出 int8 编码范围等情况同样不能直接加速。\n   这时应当放弃 int8，依次回退到 f16、f32 TopM，必要时执行原 f64 全扫。这样可能多付一次候选扫描、性能变慢，但正确性不能让步；f16 镜像也应保留，作为偏斜数据的第二级加速。这是我的回答，帮我记录",
+      "source_snapshot": "previous-scored-material.json",
+      "source_pointer": "/user_prompts/28/content"
+    },
+    {
+      "id": "user-3",
+      "source": "student",
+      "authorship": "historical_user_statement",
+      "content": "他这个指的是官方的评测运行环境吧测试驱动好像是官方的，就是他们在我们提测之后，他们的官方那个体测吧",
+      "source_snapshot": "previous-scored-material.json",
+      "source_pointer": "/user_prompts/2/content"
+    },
+    {
+      "id": "user-7",
+      "source": "student",
+      "authorship": "historical_user_statement",
+      "content": "能继续准备吗，这个的目标是什么，对性能有要求吗，有的话继续优化",
+      "source_snapshot": "previous-scored-material.json",
+      "source_pointer": "/user_prompts/6/content"
+    },
+    {
+      "id": "user-structural-question-20261114",
+      "source": "student",
+      "authorship": "historical_user_statement",
+      "content": "从第一性原理出发，我们的这个从整体有什么结构性的问题或者之前没有注意到或者被忽略的问题，导致我们一直没法突破5000分",
+      "source_snapshot": "previous-scored-material.json",
+      "source_pointer": "/user_prompts/35/content"
+    }
+  ],
+  "source_chains": [
+    {
+      "id": "perf-ab-2026-11-11-protocol-allocation",
+      "source": "historical_chain",
+      "source_snapshot": "previous-scored-material.json",
+      "source_pointer": "/learning_chains/0",
+      "status": "rejected_student_redirected_to_vector_scan",
+      "pre_decision_source_record_id": "user-16",
+      "initial_result_experiment_id": "experiment-protocol-allocation-ab",
+      "post_result_source_record_id": "user-17",
+      "retest_result_experiment_id": "experiment-protocol-allocation-persistent-retest",
+      "final_student_decision_source_record_id": "user-18",
+      "agent_next_action": "Stop protocol-allocation work and start a new independent vector-scan-kernel experiment chain.",
+      "recorded_at": "2026-11-11T05:10:44Z",
+      "recorded_at_semantics": "Chain-level metadata copied from the source; not an utterance, result, or event timestamp."
+    },
+    {
+      "id": "perf-ab-2026-11-11-scan-q64",
+      "source": "historical_chain",
+      "source_snapshot": "previous-scored-material.json",
+      "source_pointer": "/learning_chains/1",
+      "status": "rejected_after_wsl_and_official_flags_docker_retests",
+      "pre_decision_source_record_id": "user-19",
+      "initial_result_experiment_id": "experiment-scan-q64-ab",
+      "post_result_source_record_id": "user-20",
+      "retest_result_experiment_id": "experiment-scan-q64-docker-ab",
+      "final_student_decision_source_record_id": null,
+      "agent_next_action": "Close q64: both WSL and official-flags Docker medians were below the student's 5% threshold; source remains at baseline.",
+      "recorded_at": "2026-11-11T06:38:42Z",
+      "recorded_at_semantics": "Chain-level metadata copied from the source; not an utterance, result, or event timestamp."
+    },
+    {
+      "id": "perf-ab-2026-11-11-topm-i8-integer-certificate",
+      "source": "historical_chain",
+      "source_snapshot": "previous-scored-material.json",
+      "source_pointer": "/learning_chains/7",
+      "status": "accepted_by_student_after_dual_environment_retest",
+      "pre_decision_source_record_id": "user-27",
+      "initial_result_experiment_id": "experiment-topm-i8-wsl-ab",
+      "post_result_source_record_id": "user-29",
+      "retest_result_experiment_id": "experiment-topm-i8-docker-ab",
+      "final_student_decision_source_record_id": "user-29",
+      "agent_next_action": "The student explicitly retained int8 and explained the bandwidth/SIMD mechanism, exact rescoring, certificate failures and why f16 remains useful. Continue with independent write-path work rather than weakening those fallbacks.",
+      "recorded_at": "2026-11-11T13:00:42.059603Z",
+      "recorded_at_semantics": "Chain-level metadata copied from the source; not an utterance, result, or event timestamp."
+    },
+    {
+      "id": "structural-cost-audit-20261114",
+      "source": "historical_chain",
+      "source_snapshot": "previous-scored-material.json",
+      "source_pointer": "/learning_chains/17",
+      "status": "agent_results_awaiting_student_interpretation",
+      "pre_decision_source_record_id": "user-structural-question-20261114",
+      "initial_result_experiment_id": "agent-structural-cache-response-20261114",
+      "post_result_source_record_id": null,
+      "retest_result_experiment_id": "agent-bounded-block-lifecycle-20261114",
+      "final_student_decision_source_record_id": null,
+      "post_interpretation": null,
+      "agent_next_action": "Lock ack;M gate failed,AA imprecise.No student interpretation."
+    }
+  ]
 }
