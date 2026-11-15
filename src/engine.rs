@@ -58,15 +58,24 @@ struct TableIndex {
     built_at: usize,
 }
 
-/// Query-side contiguous snapshot of one table's visible rows: pk-ordered row
-/// copies with vector values stripped, plus every vector concatenated into a
-/// single flat buffer. Exact TopK scans run over this instead of the row map,
-/// trading one rebuild per data change for sequential memory access and
-/// early-abandon distance checks.
+/// Snapshot-local scalar representation. The PK column borrows the contiguous
+/// `ScanCache::pks`; no snapshot filter or projection needs the Store row map.
+enum SnapshotColumn {
+    PrimaryKey,
+    Int(Vec<i64>),
+    Dictionary { values: Vec<String>, codes: Vec<u8> },
+    Strings(Vec<String>),
+    Vector,
+}
+
+/// Query-side contiguous snapshot: PK-ordered typed scalar columns plus the
+/// existing original/compressed vector buffers. This removes a per-row Row and
+/// values allocation while preserving exact content and PK tie semantics.
 struct ScanCache {
     version: u64,
     dim: usize,
-    rows: Vec<Row>,
+    pks: Vec<i64>,
+    columns: Vec<SnapshotColumn>,
     flat: Vec<f32>,
     /// Serial int8 snapshots may share resident original vectors instead of
     /// allocating a second complete f32 array during snapshot construction.
@@ -82,6 +91,10 @@ struct ScanCache {
 }
 
 impl ScanCache {
+    fn len(&self) -> usize {
+        self.pks.len()
+    }
+
     fn vector(&self, position: usize) -> &[f32] {
         if self.originals.is_empty() {
             &self.flat[position * self.dim..(position + 1) * self.dim]
@@ -90,20 +103,90 @@ impl ScanCache {
         }
     }
 
+    fn ordering(&self, col: usize, position: usize, lit: &Literal) -> Ordering {
+        match (&self.columns[col], lit) {
+            (SnapshotColumn::PrimaryKey, Literal::Int(right)) => self.pks[position].cmp(right),
+            (SnapshotColumn::Int(values), Literal::Int(right)) => values[position].cmp(right),
+            (SnapshotColumn::Dictionary { values, codes }, Literal::Str(right)) =>
+                values[codes[position] as usize].cmp(right),
+            (SnapshotColumn::Strings(values), Literal::Str(right)) => values[position].cmp(right),
+            _ => Ordering::Equal,
+        }
+    }
+
+    fn out_value(&self, col: usize, position: usize) -> DbResult<OutValue> {
+        match &self.columns[col] {
+            SnapshotColumn::PrimaryKey => Ok(OutValue::Int(self.pks[position])),
+            SnapshotColumn::Int(values) => Ok(OutValue::Int(values[position])),
+            SnapshotColumn::Dictionary { values, codes } =>
+                Ok(OutValue::Str(values[codes[position] as usize].clone())),
+            SnapshotColumn::Strings(values) => Ok(OutValue::Str(values[position].clone())),
+            SnapshotColumn::Vector => Err(DbError::Internal),
+        }
+    }
+
     fn positions(&self, filter: &BoundFilter) -> Option<Rc<Vec<usize>>> {
         // One bounded entry per snapshot; large tables/expressions retain
-        // the original streaming filter rather than allocating a row list.
-        if filter.prog.len() > 32 || self.rows.len() > 131072 {
+        // streaming typed-column filters rather than allocating a row list.
+        if filter.prog.len() > 32 || self.len() > 131072 {
             return None;
         }
         if let Some((key, positions)) = self.filtered_positions.borrow().as_ref() {
             if *key == filter.prog { return Some(Rc::clone(positions)); }
         }
-        let positions = Rc::new(self.rows.iter().enumerate()
-            .filter_map(|(i, row)| eval_bound(filter, row).then_some(i)).collect::<Vec<_>>());
+        let positions = Rc::new((0..self.len())
+            .filter_map(|i| eval_snapshot_bound(filter, self, i).then_some(i)).collect::<Vec<_>>());
         *self.filtered_positions.borrow_mut() = Some((filter.prog.clone(), Rc::clone(&positions)));
         Some(positions)
     }
+}
+
+fn snapshot_columns(
+    schema: &Schema,
+    pks: &[i64],
+    table: &crate::storage::TableData,
+) -> Vec<SnapshotColumn> {
+    schema.columns.iter().enumerate().map(|(col, definition)| {
+        if definition.primary_key {
+            return SnapshotColumn::PrimaryKey;
+        }
+        match definition.kind {
+            ColKind::BigInt => SnapshotColumn::Int(pks.iter().map(|pk| {
+                match &table.rows[pk].row.vals[col] {
+                    VVal::Int(value) => *value,
+                    _ => unreachable!("schema-checked BIGINT snapshot value"),
+                }
+            }).collect()),
+            ColKind::Varchar(_) => {
+                let mut values = Vec::new();
+                let mut codes = Vec::with_capacity(pks.len());
+                let mut dictionary: HashMap<String, u8> = HashMap::new();
+                for pk in pks {
+                    let VVal::Str(text) = &table.rows[pk].row.vals[col] else {
+                        unreachable!("schema-checked VARCHAR snapshot value")
+                    };
+                    if let Some(&code) = dictionary.get(text) {
+                        codes.push(code);
+                    } else if values.len() < 256 {
+                        let code = values.len() as u8;
+                        values.push(text.clone());
+                        dictionary.insert(text.clone(), code);
+                        codes.push(code);
+                    } else {
+                        // Overflow loses only deduplication, never content.
+                        return SnapshotColumn::Strings(pks.iter().map(|pk| {
+                            match &table.rows[pk].row.vals[col] {
+                                VVal::Str(value) => value.clone(),
+                                _ => unreachable!("schema-checked VARCHAR snapshot value"),
+                            }
+                        }).collect());
+                    }
+                }
+                SnapshotColumn::Dictionary { values, codes }
+            }
+            ColKind::Vector(_) => SnapshotColumn::Vector,
+        }
+    }).collect()
 }
 
 struct CachedQuery {
@@ -573,6 +656,10 @@ impl Engine {
             None => return,
         };
         pks.sort_unstable();
+        let columns = {
+            let table = &self.store.tables[&table_id];
+            snapshot_columns(&schema, &pks, table)
+        };
         if dim == 128 && self.scan_threads == 1
             && certified_query_i8_enabled() && certified_query_f32_enabled()
             && pks.len().saturating_mul(dim).saturating_mul(7) <= self.scan_cache_budget
@@ -589,20 +676,16 @@ impl Engine {
                 let scale = maximum / 127.0;
                 let mut encoded = Vec::with_capacity(pks.len() * dim);
                 let mut originals = Vec::with_capacity(pks.len());
-                let mut rows = Vec::with_capacity(pks.len());
                 let valid = pks.iter().all(|pk| {
                     let row = &self.store.tables[&table_id].rows[pk].row;
                     let VVal::Vec(Some(vector)) = &row.vals[vector_col] else { return false };
                     if !i8_encode_topm(vector, scale, &mut encoded) { return false; }
                     originals.push(Rc::clone(vector));
-                    let mut snapshot = row.clone();
-                    snapshot.vals[vector_col] = VVal::Vec(None);
-                    rows.push(snapshot);
                     true
                 });
                 if valid {
                     self.scan_caches.insert(table_id, ScanCache {
-                        version, dim, rows, flat: Vec::new(), originals,
+                        version, dim, pks, columns, flat: Vec::new(), originals,
                         i8_flat: encoded, i8_scale: scale,
                         f16_flat: Vec::new(), f16_max_norm_upper: 0.0,
                         filtered_positions: std::cell::RefCell::new(None),
@@ -612,23 +695,19 @@ impl Engine {
                 }
             }
         }
-        let mut rows = Vec::with_capacity(pks.len());
         let mut flat = Vec::with_capacity(pks.len() * dim);
         let mut missing: Vec<(usize, i64)> = Vec::new();
         for (position, &pk) in pks.iter().enumerate() {
             let Some(entry) = self.store.tables.get(&table_id).and_then(|t| t.rows.get(&pk)) else {
                 continue;
             };
-            let mut snapshot = entry.row.clone();
-            match &snapshot.vals[vector_col] {
+            match &entry.row.vals[vector_col] {
                 VVal::Vec(Some(vector)) => flat.extend_from_slice(vector),
                 _ => {
                     flat.extend(std::iter::repeat(0f32).take(dim));
                     missing.push((position, pk));
                 }
             }
-            snapshot.vals[vector_col] = VVal::Vec(None);
-            rows.push(snapshot);
         }
         for (position, pk) in missing {
             if let Ok(vector) = self.store.read_vec(table_id, pk) {
@@ -694,7 +773,8 @@ impl Engine {
             ScanCache {
                 version,
                 dim,
-                rows,
+                pks,
+                columns,
                 flat,
                 originals: Vec::new(),
                 i8_flat,
@@ -1151,7 +1231,7 @@ impl Engine {
                 let limit = topk_limit.unwrap();
                 let dim = cache.dim;
                 let qvec = dist_ctx.as_ref().expect("topk implies dist_ctx").1.clone();
-                let total = cache.rows.len();
+                let total = cache.len();
                 let threads = if self.scan_threads > 1 && total * dim >= 4096 {
                     self.scan_threads.min(total)
                 } else {
@@ -1160,7 +1240,7 @@ impl Engine {
                 let chunk = total.div_ceil(threads);
                 let filter_ref = bound_filter.as_ref();
                 let q_ref: &[f32] = &qvec;
-                let mut topk: BinaryHeap<HeapItem> = BinaryHeap::with_capacity(limit + 1);
+                let mut topk: BinaryHeap<SnapshotItem> = BinaryHeap::with_capacity(limit + 1);
                 if threads == 1 {
                     let try_query_topm = dim == 128
                         && limit > 0
@@ -1226,48 +1306,12 @@ impl Engine {
                         flat_scan_serial_f64(cache, filter_ref, q_ref, limit, &mut topk);
                     }
                 } else {
-                    // Scoped workers over disjoint row ranges; per-chunk local
-                    // heaps merge with identical tie-break semantics.
-                    //
-                    // Soundness of sharing rows across threads: scan-cache
-                    // rows hold VVal::Vec(None) (stripped at build), workers
-                    // only read pk and non-vector columns - filters cannot
-                    // reference vector columns (bind_filter rejects them) and
-                    // distances come from the flat buffer. The Rc inside
-                    // VVal::Vec is therefore never dereferenced or mutated by
-                    // any worker, so sharing it needs no synchronization.
-                    struct SyncRow<'a>(&'a Row);
-                    unsafe impl Send for SyncRow<'_> {}
-                    unsafe impl Sync for SyncRow<'_> {}
-                    // Same invariant as SyncRow: the flat buffer is plain f32
-                    // and cache rows' vector slots are always None, so the
-                    // non-Sync Rc inside Row is never touched by workers.
+                    // Scoped workers over disjoint positions. Parallel snapshots
+                    // use plain flat/scalar buffers; they never touch the serial-
+                    // only Rc originals or the main thread's RefCell filter cache.
                     struct SyncCache<'a>(&'a ScanCache);
                     unsafe impl Send for SyncCache<'_> {}
                     unsafe impl Sync for SyncCache<'_> {}
-                    struct ScanItem<'a> {
-                        row: SyncRow<'a>,
-                        position: usize,
-                        distance: f64,
-                    }
-                    impl PartialEq for ScanItem<'_> {
-                        fn eq(&self, other: &Self) -> bool {
-                            self.distance == other.distance && self.row.0.pk == other.row.0.pk
-                        }
-                    }
-                    impl Eq for ScanItem<'_> {}
-                    impl PartialOrd for ScanItem<'_> {
-                        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-                            Some(self.cmp(other))
-                        }
-                    }
-                    impl Ord for ScanItem<'_> {
-                        fn cmp(&self, other: &Self) -> Ordering {
-                            self.distance
-                                .total_cmp(&other.distance)
-                                .then(self.row.0.pk.cmp(&other.row.0.pk))
-                        }
-                    }
                     let mut local: Vec<Vec<(usize, f64)>> = Vec::with_capacity(threads);
                     let sync_cache = SyncCache(cache);
                     std::thread::scope(|scope| {
@@ -1275,18 +1319,17 @@ impl Engine {
                         for slice_index in 0..threads {
                             let sync_cache = SyncCache(sync_cache.0);
                             handles.push(scope.spawn(move || {
-                                // Capture the whole wrapper (RFC 2229 would
-                                // otherwise capture the `&ScanCache` field).
                                 let sync_cache = sync_cache;
                                 let cache = sync_cache.0;
-                                let mut heap: BinaryHeap<ScanItem> =
+                                let mut heap: BinaryHeap<SnapshotItem> =
                                     BinaryHeap::with_capacity(limit + 1);
                                 let mut local_threshold = f64::INFINITY;
                                 let start = slice_index * chunk;
                                 let end = (start + chunk).min(total);
-                                for (position, row) in cache.rows[start..end].iter().enumerate() {
-                                    let position = start + position;
-                                    if filter_ref.map_or(false, |f| !eval_bound(f, row)) {
+                                for position in start..end {
+                                    if filter_ref.map_or(false, |f| {
+                                        !eval_snapshot_bound(f, cache, position)
+                                    }) {
                                         continue;
                                     }
                                     let vector = &cache.flat[position * dim..(position + 1) * dim];
@@ -1295,8 +1338,8 @@ impl Engine {
                                     else {
                                         continue;
                                     };
-                                    let candidate = ScanItem {
-                                        row: SyncRow(row),
+                                    let candidate = SnapshotItem {
+                                        pk: cache.pks[position],
                                         position,
                                         distance: dist_sq,
                                     };
@@ -1325,11 +1368,11 @@ impl Engine {
                             local.push(handle.join().expect("scan worker panicked"));
                         }
                     });
-                    // Resolve winning positions back to cache rows on this thread.
                     for pairs in local {
                         for (position, dist_sq) in pairs {
-                            let row = &cache.rows[position];
-                            let candidate = HeapItem { row, distance: dist_sq };
+                            let candidate = SnapshotItem {
+                                pk: cache.pks[position], position, distance: dist_sq,
+                            };
                             if topk.len() < limit {
                                 topk.push(candidate);
                             } else if topk.peek().map_or(false, |worst| candidate < *worst) {
@@ -1339,10 +1382,40 @@ impl Engine {
                         }
                     }
                 }
-                records.extend(topk.into_iter().map(|item| SelectedRow {
-                    row: item.row,
-                    distance: Some(item.distance.sqrt()),
-                }));
+                let mut selected: Vec<SnapshotItem> = topk.into_iter().collect();
+                for item in &mut selected {
+                    item.distance = item.distance.sqrt();
+                }
+                selected.sort_by(|a, b| a.distance.partial_cmp(&b.distance)
+                    .unwrap_or(Ordering::Equal).then(a.pk.cmp(&b.pk)));
+                let mut columns = Vec::new();
+                for item in &items {
+                    match item {
+                        BoundProj::Column { index } =>
+                            columns.push(schema.columns[*index].name.clone()),
+                        BoundProj::L2 { alias, .. } => columns.push(alias.clone()),
+                    }
+                }
+                let mut output_rows = Vec::with_capacity(selected.len());
+                for item in selected {
+                    let mut output = Vec::with_capacity(items.len());
+                    for projection in &items {
+                        match projection {
+                            BoundProj::Column { index } => {
+                                if matches!(&cache.columns[*index], SnapshotColumn::Vector) {
+                                    let vector = self.store.read_vec(table_id, item.pk)?;
+                                    output.push(OutValue::Vector(vector.as_ref().clone()));
+                                } else {
+                                    output.push(cache.out_value(*index, item.position)?);
+                                }
+                            }
+                            BoundProj::L2 { .. } =>
+                                output.push(OutValue::Float(item.distance)),
+                        }
+                    }
+                    output_rows.push(output);
+                }
+                return Ok(ExecResult::Query { columns, rows: output_rows });
             } else {
                 let visible = self.visible_row_refs(table_id, false)?;
                 self.scan_rows(table_id, visible, &bound_filter, &dist_ctx, topk_limit, &mut records)?;
@@ -1457,24 +1530,24 @@ impl Ord for HeapItem<'_> {
 
 const QUERY_TOPM: usize = 32;
 
-struct ApproxScanItem {
+struct SnapshotItem {
     position: usize,
     pk: i64,
     distance: f64,
 }
 
-impl PartialEq for ApproxScanItem {
+impl PartialEq for SnapshotItem {
     fn eq(&self, other: &Self) -> bool {
         self.distance == other.distance && self.pk == other.pk
     }
 }
-impl Eq for ApproxScanItem {}
-impl PartialOrd for ApproxScanItem {
+impl Eq for SnapshotItem {}
+impl PartialOrd for SnapshotItem {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
-impl Ord for ApproxScanItem {
+impl Ord for SnapshotItem {
     fn cmp(&self, other: &Self) -> Ordering {
         self.distance.total_cmp(&other.distance).then(self.pk.cmp(&other.pk))
     }
@@ -1483,26 +1556,29 @@ impl Ord for ApproxScanItem {
 /// Original serial flat scan, also used as the whole-query fallback. Keeping
 /// this as a separate empty-heap path prevents approximate candidates or exact
 /// candidate results from leaking into a certificate-failure result.
-fn flat_scan_serial_f64<'a>(
-    cache: &'a ScanCache,
+fn flat_scan_serial_f64(
+    cache: &ScanCache,
     filter: Option<&BoundFilter>,
     qvec: &[f32],
     limit: usize,
-    topk: &mut BinaryHeap<HeapItem<'a>>,
+    topk: &mut BinaryHeap<SnapshotItem>,
 ) {
     let dim = cache.dim;
     let mut threshold = f64::INFINITY;
     let positions = filter.and_then(|f| cache.positions(f));
-    let count = positions.as_ref().map_or(cache.rows.len(), |p| p.len());
+    let count = positions.as_ref().map_or(cache.len(), |p| p.len());
     for index in 0..count {
         let position = positions.as_ref().map_or(index, |p| p[index]);
-        let row = &cache.rows[position];
-        if positions.is_none() && filter.map_or(false, |f| !eval_bound(f, row)) { continue; }
+        if positions.is_none() && filter.map_or(false, |f| {
+            !eval_snapshot_bound(f, cache, position)
+        }) { continue; }
         let vector = cache.vector(position);
         let Some(dist_sq) = dist_sq_f64_abandon(vector, qvec, threshold) else {
             continue;
         };
-        let candidate = HeapItem { row, distance: dist_sq };
+        let candidate = SnapshotItem {
+            pk: cache.pks[position], position, distance: dist_sq,
+        };
         if topk.len() < limit {
             topk.push(candidate);
             if topk.len() == limit {
@@ -1518,16 +1594,16 @@ fn flat_scan_serial_f64<'a>(
 
 /// Integer-grid candidate pass. The integer sum is exact; scale is applied
 /// once per row and the query certificate covers the original f32/f64 result.
-fn flat_scan_query_topm_i8<'a>(
-    cache: &'a ScanCache,
+fn flat_scan_query_topm_i8(
+    cache: &ScanCache,
     filter: Option<&BoundFilter>,
     qvec: &[f32],
     encoded_query: &[i8],
     limit: usize,
-    topk: &mut BinaryHeap<HeapItem<'a>>,
+    topk: &mut BinaryHeap<SnapshotItem>,
 ) -> bool {
     debug_assert_eq!(cache.dim, 128);
-    debug_assert_eq!(cache.i8_flat.len(), cache.rows.len() * cache.dim);
+    debug_assert_eq!(cache.i8_flat.len(), cache.len() * cache.dim);
     debug_assert!(limit > 0 && limit < QUERY_TOPM);
     let dim = cache.dim;
     let scale_sq = cache.i8_scale * cache.i8_scale;
@@ -1537,18 +1613,19 @@ fn flat_scan_query_topm_i8<'a>(
     let mut eligible = 0usize;
     let mut approx: BinaryHeap<(i32, i64, usize)> = BinaryHeap::with_capacity(QUERY_TOPM + 1);
     let positions = filter.and_then(|f| cache.positions(f));
-    let count = positions.as_ref().map_or(cache.rows.len(), |p| p.len());
+    let count = positions.as_ref().map_or(cache.len(), |p| p.len());
     for index in 0..count {
         let position = positions.as_ref().map_or(index, |p| p[index]);
-        let row = &cache.rows[position];
-        if positions.is_none() && filter.map_or(false, |f| !eval_bound(f, row)) { continue; }
+        if positions.is_none() && filter.map_or(false, |f| {
+            !eval_snapshot_bound(f, cache, position)
+        }) { continue; }
         eligible += 1;
         let vector = &cache.i8_flat[position * dim..(position + 1) * dim];
         #[cfg(target_arch = "x86_64")]
         let distance = unsafe { crate::value::dist_sq_avx2_topm_i8(vector, encoded_query) };
         #[cfg(not(target_arch = "x86_64"))]
         let distance = (crate::value::l2_distance_sq_topm_i8(vector, encoded_query, 1.0)) as i32;
-        let candidate = (distance, row.pk, position);
+        let candidate = (distance, cache.pks[position], position);
         if approx.len() < QUERY_TOPM {
             approx.push(candidate);
         } else if approx.peek().map_or(false, |worst| candidate < *worst) {
@@ -1557,9 +1634,8 @@ fn flat_scan_query_topm_i8<'a>(
         }
     }
 
-    let mut exact: BinaryHeap<HeapItem> = BinaryHeap::with_capacity(limit + 1);
+    let mut exact: BinaryHeap<SnapshotItem> = BinaryHeap::with_capacity(limit + 1);
     for approximate in approx.iter() {
-        let row = &cache.rows[approximate.2];
         let vector = cache.vector(approximate.2);
         let Some(distance) = dist_sq_f64_abandon(vector, qvec, f64::INFINITY) else {
             return false;
@@ -1567,7 +1643,9 @@ fn flat_scan_query_topm_i8<'a>(
         if !distance.is_finite() {
             return false;
         }
-        let candidate = HeapItem { row, distance };
+        let candidate = SnapshotItem {
+            pk: cache.pks[approximate.2], position: approximate.2, distance,
+        };
         if exact.len() < limit {
             exact.push(candidate);
         } else if exact.peek().map_or(false, |worst| candidate < *worst) {
@@ -1600,36 +1678,37 @@ fn flat_scan_query_topm_i8<'a>(
 
 /// Compressed candidate pass. Every exact distance still comes from the
 /// original f32 row and original qvec; decoded_query is used only for TopM.
-fn flat_scan_query_topm_f16<'a>(
-    cache: &'a ScanCache,
+fn flat_scan_query_topm_f16(
+    cache: &ScanCache,
     filter: Option<&BoundFilter>,
     qvec: &[f32],
     decoded_query: &[f32],
     query_norm_upper: f64,
     limit: usize,
-    topk: &mut BinaryHeap<HeapItem<'a>>,
+    topk: &mut BinaryHeap<SnapshotItem>,
 ) -> bool {
     debug_assert_eq!(cache.dim, 128);
     debug_assert_eq!(cache.f16_flat.len(), cache.flat.len());
     debug_assert!(limit > 0 && limit < QUERY_TOPM);
     let dim = cache.dim;
     let mut eligible = 0usize;
-    let mut approx: BinaryHeap<ApproxScanItem> = BinaryHeap::with_capacity(QUERY_TOPM + 1);
+    let mut approx: BinaryHeap<SnapshotItem> = BinaryHeap::with_capacity(QUERY_TOPM + 1);
     let positions = filter.and_then(|f| cache.positions(f));
-    let count = positions.as_ref().map_or(cache.rows.len(), |p| p.len());
+    let count = positions.as_ref().map_or(cache.len(), |p| p.len());
     for index in 0..count {
         let position = positions.as_ref().map_or(index, |p| p[index]);
-        let row = &cache.rows[position];
-        if positions.is_none() && filter.map_or(false, |f| !eval_bound(f, row)) { continue; }
+        if positions.is_none() && filter.map_or(false, |f| {
+            !eval_snapshot_bound(f, cache, position)
+        }) { continue; }
         eligible += 1;
         let vector = &cache.f16_flat[position * dim..(position + 1) * dim];
         let distance = l2_distance_sq_fast_topm_f16_x4(vector, decoded_query);
         if !distance.is_finite() {
             return false;
         }
-        let candidate = ApproxScanItem {
+        let candidate = SnapshotItem {
             position,
-            pk: row.pk,
+            pk: cache.pks[position],
             distance,
         };
         if approx.len() < QUERY_TOPM {
@@ -1640,9 +1719,8 @@ fn flat_scan_query_topm_f16<'a>(
         }
     }
 
-    let mut exact: BinaryHeap<HeapItem> = BinaryHeap::with_capacity(limit + 1);
+    let mut exact: BinaryHeap<SnapshotItem> = BinaryHeap::with_capacity(limit + 1);
     for approximate in approx.iter() {
-        let row = &cache.rows[approximate.position];
         let vector = cache.vector(approximate.position);
         let Some(distance) = dist_sq_f64_abandon(vector, qvec, f64::INFINITY) else {
             return false;
@@ -1650,7 +1728,9 @@ fn flat_scan_query_topm_f16<'a>(
         if !distance.is_finite() {
             return false;
         }
-        let candidate = HeapItem { row, distance };
+        let candidate = SnapshotItem {
+            pk: cache.pks[approximate.position], position: approximate.position, distance,
+        };
         if exact.len() < limit {
             exact.push(candidate);
         } else if exact.peek().map_or(false, |worst| candidate < *worst) {
@@ -1688,33 +1768,34 @@ fn flat_scan_query_topm_f16<'a>(
 /// Build 32 complete-f32 candidates, exactly rescore only those candidates,
 /// and accept them only when every excluded row is certified worse than the
 /// candidates' exact Kth row. False means discard all locals and rerun f64.
-fn flat_scan_query_topm<'a>(
-    cache: &'a ScanCache,
+fn flat_scan_query_topm(
+    cache: &ScanCache,
     filter: Option<&BoundFilter>,
     qvec: &[f32],
     limit: usize,
-    topk: &mut BinaryHeap<HeapItem<'a>>,
+    topk: &mut BinaryHeap<SnapshotItem>,
 ) -> bool {
     debug_assert_eq!(cache.dim, 128);
     debug_assert!(limit > 0 && limit < QUERY_TOPM);
     let dim = cache.dim;
     let mut eligible = 0usize;
-    let mut approx: BinaryHeap<ApproxScanItem> = BinaryHeap::with_capacity(QUERY_TOPM + 1);
+    let mut approx: BinaryHeap<SnapshotItem> = BinaryHeap::with_capacity(QUERY_TOPM + 1);
     let positions = filter.and_then(|f| cache.positions(f));
-    let count = positions.as_ref().map_or(cache.rows.len(), |p| p.len());
+    let count = positions.as_ref().map_or(cache.len(), |p| p.len());
     for index in 0..count {
         let position = positions.as_ref().map_or(index, |p| p[index]);
-        let row = &cache.rows[position];
-        if positions.is_none() && filter.map_or(false, |f| !eval_bound(f, row)) { continue; }
+        if positions.is_none() && filter.map_or(false, |f| {
+            !eval_snapshot_bound(f, cache, position)
+        }) { continue; }
         eligible += 1;
         let vector = cache.vector(position);
         let distance = l2_distance_sq_fast_topm_x4(vector, qvec);
         if !distance.is_finite() {
             return false;
         }
-        let candidate = ApproxScanItem {
+        let candidate = SnapshotItem {
             position,
-            pk: row.pk,
+            pk: cache.pks[position],
             distance,
         };
         if approx.len() < QUERY_TOPM {
@@ -1725,9 +1806,8 @@ fn flat_scan_query_topm<'a>(
         }
     }
 
-    let mut exact: BinaryHeap<HeapItem> = BinaryHeap::with_capacity(limit + 1);
+    let mut exact: BinaryHeap<SnapshotItem> = BinaryHeap::with_capacity(limit + 1);
     for approximate in approx.iter() {
-        let row = &cache.rows[approximate.position];
         let vector = cache.vector(approximate.position);
         let Some(distance) = dist_sq_f64_abandon(vector, qvec, f64::INFINITY) else {
             return false;
@@ -1735,7 +1815,9 @@ fn flat_scan_query_topm<'a>(
         if !distance.is_finite() {
             return false;
         }
-        let candidate = HeapItem { row, distance };
+        let candidate = SnapshotItem {
+            pk: cache.pks[approximate.position], position: approximate.position, distance,
+        };
         if exact.len() < limit {
             exact.push(candidate);
         } else if exact.peek().map_or(false, |worst| candidate < *worst) {
@@ -1936,6 +2018,57 @@ fn eval_bound(filter: &BoundFilter, row: &Row) -> bool {
     })
 }
 
+fn eval_snapshot_cmp(
+    cache: &ScanCache,
+    position: usize,
+    col: usize,
+    op: CmpOp,
+    lit: &Literal,
+) -> bool {
+    let ordering = cache.ordering(col, position, lit);
+    match op {
+        CmpOp::Eq => ordering == Ordering::Equal,
+        CmpOp::Ne => ordering != Ordering::Equal,
+        CmpOp::Lt => ordering == Ordering::Less,
+        CmpOp::Le => ordering != Ordering::Greater,
+        CmpOp::Gt => ordering == Ordering::Greater,
+        CmpOp::Ge => ordering != Ordering::Less,
+    }
+}
+
+fn eval_snapshot_bound(filter: &BoundFilter, cache: &ScanCache, position: usize) -> bool {
+    if filter.prog.len() == 1 {
+        if let BInstr::Cmp { col, op, lit } = &filter.prog[0] {
+            return eval_snapshot_cmp(cache, position, *col, *op, lit);
+        }
+    }
+    thread_local! {
+        static STACK: std::cell::RefCell<Vec<bool>> =
+            std::cell::RefCell::new(Vec::new());
+    }
+    STACK.with(|cell| {
+        let mut stack = cell.borrow_mut();
+        stack.clear();
+        for instr in &filter.prog {
+            match instr {
+                BInstr::Cmp { col, op, lit } =>
+                    stack.push(eval_snapshot_cmp(cache, position, *col, *op, lit)),
+                BInstr::And => {
+                    let b = stack.pop().unwrap_or(true);
+                    let a = stack.pop().unwrap_or(true);
+                    stack.push(a && b);
+                }
+                BInstr::Or => {
+                    let b = stack.pop().unwrap_or(false);
+                    let a = stack.pop().unwrap_or(false);
+                    stack.push(a || b);
+                }
+            }
+        }
+        stack.pop().unwrap_or(true)
+    })
+}
+
 fn bind_literal(kind: &ColKind, literal: Literal) -> DbResult<VVal> {
     match (kind, literal) {
         (ColKind::BigInt, Literal::Int(value)) => Ok(VVal::Int(value)),
@@ -2060,6 +2193,66 @@ mod query_topm_tests {
     }
 
     #[test]
+    fn snapshot_soa_filters_and_projects_typed_columns() {
+        let dir = std::env::temp_dir().join(format!("mvdb-soa-columns-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let mut engine = Engine::new(Store::open(&dir, 1024 * 1024).unwrap());
+        engine.query_result_budget = 0;
+        engine.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, n BIGINT, c VARCHAR(4), v VECTOR(2))").unwrap();
+        engine.execute("INSERT INTO t VALUES (1,10,'甲','[0,0]'),(2,20,'乙','[1,0]'),(3,30,'甲','[2,0]')").unwrap();
+        let result = engine.execute("SELECT id,n,c,L2_DISTANCE(v,'[0,0]') AS d FROM t WHERE c='甲' AND n>=10 ORDER BY d LIMIT 2").unwrap();
+        let ExecResult::Query { rows, .. } = result else { panic!("expected rows") };
+        assert_eq!(rows, vec![
+            vec![OutValue::Int(1), OutValue::Int(10), OutValue::Str("甲".to_string()), OutValue::Float(0.0)],
+            vec![OutValue::Int(3), OutValue::Int(30), OutValue::Str("甲".to_string()), OutValue::Float(2.0)],
+        ]);
+        let result = engine.execute("SELECT id,c,v FROM t WHERE c='乙' ORDER BY L2_DISTANCE(v,'[0,0]') LIMIT 1").unwrap();
+        let ExecResult::Query { rows, .. } = result else { panic!("expected rows") };
+        assert_eq!(rows, vec![vec![OutValue::Int(2), OutValue::Str("乙".to_string()), OutValue::Vector(vec![1.0, 0.0])]]);
+        let table = engine.resolve_table("t").unwrap().0;
+        assert!(matches!(&engine.scan_caches[&table].columns[2], SnapshotColumn::Dictionary { .. }));
+        assert_eq!(engine.scan_caches[&table].pks, vec![1, 2, 3]);
+        drop(engine);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn snapshot_soa_dictionary_overflow_preserves_content_and_restart() {
+        let dir = std::env::temp_dir().join(format!("mvdb-soa-overflow-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let mut engine = Engine::new(Store::open(&dir, 1024 * 1024).unwrap());
+        engine.query_result_budget = 0;
+        engine.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, c VARCHAR(8), v VECTOR(2))").unwrap();
+        for base in (0..300).step_by(100) {
+            let values = (base..base + 100).map(|pk|
+                format!("({pk},'u{pk}','[{pk},0]')")).collect::<Vec<_>>().join(",");
+            engine.execute(&format!("INSERT INTO t VALUES {values}")).unwrap();
+        }
+        let query = "SELECT id,c,L2_DISTANCE(v,'[287,0]') AS d FROM t WHERE c='u287' ORDER BY d LIMIT 2";
+        let expected = vec![vec![OutValue::Int(287), OutValue::Str("u287".to_string()), OutValue::Float(0.0)]];
+        let ExecResult::Query { rows, .. } = engine.execute(query).unwrap() else { panic!("expected rows") };
+        assert_eq!(rows, expected);
+        let table = engine.resolve_table("t").unwrap().0;
+        assert!(matches!(&engine.scan_caches[&table].columns[1], SnapshotColumn::Strings(_)));
+        engine.execute("UPDATE t SET c='u287' WHERE id=0").unwrap();
+        let ExecResult::Query { rows, .. } = engine.execute(query).unwrap() else { panic!("expected rows") };
+        assert_eq!(rows, vec![
+            vec![OutValue::Int(287), OutValue::Str("u287".to_string()), OutValue::Float(0.0)],
+            vec![OutValue::Int(0), OutValue::Str("u287".to_string()), OutValue::Float(287.0)],
+        ]);
+        engine.store.shutdown().unwrap();
+        drop(engine);
+        let mut engine = Engine::new(Store::open(&dir, 1024 * 1024).unwrap());
+        engine.query_result_budget = 0;
+        let ExecResult::Query { rows, .. } = engine.execute(query).unwrap() else { panic!("expected rows") };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0], OutValue::Int(287));
+        assert_eq!(rows[1][0], OutValue::Int(0));
+        drop(engine);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn cached_results_follow_visibility_modes_limits_and_request_ids() {
         let dir = std::env::temp_dir().join(format!("mvdb-cache-{}-{}", std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
@@ -2122,24 +2315,26 @@ mod query_topm_tests {
     }
 
     fn cache_from_vectors(vectors: Vec<Vec<f32>>) -> ScanCache {
-        let mut rows = Vec::with_capacity(vectors.len());
+        let mut pks = Vec::with_capacity(vectors.len());
+        let mut codes = Vec::with_capacity(vectors.len());
         let mut flat = Vec::with_capacity(vectors.len() * 128);
         for (pk, vector) in vectors.into_iter().enumerate() {
             assert_eq!(vector.len(), 128);
             flat.extend_from_slice(&vector);
-            rows.push(Row {
-                pk: pk as i64,
-                vals: vec![
-                    VVal::Int(pk as i64),
-                    VVal::Str(if pk % 2 == 0 { "even" } else { "odd" }.to_string()),
-                    VVal::Vec(None),
-                ],
-            });
+            pks.push(pk as i64);
+            codes.push((pk % 2) as u8);
         }
         ScanCache {
             version: 0,
             dim: 128,
-            rows,
+            pks,
+            columns: vec![
+                SnapshotColumn::PrimaryKey,
+                SnapshotColumn::Dictionary {
+                    values: vec!["even".to_string(), "odd".to_string()], codes,
+                },
+                SnapshotColumn::Vector,
+            ],
             flat,
             originals: Vec::new(),
             i8_flat: Vec::new(),
@@ -2160,18 +2355,18 @@ mod query_topm_tests {
         })
     }
 
-    fn snapshot(heap: BinaryHeap<HeapItem<'_>>) -> Vec<(i64, u64)> {
+    fn snapshot(heap: BinaryHeap<SnapshotItem>) -> Vec<(i64, u64)> {
         heap.into_sorted_vec()
             .into_iter()
-            .map(|item| (item.row.pk, item.distance.to_bits()))
+            .map(|item| (item.pk, item.distance.to_bits()))
             .collect()
     }
 
-    fn expected_f64<'a>(
-        cache: &'a ScanCache,
+    fn expected_f64(
+        cache: &ScanCache,
         filter: &Option<BoundFilter>,
         query: &[f32],
-    ) -> BinaryHeap<HeapItem<'a>> {
+    ) -> BinaryHeap<SnapshotItem> {
         let mut expected = BinaryHeap::new();
         flat_scan_serial_f64(cache, filter.as_ref(), query, 10, &mut expected);
         expected
