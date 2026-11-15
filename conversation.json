@@ -370,7 +370,7 @@
     {
       "id": "wal-pretouch-durability-plan",
       "topic": "验证真实预触页，但保留每次提交的持久化边界",
-      "status": "confirmed_plan_without_valid_result",
+      "status": "confirmed_plan_tested_and_rejected",
       "proposal": {
         "source": "agent",
         "content": "只对真正新建空库同步预写6MiB；逻辑WAL尾独立于物理容量，以定位写覆盖零区，无异步提交、不补充窗口、每次真实帧仍同步后发布和ACK。"
@@ -387,11 +387,25 @@
         "source": "agent",
         "content": "冻结2对同二进制A/A及3对A/B，共10个fresh生命周期；驱动在cgroup外，计时后核验40,320条查询，覆盖ACK恢复、未ACK尾、checkpoint、耗尽回退和失败不ACK。写入T、B、M和查询T、B、M分别报告。"
       },
-      "result_evidence": [],
+      "result_evidence": [
+        {
+          "pointer": "/experiments/24/output",
+          "excerpt": "配对中位改善（正数更好）：write_total +39.524798%，startup_write_total +37.278541%，counted_total +18.433694%；"
+        },
+        {
+          "pointer": "/experiments/24/output",
+          "excerpt": "完整生命周期物理写入增加116.882129%，生命周期峰值内存增加46.888567%。"
+        },
+        {
+          "pointer": "/experiments/24/output",
+          "excerpt": "冻结v2门共9项硬失败；DB CPU绝对改善0.363989%仍未过其A/A非劣下界。"
+        }
+      ],
       "tradeoff_and_reflection": {
         "source": "agent",
-        "content": "本条只确认假设与验证方案。两次基础设施校验失败的尝试已排除，不进入任何A/A或A/B统计；排除尝试的部分原生持久化目录缺失，不能据此得出持久化通过或失败。当前没有可采用的性能结果，不称已集成。"
-      }
+        "content": "真实预触页缩短了本地写入时间，但物理写入、峰值内存及多个查询/恢复阶段代价使冻结门失败，按原规则拒绝。专项正确性通过不能覆盖完整成本失败。两次不完整尝试始终排除，两个零分母项保持证据不足；不缩小窗口或改门重测，不合入候选。"
+      },
+      "student_explanation_time_context": "本条学生审阅确认发生于有效结果产生之前，原文保持当时的计划与预测；下方后续结果、分析与否决由Agent记录。"
     }
   ],
   "evidence_index": [
@@ -626,13 +640,27 @@
         "excerpt": "我认可验证WAL真实预触页的假设。仅fallocate与真实写零并同步不同：后者可能提前完成块初始化和extent转换，减少后续提交的元数据工作，但收益依赖文件系统。初始6MiB写零的同步只保证这些零已落盘，不保证以后覆盖进去的日志记录持久化；每次真实提交仍须在发布和ACK前完成同步。实验必须同时计入额外写入、启动时间、写入和查询窗口的B、峰值内存及恢复成本，并区分逻辑尾与物理容量；checkpoint后空WAL不能据此当成新库。当前只"
       },
       "contribution_source": "agent_draft_reviewed_and_confirmed_by_student",
-      "result_evidence": [],
+      "result_evidence": [
+        {
+          "pointer": "/experiments/24/output",
+          "excerpt": "配对中位改善（正数更好）：write_total +39.524798%，startup_write_total +37.278541%，counted_total +18.433694%；"
+        },
+        {
+          "pointer": "/experiments/24/output",
+          "excerpt": "完整生命周期物理写入增加116.882129%，生命周期峰值内存增加46.888567%。"
+        },
+        {
+          "pointer": "/experiments/24/output",
+          "excerpt": "冻结v2门共9项硬失败；DB CPU绝对改善0.363989%仍未过其A/A非劣下界。"
+        }
+      ],
       "deduplication": "本问题、验证和修正链只列一次；维度为阅读索引，未自评档位。",
       "review_confirmation": {
         "pointer": "/review_confirmations/0/content",
         "excerpt": "我已经审阅了，可以作为解释写进正式材料"
       },
-      "confirmation_scope": "四个不同技术主题共用本次审阅确认，不声称存在四条独立用户原话或学生独立执行实验。"
+      "confirmation_scope": "四个不同技术主题共用本次审阅确认，不声称存在四条独立用户原话或学生独立执行实验。",
+      "result_attribution": "Agent在学生认可验证计划后执行并报告；尚无学生对新否决结果的事后解释，不追记为学生已经作出该解释。"
     }
   ],
   "experiments": [
@@ -786,6 +814,12 @@
       "source": "tool_result",
       "command": "读取ann-scoped-compactkey-20261115/coordinator-audit.json；已有321文件与runtime独立核验，本轮不重跑。",
       "output": "ANN-scoped compact-key+flat-reuse候选：20个uniform生命周期、10个ties生命周期，80640+20000响应核验；ANN初始/恢复唯一查询改善80.392007%/88.452793%，ANN生命周期peak改善3.350923%。12项exact计时门失败，初始唯一/恢复唯一/重复合计分别退化3.819231%/3.682831%/6.816848%，ties退化11.703510%；exact峰值退化1.129802%仍在其非劣门内。正确性/持久化等其他门通过，最终REJECT_CANDIDATE_CONFIRMED；未集成、worker已释放，不产生新正式成绩。"
+    },
+    {
+      "id": "agent-wal-pretouch-final-rejection-20261115",
+      "source": "tool_result",
+      "command": "复核storage-pretouch-20261115/result.json、coordinator-audit.json和report.md；本次材料整理只读取已保存结果，未重跑实验。",
+      "output": "WAL真实预触页最终独立复核：REJECT_CANDIDATE_CONFIRMED，候选未集成、未提测。10个有效fresh生命周期，先前attempts1/2全部排除；40,320条查询响应在计时后通过完整f64/稳定PK真值核验，10个最终durable WAL逐文件hash及A/B配对字节一致，53/53 focused/crash检查通过。配对中位改善（正数更好）：write_total +39.524798%，startup_write_total +37.278541%，counted_total +18.433694%；query_total -2.290761%，initial_unique -4.779841%，recovery_unique -6.927632%，recovery_open_ready -19.870725%，shutdown_sum -23.359431%。完整生命周期物理写入增加116.882129%，生命周期峰值内存增加46.888567%。局部筛选T+B/3=0.564088671个百分点，低于预声明5个百分点门。冻结v2门共9项硬失败；DB CPU绝对改善0.363989%仍未过其A/A非劣下界。另有query-window物理写入和complete-lifecycle物理读取两项零分母，保留为证据不足，未并入9项硬失败，未替换为逻辑文件大小。425个索引产物、65,762,107字节已由协调者重hash。控制为44ffd886f的13个固定blob，候选仅storage.rs；有效驱动a7163d7642fddfa7b63e5b688ce60197b13f9ad0d20e66b06f600683e916c95c。这些是本地direct-pipe/shared-device数据，不是官方专用设备B或E。完整release回归因门失败未运行；此前排除尝试的原生持久化目录缺失限制不改变，也不作通过/失败推断。正式成绩仍E3666.888955/Prompt4.0。"
     }
   ],
   "additional_experiment_context": {
@@ -797,7 +831,7 @@
     "新加入的四段为Agent起草、学生审阅确认的整理稿；其来源与历史用户技术原文分别标识。",
     "真实实施和验证主要由Agent完成；审阅确认不能代替亲自设计实验、独立推导或迁移验证的证据。",
     "本地部署、共享设备io.stat、A/A噪声与阶段窗口不等同于未知官方基线；不以本地百分比推算正式E。",
-    "WAL预触页尚无有效性能结果，失败尝试全部排除；零区同步不替代后续真实日志记录的提交同步。",
+    "WAL预触页在审阅时只有验证计划，后续有效实验被拒绝；事前审阅原文保留，实际结果单独归属Agent。零区同步不能替代真实日志记录提交同步。",
     "没有可核对的既往分维度评审报告；本地引用检查不能证明平台评审成功或保证Prompt目标。"
   ],
   "submission_context": {
