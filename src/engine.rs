@@ -951,7 +951,7 @@ impl Engine {
         let rows = self.visible_rows(table_id)?;
         let mut ops = Vec::new();
         for row in rows {
-            if bound_filter.as_ref().map_or(true, |f| !eval_bound(f, &row)) {
+            if bound_filter.as_ref().map_or(false, |f| !eval_bound(f, &row)) {
                 continue;
             }
             let mut updated = row.clone();
@@ -972,7 +972,7 @@ impl Engine {
         let rows = self.visible_rows(table_id)?;
         let mut ops = Vec::new();
         for row in rows {
-            if bound_filter.as_ref().map_or(false, |f| eval_bound(f, &row)) {
+            if bound_filter.as_ref().map_or(true, |f| eval_bound(f, &row)) {
                 ops.push(WalOp::DeleteRow { table_id, pk: row.pk });
             }
         }
