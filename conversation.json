@@ -1,6 +1,6 @@
 {
   "schema": "minivectordb-technical-decisions-v2",
-  "material_summary": "按技术问题组织既有判断、依据、确认、实测和取舍，保留历史技术原文与复测顺序。新增字典诊断与修复验证均为Agent结果；已确认解释保持原文和真实来源。",
+  "material_summary": "按技术问题组织既有判断、依据、确认、实测和取舍，保留历史技术原文与复测顺序。本次加入Agent起草、用户审阅确认的字典内存判断及WAL实验复盘；WAL完善既有判断链，不重复列项。实验仍归属Agent，审阅确认不作为独立推导或亲自执行的记录。",
   "materials_scope": "2026-11-09至2026-11-16，本队轻向量数据库实现、验证与既有材料整理。",
   "source_conventions": {
     "historical_user_statement": "既有记录中的真实技术追问、解释或确认，技术内容不改写。",
@@ -25,6 +25,23 @@
         "wal-pretouch-durability-plan"
       ],
       "attribution": "四个Agent起草解释共用一次学生审阅确认；不是四条独立用户原话，也不证明学生独立执行实验。"
+    },
+    {
+      "id": "review-20261116-dictionary-and-wal-reflection",
+      "date": "2026-11-16",
+      "date_semantics": "当前会话审阅确认的记录日期，Asia/Shanghai；未声称精确消息时间。",
+      "source": "student",
+      "content": "认可",
+      "scope": "审阅确认字典内存判断与WAL实验复盘两段Agent草稿；WAL补全原计划、实测与否决链。",
+      "technical_record_ids": [
+        "dictionary-transient-peak-diagnostic",
+        "wal-pretouch-durability-plan"
+      ],
+      "approved_explanation_sha256_utf8": {
+        "dictionary-transient-peak-diagnostic": "a53a69217fc1b5d7f1d3c4f494b27f7c4cc2a490c5590a41ca5095b7a842bca2",
+        "wal-pretouch-durability-plan": "ed2a51742f1045c5358de07c11da50865f59bdce4bffec1eb9b619cce1414dd5"
+      },
+      "attribution": "两段Agent起草解释共用一次真实用户审阅确认；不是两条用户自发原话，也不证明用户独立推导或亲自执行实验。"
     }
   ],
   "technical_records": [
@@ -513,7 +530,7 @@
     {
       "id": "wal-pretouch-durability-plan",
       "topic": "验证真实预触页，但保留每次提交的持久化边界",
-      "status": "confirmed_plan_tested_and_rejected",
+      "status": "confirmed_plan_tested_rejected_and_post_result_reflection_confirmed",
       "proposal": {
         "source": "agent",
         "content": "只对真正新建空库同步预写6MiB；逻辑WAL尾独立于物理容量，以定位写覆盖零区，无异步提交、不补充窗口、每次真实帧仍同步后发布和ACK。"
@@ -524,6 +541,13 @@
           "authorship": "Agent起草，学生审阅后确认作为解释；是整理稿，不是逐字聊天记录。",
           "confirmation_id": "review-20261115-technical-explanations",
           "content": "我认可验证WAL真实预触页的假设。仅fallocate与真实写零并同步不同：后者可能提前完成块初始化和extent转换，减少后续提交的元数据工作，但收益依赖文件系统。初始6MiB写零的同步只保证这些零已落盘，不保证以后覆盖进去的日志记录持久化；每次真实提交仍须在发布和ACK前完成同步。实验必须同时计入额外写入、启动时间、写入和查询窗口的B、峰值内存及恢复成本，并区分逻辑尾与物理容量；checkpoint后空WAL不能据此当成新库。当前只有验证计划，没有有效性能结论，采样失败的尝试不进入统计。"
+        },
+        {
+          "source": "agent_draft_reviewed_and_confirmed_by_student",
+          "authorship": "Agent起草，用户审阅确认作为解释；不是用户自发原话、独立推导或亲自执行实验的记录。",
+          "confirmation_id": "review-20261116-dictionary-and-wal-reflection",
+          "stage": "post_result_reflection",
+          "content": "此前认可的是验证预触页假设，不是预先认可采用。实测写入总时间中位改善39.5248%，但完整生命周期物理写入增加116.8821%，查询、恢复和峰值等预声明门也有失败，因此应保留否决。局部提交变快不足以证明整体值得采用，也不能在看到结果后改门槛；初始零页同步始终不能代替后续真实日志的提交同步。"
         }
       ],
       "validation": {
@@ -548,7 +572,7 @@
         "source": "agent",
         "content": "真实预触页缩短了本地写入时间，但物理写入、峰值内存及多个查询/恢复阶段代价使冻结门失败，按原规则拒绝。专项正确性通过不能覆盖完整成本失败。两次不完整尝试始终排除，两个零分母项保持证据不足；不缩小窗口或改门重测，不合入候选。"
       },
-      "student_explanation_time_context": "本条学生审阅确认发生于有效结果产生之前，原文保持当时的计划与预测；下方后续结果、分析与否决由Agent记录。"
+      "student_explanation_time_context": "第一段解释的审阅确认发生于有效结果产生之前，仅认可验证计划；实验、后续分析与否决由Agent完成。第二段为本次结果公布后由Agent起草、用户审阅确认的复盘，保留既有否决，不改写原计划或实验门槛。"
     },
     {
       "id": "task-goal-and-performance-question",
@@ -695,8 +719,16 @@
     {
       "id": "dictionary-transient-peak-diagnostic",
       "topic": "字符串字典构建的临时副本与峰值内存",
-      "status": "agent_candidate_validated_and_selected_no_new_student_explanation",
-      "student_contributions": [],
+      "status": "agent_candidate_validated_selected_post_result_explanation_reviewed_and_confirmed",
+      "student_contributions": [
+        {
+          "source": "agent_draft_reviewed_and_confirmed_by_student",
+          "authorship": "Agent起草，用户审阅确认作为解释；不是用户自发原话、独立推导或亲自执行实验的记录。",
+          "confirmation_id": "review-20261116-dictionary-and-wal-reflection",
+          "stage": "post_result_reflection",
+          "content": "不能只凭不同值个数或平均重复率判断字典是否节省内存，还要看字符串字节数及对象是否同时存活。旧实现同时复制字典值和字符串键，溢出时又在临时副本存活期间构造完整回退列。借用键并在回退分配前释放临时状态后，长字符串溢出样本峰值降低约11.6–11.8MiB，未溢出样本降低约4.1–4.5MiB，短字符串对照没有峰值增加。这支持具体修复机制，但不能据此推断官方数据分布、解释上一轮E下降或保证5000分。"
+        }
+      ],
       "proposal": {
         "source": "agent",
         "content": "检验字典值和拥有字符串键的重复克隆，以及溢出回退构造时的同时存活，是否能在规定类型的样本上提高完整峰值。"
@@ -728,7 +760,8 @@
           "pointer": "/experiments/29/output",
           "excerpt": "原始响应逐条解析、哈希和预期TopK/投影比较通过；各对记录的持久化文件哈希相等。Root复核时临时WAL原始文件已不可用，因此未声称重新哈希这些原始WAL字节。快照字符串投影和溢出/重启语义由现有单元覆盖；资源样本的字符串投影无LIMIT，走普通行路径。"
         }
-      ]
+      ],
+      "student_explanation_time_context": "D2诊断、修复验证及原Agent反思保留记录时原文；其中“没有新增学生事后解释”及空解释字段指当时状态。本次用户在看到诊断与修复结果后审阅确认上述Agent解释，未追记为事前预测或亲自执行。"
     }
   ],
   "evidence_index": [
@@ -963,10 +996,62 @@
         "excerpt": "我认可验证WAL真实预触页的假设。仅fallocate与真实写零并同步不同：后者可能提前完成块初始化和extent转换，减少后续提交的元数据工作，但收益依赖文件系统。初始6MiB写零的同步只保证这些零已落盘，不保证以后覆盖进去的日志记录持久化；每次真实提交仍须在发布和ACK前完成同步。实验必须同时计入额外写入、启动时间、写入和查询窗口的B、峰值内存及恢复成本，并区分逻辑尾与物理容量；checkpoint后空WAL不能据此当成新库。当前只"
       },
       "contribution_source": "agent_draft_reviewed_and_confirmed_by_student",
-      "result_evidence": [],
+      "result_evidence": [
+        {
+          "pointer": "/experiments/24/output",
+          "excerpt": "配对中位改善（正数更好）：write_total +39.524798%，startup_write_total +37.278541%，counted_total +18.433694%；"
+        },
+        {
+          "pointer": "/experiments/24/output",
+          "excerpt": "完整生命周期物理写入增加116.882129%，生命周期峰值内存增加46.888567%。"
+        },
+        {
+          "pointer": "/experiments/24/output",
+          "excerpt": "冻结v2门共9项硬失败；DB CPU绝对改善0.363989%仍未过其A/A非劣下界。"
+        }
+      ],
       "deduplication": "本问题、验证和修正链只列一次；维度为阅读索引，未自评档位。",
-      "result_attribution": "Agent在学生认可验证计划后执行并报告；尚无学生对新否决结果的事后解释，不追记为学生已经作出该解释。",
-      "retained_agent_result_location": "/technical_records/9/result_evidence"
+      "result_attribution": "Agent在前次计划确认后执行实验并作出否决；用户本次审阅确认Agent起草的事后复盘。同一WAL计划、验证、否决与复盘链保留为一个单元，未另列评分单位。",
+      "retained_agent_result_location": "/technical_records/9/result_evidence",
+      "additional_student_evidence": [
+        {
+          "pointer": "/technical_records/9/student_contributions/1/content",
+          "excerpt": "此前认可的是验证预触页假设，不是预先认可采用。实测写入总时间中位改善39.5248%，但完整生命周期物理写入增加116.8821%，查询、恢复和峰值等预声明门也有失败，因此应保留否决。局部提交变快不足以证明整体值得采用，也不能在看到结果后改门槛；初始零页同步始终不能代替后续真实日志的提交同步。"
+        }
+      ]
+    },
+    {
+      "unit": "dictionary-transient-peak-diagnostic",
+      "dimension": "技术理解与迁移",
+      "student_evidence": {
+        "pointer": "/technical_records/13/student_contributions/0/content",
+        "excerpt": "不能只凭不同值个数或平均重复率判断字典是否节省内存，还要看字符串字节数及对象是否同时存活。旧实现同时复制字典值和字符串键，溢出时又在临时副本存活期间构造完整回退列。借用键并在回退分配前释放临时状态后，长字符串溢出样本峰值降低约11.6–11.8MiB，未溢出样本降低约4.1–4.5MiB，短字符串对照没有峰值增加。这支持具体修复机制，但不能据此推断官方数据分布、解释上一轮E下降或保证5000分。"
+      },
+      "contribution_source": "agent_draft_reviewed_and_confirmed_by_student",
+      "result_evidence": [
+        {
+          "pointer": "/experiments/28/output",
+          "excerpt": "256个长值后字典溢出的SoA减旧版生命周期峰值字节：12574720,12337152。"
+        },
+        {
+          "pointer": "/experiments/28/output",
+          "excerpt": "255个长值加重复短值、不溢出的SoA减旧版生命周期峰值字节：4726784,4509696。"
+        },
+        {
+          "pointer": "/experiments/29/output",
+          "excerpt": "本地功能检查：release单元23/23、公开MySQL20/20、扩展6/6、协议20/20、无WHERE黑盒4组全部通过；这些协议检查不等同于平台正式MySQL准入结果。"
+        },
+        {
+          "pointer": "/experiments/29/output",
+          "excerpt": "预声明3种样本各2对交替，共12个生命周期；候选减修复后SoA对照的首次TopK后完整峰值字节：溢出样本-12169216、-12333056；不溢出长字符串样本-4669440、-4272128；短字符串对照-245760、0。六项预声明内存门槛全部通过。"
+        },
+        {
+          "pointer": "/experiments/29/output",
+          "excerpt": "原始响应逐条解析、哈希和预期TopK/投影比较通过；各对记录的持久化文件哈希相等。Root复核时临时WAL原始文件已不可用，因此未声称重新哈希这些原始WAL字节。快照字符串投影和溢出/重启语义由现有单元覆盖；资源样本的字符串投影无LIMIT，走普通行路径。"
+        }
+      ],
+      "deduplication": "字典诊断、修复与解释只列一次；维度为阅读索引，未自评档位，索引数量不代表平台分数。",
+      "result_attribution": "诊断、源码修复和验证均由Agent完成；用户在本次审阅确认解释，不作为亲自实验或独立推导证据。"
     }
   ],
   "experiments": [
@@ -1175,12 +1260,12 @@
   },
   "limitations": [
     "一条修正链只列一个最相关维度；索引数量、实验数量和共享确认均不是平台分数。",
-    "新加入的四段为Agent起草、学生审阅确认的整理稿；其来源与历史用户技术原文分别标识。",
+    "前次四段及本次两段为Agent起草、用户审阅确认的整理稿；分别关联两次真实确认，来源与历史用户技术原文分别标识。",
     "真实实施和验证主要由Agent完成；审阅确认不能代替亲自设计实验、独立推导或迁移验证的证据。",
     "本地部署、共享设备io.stat、A/A噪声与阶段窗口不等同于未知官方基线；不以本地百分比推算正式E。",
-    "WAL预触页在审阅时只有验证计划，后续有效实验被拒绝；事前审阅原文保留，实际结果单独归属Agent。零区同步不能替代真实日志记录提交同步。",
+    "WAL预触页首次审阅时仅为验证计划，后续有效实验被拒绝；本次用户审阅确认事后复盘，保留原否决与预声明门。零区同步不能替代真实日志记录提交同步。",
     "没有可核对的既往分维度评审报告；本地引用检查不能证明平台评审成功或保证Prompt目标。",
-    "新平台结果与分布诊断均只记为实际平台/Agent后续结果；没有新增学生事后解释，也不建立成绩变化归因。",
+    "平台结果与分布诊断保留当时的实际平台/Agent原文；本次新增字典判断与WAL复盘的审阅确认。没有对平台成绩变化建立因果归因，也不据此预测官方成绩。",
     "恢复的任务目标、提交成功率和结构性问题属于历史问题/上下文；本地结构与引用校验通过不代表平台评分资格或Prompt提升。"
   ],
   "submission_context": {
@@ -1200,7 +1285,7 @@
       "E": 3666.888955,
       "Prompt": 4.0
     },
-    "published_but_formally_unscored_commit": "5ea9e585f0a505beead3c82187155b3ffdc4942b",
+    "published_but_formally_unscored_commit": "43ab74646e0c8b6053c70cac6230870423577f02",
     "isolated_unselected_old_engine_plus_fix_candidate": {
       "base_commit": "5ea9e585f0a505beead3c82187155b3ffdc4942b",
       "old_engine_commit": "5a51c258373c482b866462c0539c6adb20caeb0a",
@@ -1209,13 +1294,13 @@
       "functional_validation_only": true,
       "selected_applied_published_or_submitted": false
     },
-    "material_state": "供本次源码提交使用的审核版；材料冻结时源码与材料已通过本地审查，尚未发布本次提交或正式提测。后续发布事实以独立发布回执为准。",
+    "material_state": "本次两段解释已由用户在当前会话审阅确认，正在冻结为材料提交；字典修复源码已按43ab74646e0c8b6053c70cac6230870423577f02发布且尚未正式提测。本次新材料提交的发布事实以独立发布回执为准，不混同材料冻结时间和正式成绩。",
     "local_validation_is_not_platform_score_or_eligibility_prediction": true,
     "selected_dictionary_lifetime_candidate": {
       "base_commit": "5ea9e585f0a505beead3c82187155b3ffdc4942b",
       "engine_sha256": "6c6d56d45b439c44e75d81873ff455bcdd10be0e2e15175905b96ffe1d751442",
       "binary_sha256": "5f054b8c68b0869bb52096d195c47f15f9fd9a3171536b74d4053a7b4c5ce88a",
-      "state_at_material_freeze": "root_reviewed_selected_for_source_and_material_commit_not_formally_scored",
+      "state_at_material_freeze": "selected_source_published_in_43ab74646e0c8b6053c70cac6230870423577f02_not_formally_scored",
       "functional_checks": {
         "release_units": 23,
         "public": 20,
@@ -1225,9 +1310,12 @@
       },
       "resource_lifecycles": 12,
       "root_review_sha256": "4375e5c599819e4750a438a326e6fad68cfce9ae626d4b4fec7520921535562a",
-      "new_student_explanation": null
+      "new_student_explanation": {
+        "pointer": "/technical_records/13/student_contributions/0/content",
+        "excerpt": "不能只凭不同值个数或平均重复率判断字典是否节省内存，还要看字符串字节数及对象是否同时存活。旧实现同时复制字典值和字符串键，溢出时又在临时副本存活期间构造完整回退列。借用键并在回退分配前释放临时状态后，长字符串溢出样本峰值降低约11.6–11.8MiB，未溢出样本降低约4.1–4.5MiB，短字符串对照没有峰值增加。这支持具体修复机制，但不能据此推断官方数据分布、解释上一轮E下降或保证5000分。"
+      }
     },
-    "published_but_formally_unscored_commit_scope": "该字段记录本次材料冻结前已发布的源码父提交；本次源码以selected_dictionary_lifetime_candidate中的哈希定位。",
+    "published_but_formally_unscored_commit_scope": "本次材料冻结前已实际发布的字典修复源码与上一版材料提交；本次仅更新两份材料，后续发布以独立回执为准。",
     "public_platform_retention_rule_observed": {
       "source_url": "https://open.oceanbase.com/train/detail/21?questionId=600081",
       "observed_date_timezone": "2026-11-16 Asia/Shanghai",
