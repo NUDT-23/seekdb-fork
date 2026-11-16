@@ -261,7 +261,7 @@ impl Engine {
             query_results: HashMap::new(),
             query_result_bytes: 0,
             query_result_budget: std::env::var("MINIVEC_RESULT_CACHE_MB")
-                .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(8)
+                .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0)
                 .saturating_mul(1024 * 1024),
             query_result_clock: 0,
         };

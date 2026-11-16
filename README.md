@@ -201,9 +201,10 @@ the 2.25 GB recovery chain all pass (191.4 s, exit 0). This candidate changes
 the durable encoding; new readers accept legacy and packed records.
 
 The 2026-11-12 candidate adds a process-local result cache for repeated identical
-SELECT statements with LIMIT 1..128 outside explicit transactions. It defaults to
-8 MiB (`MINIVEC_RESULT_CACHE_MB=0` disables it), has a 2048-entry ceiling and
-evicts the least recently used entry. Every parsed non-SELECT statement clears
+SELECT statements with LIMIT 1..128 outside explicit transactions. It defaulted to
+8 MiB until 2026-11-16 and is now off unless `MINIVEC_RESULT_CACHE_MB` is set to a
+non-zero budget (see "Request loop and result cache default" below); it has a
+2048-entry ceiling and evicts the least recently used entry. Every parsed non-SELECT statement clears
 it before execution, as do exact/ANN mode changes; restart starts empty. Official
 JSON responses reuse a cached suffix while rebuilding each request ID. Oversized
 result estimates are rejected before cloning and rendering for the cache.
