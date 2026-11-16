@@ -206,6 +206,34 @@ mod rawio {
         fn write(fd: c_int, buf: *const c_void, count: usize) -> isize;
         fn poll(fds: *mut PollFd, nfds: c_ulong, timeout: c_int) -> c_int;
         fn memchr(s: *const c_void, c: c_int, n: usize) -> *mut c_void;
+        fn getrusage(who: c_int, usage: *mut c_void) -> c_int;
+    }
+
+    /// What one busy-poll window observed.
+    pub struct SpinOutcome {
+        /// Input (or hang-up/error) showed up before the window closed.
+        pub ready: bool,
+        /// Longest time between two consecutive readiness probes.
+        pub max_gap: Duration,
+    }
+
+    /// Involuntary context switches of the calling thread so far, when the
+    /// kernel reports them.
+    #[cfg(target_pointer_width = "64")]
+    pub fn involuntary_switches() -> Option<u64> {
+        const RUSAGE_THREAD: c_int = 1;
+        // LP64 `struct rusage` is two timevals (four longs) and fourteen
+        // longs, ru_nivcsw last; the buffer is oversized on purpose.
+        let mut usage = [0i64; 32];
+        if unsafe { getrusage(RUSAGE_THREAD, usage.as_mut_ptr().cast()) } != 0 {
+            return None;
+        }
+        Some(usage[17] as u64)
+    }
+
+    #[cfg(not(target_pointer_width = "64"))]
+    pub fn involuntary_switches() -> Option<u64> {
+        None
     }
 
     pub fn find_newline(haystack: &[u8]) -> Option<usize> {
@@ -225,18 +253,18 @@ mod rawio {
     /// leak to whoever shares the open file description); readiness is only
     /// probed with zero-timeout `poll(2)`. Any non-zero result (data, hang-up,
     /// error, EINTR) hands over to the blocking read, which reports it.
-    pub fn spin_until_readable(window: Duration) {
-        if window.is_zero() {
-            return;
-        }
+    pub fn spin_until_readable(window: Duration) -> SpinOutcome {
         let mut pfd = PollFd { fd: 0, events: POLLIN, revents: 0 };
         let started = Instant::now();
+        let mut last = started;
+        let mut max_gap = Duration::ZERO;
         loop {
-            if unsafe { poll(&mut pfd, 1, 0) } != 0 {
-                return;
-            }
-            if started.elapsed() >= window {
-                return;
+            let ready = unsafe { poll(&mut pfd, 1, 0) } != 0;
+            let now = Instant::now();
+            max_gap = max_gap.max(now.saturating_duration_since(last));
+            last = now;
+            if ready || now.saturating_duration_since(started) >= window {
+                return SpinOutcome { ready, max_gap };
             }
             std::hint::spin_loop();
         }
@@ -291,7 +319,18 @@ mod rawio {
         haystack.iter().position(|&byte| byte == b'\n')
     }
 
-    pub fn spin_until_readable(_window: Duration) {}
+    pub struct SpinOutcome {
+        pub ready: bool,
+        pub max_gap: Duration,
+    }
+
+    pub fn involuntary_switches() -> Option<u64> {
+        None
+    }
+
+    pub fn spin_until_readable(_window: Duration) -> SpinOutcome {
+        SpinOutcome { ready: true, max_gap: Duration::ZERO }
+    }
 
     pub fn read_stdin(buf: &mut Vec<u8>) -> io::Result<usize> {
         let len = buf.len();
@@ -313,6 +352,156 @@ mod rawio {
     }
 }
 
+/// Decides before every stdin read whether busy-polling is worth a CPU.
+///
+/// Spinning only pays while a CPU is free for it. On a saturated host the
+/// spinning thread uses up its time slice, is descheduled, and the request
+/// it was waiting for then sits unread until the thread runs again. Two
+/// signs of having lost the CPU (an involuntary context switch since the
+/// previous spin, or a probe-to-probe gap of `STALL`) within `TRIP_SPAN`
+/// spinning reads suspend spinning for a number of reads that doubles on
+/// every further sign and resets after `CALM_SPAN` undisturbed ones. A run
+/// of windows that expire with no request suspends it as well.
+struct SpinControl {
+    window: std::time::Duration,
+    guard: bool,
+    /// Reads still to be served without spinning.
+    paused: u32,
+    /// Length of the next contention pause.
+    backoff: u32,
+    /// Since the last pause for contention no calm span has passed: the next
+    /// sign suspends spinning at once.
+    wary: bool,
+    /// Spinning reads since the last sign of contention.
+    quiet: u32,
+    /// Consecutive requests whose window expired before they arrived.
+    idle_run: u32,
+    switches: Option<u64>,
+    /// The switch count must be re-read before it is compared again.
+    rebase: bool,
+    counts: SpinCounts,
+}
+
+#[derive(Default)]
+struct SpinCounts {
+    spun: u64,
+    blocked: u64,
+    expired: u64,
+    preempted: u64,
+    stalled: u64,
+    trips: u64,
+    idle_trips: u64,
+    max_gap_us: u64,
+}
+
+impl SpinControl {
+    const STALL: std::time::Duration = std::time::Duration::from_micros(200);
+    const TRIP_SPAN: u32 = 64;
+    const CALM_SPAN: u32 = 256;
+    const PAUSE_MIN: u32 = 64;
+    const PAUSE_MAX: u32 = 4096;
+    const IDLE_RUN: u32 = 16;
+    const IDLE_PAUSE: u32 = 64;
+
+    fn new(window: std::time::Duration, guard: bool) -> SpinControl {
+        SpinControl {
+            window,
+            guard,
+            paused: 0,
+            backoff: Self::PAUSE_MIN,
+            wary: false,
+            quiet: u32::MAX,
+            idle_run: 0,
+            switches: None,
+            rebase: true,
+            counts: SpinCounts::default(),
+        }
+    }
+
+    /// Whether the read about to happen should busy-poll first.
+    fn begin(&mut self) -> bool {
+        if self.window.is_zero() {
+            return false;
+        }
+        if self.paused > 0 {
+            self.paused -= 1;
+            self.rebase = true;
+            self.counts.blocked += 1;
+            return false;
+        }
+        if self.guard && self.rebase {
+            // Switches taken while blocking say nothing about spinning.
+            self.switches = rawio::involuntary_switches();
+            self.rebase = false;
+        }
+        true
+    }
+
+    /// Account for one finished busy-poll window. `new_request` is false
+    /// when the read continues a request that is already partly buffered.
+    fn end(&mut self, outcome: &rawio::SpinOutcome, new_request: bool) {
+        self.counts.spun += 1;
+        self.counts.max_gap_us = self.counts.max_gap_us.max(outcome.max_gap.as_micros() as u64);
+        if !outcome.ready {
+            self.counts.expired += 1;
+        }
+        if !self.guard {
+            return;
+        }
+        let switches = rawio::involuntary_switches();
+        let preempted = matches!((self.switches, switches), (Some(before), Some(after)) if after > before);
+        self.switches = switches;
+        let stalled = outcome.max_gap >= Self::STALL;
+        if preempted || stalled {
+            self.counts.preempted += u64::from(preempted);
+            self.counts.stalled += u64::from(stalled);
+            if self.wary || self.quiet < Self::TRIP_SPAN {
+                self.paused = self.backoff;
+                self.backoff = (self.backoff * 2).min(Self::PAUSE_MAX);
+                self.wary = true;
+                self.counts.trips += 1;
+            }
+            self.quiet = 0;
+        } else {
+            self.quiet = self.quiet.saturating_add(1);
+            if self.wary && self.quiet >= Self::CALM_SPAN {
+                self.wary = false;
+                self.backoff = Self::PAUSE_MIN;
+            }
+        }
+        if new_request {
+            if outcome.ready {
+                self.idle_run = 0;
+            } else {
+                self.idle_run += 1;
+                if self.idle_run >= Self::IDLE_RUN {
+                    self.idle_run = 0;
+                    self.paused = self.paused.max(Self::IDLE_PAUSE);
+                    self.counts.idle_trips += 1;
+                }
+            }
+        }
+    }
+
+    /// One diagnostic line on stderr (`MINIVEC_SPIN_TRACE`).
+    fn trace(&self) {
+        let c = &self.counts;
+        eprintln!(
+            "SPIN_STATS {{\"spun\":{},\"blocked\":{},\"expired\":{},\"preempted\":{},\"stalled\":{},\"trips\":{},\"idle_trips\":{},\"max_gap_us\":{},\"backoff\":{},\"nivcsw\":{}}}",
+            c.spun,
+            c.blocked,
+            c.expired,
+            c.preempted,
+            c.stalled,
+            c.trips,
+            c.idle_trips,
+            c.max_gap_us,
+            self.backoff,
+            rawio::involuntary_switches().map_or(-1, |n| n as i64)
+        );
+    }
+}
+
 /// Request-line reader for the official loop: one reusable buffer, lines
 /// returned as slices of it. Line framing matches `BufRead::lines`: split
 /// on '\n', drop one '\r' before it, and a final unterminated line still
@@ -324,7 +513,7 @@ struct RequestReader {
     /// No '\n' lies in `start..scanned`.
     scanned: usize,
     eof: bool,
-    spin: std::time::Duration,
+    spin: SpinControl,
 }
 
 impl RequestReader {
@@ -334,7 +523,7 @@ impl RequestReader {
     /// Free space guaranteed before each read (the default pipe capacity).
     const MIN_READ: usize = 64 * 1024;
 
-    fn new(spin: std::time::Duration) -> RequestReader {
+    fn new(spin: SpinControl) -> RequestReader {
         RequestReader {
             buf: Vec::with_capacity(Self::BASE_CAPACITY),
             start: 0,
@@ -384,7 +573,10 @@ impl RequestReader {
         if self.buf.capacity() - self.buf.len() < Self::MIN_READ {
             self.buf.reserve(Self::MIN_READ.max(self.buf.len()));
         }
-        rawio::spin_until_readable(self.spin);
+        if self.spin.begin() {
+            let outcome = rawio::spin_until_readable(self.spin.window);
+            self.spin.end(&outcome, self.buf.is_empty());
+        }
         if rawio::read_stdin(&mut self.buf)? == 0 {
             self.eof = true;
         }
@@ -401,7 +593,11 @@ fn run_official(mut engine: Engine, mut out: io::StdoutLock<'static>) {
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(DEFAULT_SPIN_US);
-    let mut reader = RequestReader::new(std::time::Duration::from_micros(spin_us));
+    // MINIVEC_SPIN_GUARD=0 keeps spinning even when the thread is being
+    // descheduled; MINIVEC_SPIN_TRACE prints the controller counters on exit.
+    let spin_guard = std::env::var("MINIVEC_SPIN_GUARD").map_or(true, |v| v.trim() != "0");
+    let spin_trace = std::env::var_os("MINIVEC_SPIN_TRACE").is_some();
+    let mut reader = RequestReader::new(SpinControl::new(std::time::Duration::from_micros(spin_us), spin_guard));
     let mut first_line = true;
     loop {
         let raw = match reader.next_line() {
@@ -450,6 +646,9 @@ fn run_official(mut engine: Engine, mut out: io::StdoutLock<'static>) {
             let response = format!("{{\"id\":{},\"ok\":true}}\n", request.id_raw);
             let _ = rawio::write_stdout(&mut out, response.as_bytes());
             let _ = out.flush();
+            if spin_trace {
+                reader.spin.trace();
+            }
             std::process::exit(0);
         }
         // The ENTIRE response build (mode switch, statement split, execution,
@@ -502,4 +701,7 @@ fn run_official(mut engine: Engine, mut out: io::StdoutLock<'static>) {
     // stdin closed without shutdown: still exit cleanly after a checkpoint.
     let _ = engine.store.shutdown();
     let _ = out.flush();
+    if spin_trace {
+        reader.spin.trace();
+    }
 }
