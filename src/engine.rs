@@ -12,8 +12,8 @@ use crate::value::{
     certified_query_f16_enabled, certified_query_f16_lower_bound, certified_query_f32_enabled,
     certified_query_i8_enabled, certified_query_i8_lower_bound, certified_query_lower_bound,
     check_varchar, dist_sq_f64_abandon, f16_decode_topm, f16_encode_topm, i8_encode_topm,
-    i8_scale_topm, l2_distance, l2_distance_sq_fast, l2_distance_sq_fast_topm_f16_x4,
-    l2_distance_sq_fast_topm_x4, parse_vector, ColKind, Schema,
+    i8_row_norms_topm, i8_scale_topm, l2_distance, l2_distance_sq_fast,
+    l2_distance_sq_fast_topm_f16_x4, l2_distance_sq_fast_topm_x4, parse_vector, ColKind, Schema,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -83,11 +83,28 @@ struct ScanCache {
     /// Optional table-scale int8 mirror for the exact integer candidate pass.
     i8_flat: Vec<i8>,
     i8_scale: f64,
+    /// Squared norm of each int8 row; empty disables the block candidate scan.
+    i8_norms: Vec<i32>,
     /// Optional 128-dimensional RNE-f16 mirror; empty means unavailable.
     f16_flat: Vec<u16>,
     /// Maximum of conservative per-row original-f32 norm upper bounds.
     f16_max_norm_upper: f64,
-    filtered_positions: std::cell::RefCell<Option<(Vec<BInstr>, Rc<Vec<usize>>)>>,
+    filtered_positions: std::cell::RefCell<Vec<(Vec<BInstr>, Rc<Vec<u32>>)>>,
+}
+
+/// Filter programs remembered per snapshot; the cached position lists are
+/// additionally capped at two entries per snapshot row in total.
+const FILTER_POSITION_ENTRIES: usize = 64;
+
+fn cmp_matches(op: CmpOp, ordering: Ordering) -> bool {
+    match op {
+        CmpOp::Eq => ordering == Ordering::Equal,
+        CmpOp::Ne => ordering != Ordering::Equal,
+        CmpOp::Lt => ordering == Ordering::Less,
+        CmpOp::Le => ordering != Ordering::Greater,
+        CmpOp::Gt => ordering == Ordering::Greater,
+        CmpOp::Ge => ordering != Ordering::Less,
+    }
 }
 
 impl ScanCache {
@@ -125,19 +142,56 @@ impl ScanCache {
         }
     }
 
-    fn positions(&self, filter: &BoundFilter) -> Option<Rc<Vec<usize>>> {
-        // One bounded entry per snapshot; large tables/expressions retain
-        // streaming typed-column filters rather than allocating a row list.
+    fn positions(&self, filter: &BoundFilter) -> Option<Rc<Vec<u32>>> {
+        // Bounded per snapshot; large tables/expressions retain streaming
+        // typed-column filters rather than allocating a row list.
         if filter.prog.len() > 32 || self.len() > 131072 {
             return None;
         }
-        if let Some((key, positions)) = self.filtered_positions.borrow().as_ref() {
-            if *key == filter.prog { return Some(Rc::clone(positions)); }
+        if let Some((_, positions)) = self.filtered_positions.borrow().iter()
+            .find(|(key, _)| *key == filter.prog)
+        {
+            return Some(Rc::clone(positions));
         }
-        let positions = Rc::new((0..self.len())
-            .filter_map(|i| eval_snapshot_bound(filter, self, i).then_some(i)).collect::<Vec<_>>());
-        *self.filtered_positions.borrow_mut() = Some((filter.prog.clone(), Rc::clone(&positions)));
+        let positions = Rc::new(self.matching_positions(filter));
+        let mut cached = self.filtered_positions.borrow_mut();
+        let budget = self.len().saturating_mul(2);
+        let mut total = cached.iter().map(|(_, p)| p.len()).sum::<usize>() + positions.len();
+        while !cached.is_empty() && (cached.len() >= FILTER_POSITION_ENTRIES || total > budget) {
+            total -= cached.remove(0).1.len();
+        }
+        cached.push((filter.prog.clone(), Rc::clone(&positions)));
         Some(positions)
+    }
+
+    /// Positions of the rows that satisfy `filter`, ascending. A single
+    /// comparison on a dictionary or integer column is decided per distinct
+    /// value / per integer; everything else runs the row-wise evaluator.
+    fn matching_positions(&self, filter: &BoundFilter) -> Vec<u32> {
+        if let [BInstr::Cmp { col, op, lit }] = filter.prog.as_slice() {
+            match (&self.columns[*col], lit) {
+                (SnapshotColumn::Dictionary { values, codes }, Literal::Str(right))
+                    if values.len() <= 256 =>
+                {
+                    let mut selected = [false; 256];
+                    for (code, value) in values.iter().enumerate() {
+                        selected[code] = cmp_matches(*op, value.cmp(right));
+                    }
+                    return codes.iter().enumerate()
+                        .filter_map(|(i, &code)| selected[code as usize].then_some(i as u32))
+                        .collect();
+                }
+                (SnapshotColumn::Int(values), Literal::Int(right)) => {
+                    return values.iter().enumerate()
+                        .filter_map(|(i, value)| cmp_matches(*op, value.cmp(right)).then_some(i as u32))
+                        .collect();
+                }
+                _ => {}
+            }
+        }
+        (0..self.len())
+            .filter_map(|i| eval_snapshot_bound(filter, self, i).then_some(i as u32))
+            .collect()
     }
 }
 
@@ -209,6 +263,8 @@ pub struct Engine {
     indexes: HashMap<u32, TableIndex>,
     /// nprobe as a fraction denominator of nlist (probe = max(1, nlist/10)).
     nprobe_div: usize,
+    /// Smallest IVF size that ann mode probes instead of scanning.
+    min_ivf_rows: usize,
     /// table_id -> data version, bumped on every committed change.
     table_versions: HashMap<u32, u64>,
     scan_caches: HashMap<u32, ScanCache>,
@@ -245,6 +301,10 @@ impl Engine {
                 // full probing costs nothing where it counts and makes ann
                 // results exact-quality on any data.
                 .unwrap_or(1),
+            min_ivf_rows: std::env::var("MINIVEC_MIN_IVF_ROWS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(4096),
             table_versions: HashMap::new(),
             scan_caches: HashMap::new(),
             scan_cache_budget: std::env::var("MINIVEC_SCAN_CACHE_MB")
@@ -688,11 +748,12 @@ impl Engine {
                     true
                 });
                 if valid {
+                    let norms = i8_row_norms_topm(&encoded).unwrap_or_default();
                     self.scan_caches.insert(table_id, ScanCache {
                         version, dim, pks, columns, flat: Vec::new(), originals,
-                        i8_flat: encoded, i8_scale: scale,
+                        i8_flat: encoded, i8_scale: scale, i8_norms: norms,
                         f16_flat: Vec::new(), f16_max_norm_upper: 0.0,
-                        filtered_positions: std::cell::RefCell::new(None),
+                        filtered_positions: std::cell::RefCell::new(Vec::new()),
                     });
                     self.store.evict_table_vectors(table_id);
                     return;
@@ -772,6 +833,11 @@ impl Engine {
         } else {
             (Vec::new(), 0.0)
         };
+        let i8_norms = if i8_flat.is_empty() {
+            Vec::new()
+        } else {
+            i8_row_norms_topm(&i8_flat).unwrap_or_default()
+        };
         self.scan_caches.insert(
             table_id,
             ScanCache {
@@ -783,9 +849,10 @@ impl Engine {
                 originals: Vec::new(),
                 i8_flat,
                 i8_scale,
+                i8_norms,
                 f16_flat,
                 f16_max_norm_upper,
-                filtered_positions: std::cell::RefCell::new(None),
+                filtered_positions: std::cell::RefCell::new(Vec::new()),
             },
         );
         self.store.evict_table_vectors(table_id);
@@ -1165,10 +1232,7 @@ impl Engine {
         // distance TopK, on a table whose index exists and is large enough
         // for clustering to pay off. Small tables and exact mode always
         // scan, which keeps results exact where IVF could lose recall.
-        let min_ivf_rows = std::env::var("MINIVEC_MIN_IVF_ROWS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(4096);
+        let min_ivf_rows = self.min_ivf_rows;
         let use_ivf = self.ann_mode
             && matches!(topk_limit, Some(limit) if limit > 0)
             && self
@@ -1234,7 +1298,7 @@ impl Engine {
             if let Some(cache) = self.scan_caches.get(&table_id) {
                 let limit = topk_limit.unwrap();
                 let dim = cache.dim;
-                let qvec = dist_ctx.as_ref().expect("topk implies dist_ctx").1.clone();
+                let q_ref: &[f32] = &dist_ctx.as_ref().expect("topk implies dist_ctx").1;
                 let total = cache.len();
                 let threads = if self.scan_threads > 1 && total * dim >= 4096 {
                     self.scan_threads.min(total)
@@ -1243,7 +1307,6 @@ impl Engine {
                 };
                 let chunk = total.div_ceil(threads);
                 let filter_ref = bound_filter.as_ref();
-                let q_ref: &[f32] = &qvec;
                 let mut topk: BinaryHeap<SnapshotItem> = BinaryHeap::with_capacity(limit + 1);
                 if threads == 1 {
                     let try_query_topm = dim == 128
@@ -1572,7 +1635,7 @@ fn flat_scan_serial_f64(
     let positions = filter.and_then(|f| cache.positions(f));
     let count = positions.as_ref().map_or(cache.len(), |p| p.len());
     for index in 0..count {
-        let position = positions.as_ref().map_or(index, |p| p[index]);
+        let position = positions.as_ref().map_or(index, |p| p[index] as usize);
         if positions.is_none() && filter.map_or(false, |f| {
             !eval_snapshot_bound(f, cache, position)
         }) { continue; }
@@ -1596,6 +1659,45 @@ fn flat_scan_serial_f64(
     }
 }
 
+/// Block candidate scan over the int8 mirror: appends (integer distance,
+/// position) of the QUERY_TOPM rows smallest by (distance, position). Returns
+/// false when the scan could not run; `out` is then left untouched.
+#[cfg(target_arch = "x86_64")]
+fn i8_block_candidates(
+    cache: &ScanCache,
+    listed: Option<&[u32]>,
+    encoded_query: &[i8],
+    out: &mut Vec<(i32, usize)>,
+) -> bool {
+    let mut keys: BinaryHeap<u64> = BinaryHeap::with_capacity(QUERY_TOPM + 1);
+    // Safety: the caller checked AVX2 and that i8_norms covers every row of
+    // i8_flat; i8_norms is only ever produced by i8_row_norms_topm(i8_flat).
+    let scanned = unsafe {
+        crate::value::i8_scan_topm_avx2(
+            &cache.i8_flat,
+            &cache.i8_norms,
+            listed,
+            encoded_query,
+            QUERY_TOPM,
+            &mut keys,
+        )
+    };
+    if scanned {
+        out.extend(keys.iter().map(|&key| ((key >> 32) as i32, (key & 0xffff_ffff) as usize)));
+    }
+    scanned
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn i8_block_candidates(
+    _cache: &ScanCache,
+    _listed: Option<&[u32]>,
+    _encoded_query: &[i8],
+    _out: &mut Vec<(i32, usize)>,
+) -> bool {
+    false
+}
+
 /// Integer-grid candidate pass. The integer sum is exact; scale is applied
 /// once per row and the query certificate covers the original f32/f64 result.
 fn flat_scan_query_topm_i8(
@@ -1614,33 +1716,54 @@ fn flat_scan_query_topm_i8(
     if !scale_sq.is_finite() || scale_sq <= 0.0 {
         return false;
     }
-    let mut eligible = 0usize;
-    let mut approx: BinaryHeap<(i32, i64, usize)> = BinaryHeap::with_capacity(QUERY_TOPM + 1);
     let positions = filter.and_then(|f| cache.positions(f));
-    let count = positions.as_ref().map_or(cache.len(), |p| p.len());
-    for index in 0..count {
-        let position = positions.as_ref().map_or(index, |p| p[index]);
-        if positions.is_none() && filter.map_or(false, |f| {
-            !eval_snapshot_bound(f, cache, position)
-        }) { continue; }
-        eligible += 1;
-        let vector = &cache.i8_flat[position * dim..(position + 1) * dim];
-        #[cfg(target_arch = "x86_64")]
-        let distance = unsafe { crate::value::dist_sq_avx2_topm_i8(vector, encoded_query) };
-        #[cfg(not(target_arch = "x86_64"))]
-        let distance = (crate::value::l2_distance_sq_topm_i8(vector, encoded_query, 1.0)) as i32;
-        let candidate = (distance, cache.pks[position], position);
-        if approx.len() < QUERY_TOPM {
-            approx.push(candidate);
-        } else if approx.peek().map_or(false, |worst| candidate < *worst) {
-            approx.pop();
-            approx.push(candidate);
+    // (integer distance, position) of the QUERY_TOPM eligible rows that are
+    // smallest by (integer distance, primary key).
+    let mut candidates: Vec<(i32, usize)> = Vec::with_capacity(QUERY_TOPM);
+    let eligible;
+    if (filter.is_none() || positions.is_some())
+        && cache.i8_norms.len() == cache.len()
+        && cache.i8_flat.len() == cache.len() * dim
+        && certified_query_i8_enabled()
+    {
+        // Snapshot positions ascend with the primary key, so ordering by
+        // (distance, position) is ordering by (distance, primary key).
+        debug_assert!(cache.pks.windows(2).all(|pair| pair[0] < pair[1]));
+        let listed = positions.as_ref().map(|p| p.as_slice());
+        if !i8_block_candidates(cache, listed, encoded_query, &mut candidates) {
+            return false;
         }
+        eligible = listed.map_or(cache.len(), |p| p.len());
+    } else {
+        let mut streamed = 0usize;
+        let mut approx: BinaryHeap<(i32, i64, usize)> = BinaryHeap::with_capacity(QUERY_TOPM + 1);
+        let count = positions.as_ref().map_or(cache.len(), |p| p.len());
+        for index in 0..count {
+            let position = positions.as_ref().map_or(index, |p| p[index] as usize);
+            if positions.is_none() && filter.map_or(false, |f| {
+                !eval_snapshot_bound(f, cache, position)
+            }) { continue; }
+            streamed += 1;
+            let vector = &cache.i8_flat[position * dim..(position + 1) * dim];
+            #[cfg(target_arch = "x86_64")]
+            let distance = unsafe { crate::value::dist_sq_avx2_topm_i8(vector, encoded_query) };
+            #[cfg(not(target_arch = "x86_64"))]
+            let distance = (crate::value::l2_distance_sq_topm_i8(vector, encoded_query, 1.0)) as i32;
+            let candidate = (distance, cache.pks[position], position);
+            if approx.len() < QUERY_TOPM {
+                approx.push(candidate);
+            } else if approx.peek().map_or(false, |worst| candidate < *worst) {
+                approx.pop();
+                approx.push(candidate);
+            }
+        }
+        eligible = streamed;
+        candidates.extend(approx.iter().map(|candidate| (candidate.0, candidate.2)));
     }
 
     let mut exact: BinaryHeap<SnapshotItem> = BinaryHeap::with_capacity(limit + 1);
-    for approximate in approx.iter() {
-        let vector = cache.vector(approximate.2);
+    for &(_, position) in candidates.iter() {
+        let vector = cache.vector(position);
         let Some(distance) = dist_sq_f64_abandon(vector, qvec, f64::INFINITY) else {
             return false;
         };
@@ -1648,7 +1771,7 @@ fn flat_scan_query_topm_i8(
             return false;
         }
         let candidate = SnapshotItem {
-            pk: cache.pks[approximate.2], position: approximate.2, distance,
+            pk: cache.pks[position], position, distance,
         };
         if exact.len() < limit {
             exact.push(candidate);
@@ -1662,13 +1785,13 @@ fn flat_scan_query_topm_i8(
         *topk = exact;
         return true;
     }
-    let Some(worst_approx) = approx.peek() else {
+    let Some(worst_approx) = candidates.iter().map(|candidate| candidate.0).max() else {
         return false;
     };
     let Some(worst_exact) = exact.peek() else {
         return false;
     };
-    let lower = certified_query_i8_lower_bound((worst_approx.0 as f64) * scale_sq, cache.i8_scale);
+    let lower = certified_query_i8_lower_bound((worst_approx as f64) * scale_sq, cache.i8_scale);
     let threshold = worst_exact.distance;
     if !lower.is_finite() || !threshold.is_finite() || lower <= threshold {
         return false;
@@ -1700,7 +1823,7 @@ fn flat_scan_query_topm_f16(
     let positions = filter.and_then(|f| cache.positions(f));
     let count = positions.as_ref().map_or(cache.len(), |p| p.len());
     for index in 0..count {
-        let position = positions.as_ref().map_or(index, |p| p[index]);
+        let position = positions.as_ref().map_or(index, |p| p[index] as usize);
         if positions.is_none() && filter.map_or(false, |f| {
             !eval_snapshot_bound(f, cache, position)
         }) { continue; }
@@ -1787,7 +1910,7 @@ fn flat_scan_query_topm(
     let positions = filter.and_then(|f| cache.positions(f));
     let count = positions.as_ref().map_or(cache.len(), |p| p.len());
     for index in 0..count {
-        let position = positions.as_ref().map_or(index, |p| p[index]);
+        let position = positions.as_ref().map_or(index, |p| p[index] as usize);
         if positions.is_none() && filter.map_or(false, |f| {
             !eval_snapshot_bound(f, cache, position)
         }) { continue; }
@@ -2178,9 +2301,17 @@ mod query_topm_tests {
         };
         assert_eq!(ids(engine.execute(&query("yes")).unwrap()), vec![OutValue::Int(1),OutValue::Int(3)]);
         let table = engine.resolve_table("t").unwrap().0;
-        assert!(engine.scan_caches[&table].filtered_positions.borrow().is_some());
+        assert_eq!(engine.scan_caches[&table].filtered_positions.borrow().len(), 1);
         assert_eq!(ids(engine.execute(&query("no")).unwrap()), vec![OutValue::Int(2)]);
         assert!(ids(engine.execute(&query("none")).unwrap()).is_empty());
+        assert_eq!(ids(engine.execute(&query("yes")).unwrap()), vec![OutValue::Int(1),OutValue::Int(3)]);
+        {
+            // Three programs over a three-row snapshot: the six-position cap
+            // keeps all of them, each with its own row list.
+            let cached = engine.scan_caches[&table].filtered_positions.borrow();
+            assert_eq!(cached.iter().map(|(_, p)| p.as_slice().to_vec()).collect::<Vec<_>>(),
+                vec![vec![0u32, 2], vec![1], vec![]]);
+        }
         engine.execute("UPDATE t SET c='yes' WHERE id=2").unwrap();
         assert_eq!(ids(engine.execute(&query("yes")).unwrap()), vec![OutValue::Int(1),OutValue::Int(2)]);
         engine.execute("BEGIN").unwrap();
@@ -2343,9 +2474,10 @@ mod query_topm_tests {
             originals: Vec::new(),
             i8_flat: Vec::new(),
             i8_scale: 0.0,
+            i8_norms: Vec::new(),
             f16_flat: Vec::new(),
             f16_max_norm_upper: 0.0,
-            filtered_positions: std::cell::RefCell::new(None),
+            filtered_positions: std::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -2398,9 +2530,202 @@ mod query_topm_tests {
                 return false;
             }
         }
+        cache.i8_norms = i8_row_norms_topm(&encoded).unwrap();
         cache.i8_flat = encoded;
         cache.i8_scale = scale;
         true
+    }
+
+    /// Candidates of the retained row-at-a-time pass: no norms, so
+    /// flat_scan_query_topm_i8 cannot take the block scan.
+    #[cfg(target_arch = "x86_64")]
+    fn rowwise_i8_candidates(
+        cache: &ScanCache,
+        filter: &Option<BoundFilter>,
+        encoded_query: &[i8],
+    ) -> Vec<(i32, i64)> {
+        let mut heap: BinaryHeap<(i32, i64)> = BinaryHeap::new();
+        for position in 0..cache.len() {
+            if filter.as_ref().map_or(false, |f| !eval_snapshot_bound(f, cache, position)) {
+                continue;
+            }
+            let row = &cache.i8_flat[position * 128..(position + 1) * 128];
+            let distance = unsafe { crate::value::dist_sq_avx2_topm_i8(row, encoded_query) };
+            heap.push((distance, cache.pks[position]));
+            if heap.len() > QUERY_TOPM {
+                heap.pop();
+            }
+        }
+        heap.into_sorted_vec()
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn block_i8_candidates(
+        cache: &ScanCache,
+        filter: &Option<BoundFilter>,
+        encoded_query: &[i8],
+    ) -> Vec<(i32, i64)> {
+        let positions = filter.as_ref().map(|f| cache.positions(f).unwrap());
+        let mut out = Vec::new();
+        assert!(i8_block_candidates(
+            cache,
+            positions.as_ref().map(|p| p.as_slice()),
+            encoded_query,
+            &mut out
+        ));
+        let mut out: Vec<(i32, i64)> =
+            out.into_iter().map(|(distance, position)| (distance, cache.pks[position])).collect();
+        out.sort_unstable();
+        out
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn i8_block_scan_selects_the_same_candidates_as_the_row_scan() {
+        if !certified_query_i8_enabled() {
+            eprintln!("int8 block scan test skipped: AVX2 unavailable");
+            return;
+        }
+        let mut state = 0x9e3779b9u32;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            ((state >> 8) as f32) * (2.0 / 16_777_216.0) - 1.0
+        };
+        // Row counts around the four-row step and the candidate count, with
+        // quantized ties (two-decimal grid), an all-equal table and rows that
+        // sit on both ends of the int8 range.
+        for n in [1usize, 2, 3, 4, 5, 7, 31, 32, 33, 34, 35, 63, 64, 65, 97, 130, 1027] {
+            for shape in 0..4 {
+                let vectors: Vec<Vec<f32>> = (0..n).map(|row| (0..128).map(|d| match shape {
+                    0 => next(),
+                    1 => (next() * 3.0).round() / 3.0,
+                    2 => if (row + d) % 2 == 0 { 1.0 } else { -1.0 },
+                    _ => if row % 5 == 0 { 1.0 } else { next() * 0.01 },
+                }).collect()).collect();
+                let mut cache = cache_from_vectors(vectors);
+                assert!(attach_i8(&mut cache));
+                let queries: Vec<Vec<f32>> = vec![
+                    (0..128).map(|_| next() * 0.5).collect(),
+                    vec![0.0; 128],
+                    (0..128).map(|d| if d % 2 == 0 { 1.0 } else { -1.0 }).collect(),
+                    (0..128).map(|d| if d % 2 == 0 { -1.0 } else { 1.0 }).collect(),
+                ];
+                for query in &queries {
+                    let mut encoded = Vec::new();
+                    if !i8_encode_topm(query, cache.i8_scale, &mut encoded) {
+                        continue;
+                    }
+                    for filter in [None, category_filter("even"), category_filter("odd"),
+                                   category_filter("none")] {
+                        assert_eq!(
+                            block_i8_candidates(&cache, &filter, &encoded),
+                            rowwise_i8_candidates(&cache, &filter, &encoded),
+                            "n={n} shape={shape}"
+                        );
+                        // End to end: block scan and row scan publish the same
+                        // certificate verdict and the same exact heap.
+                        let mut blocks = BinaryHeap::new();
+                        let accepted = flat_scan_query_topm_i8(
+                            &cache, filter.as_ref(), query, &encoded, 10, &mut blocks);
+                        let norms = std::mem::take(&mut cache.i8_norms);
+                        let mut rowwise = BinaryHeap::new();
+                        let accepted_rowwise = flat_scan_query_topm_i8(
+                            &cache, filter.as_ref(), query, &encoded, 10, &mut rowwise);
+                        cache.i8_norms = norms;
+                        assert_eq!(accepted, accepted_rowwise, "n={n} shape={shape}");
+                        if accepted {
+                            assert_eq!(snapshot(blocks), snapshot(rowwise));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn i8_block_scan_rejects_inconsistent_arguments() {
+        if !certified_query_i8_enabled() {
+            return;
+        }
+        let flat = vec![1i8; 256];
+        let norms = i8_row_norms_topm(&flat).unwrap();
+        assert_eq!(norms, vec![128, 128]);
+        let query = vec![1i8; 128];
+        let mut heap = BinaryHeap::new();
+        unsafe {
+            use crate::value::i8_scan_topm_avx2;
+            assert!(i8_scan_topm_avx2(&flat, &norms, None, &query, 32, &mut heap));
+            assert_eq!(heap.clone().into_sorted_vec(), vec![0u64, 1]);
+            assert!(i8_scan_topm_avx2(&flat, &norms, Some(&[1]), &query, 32, &mut heap));
+            assert_eq!(heap.clone().into_sorted_vec(), vec![1u64]);
+            assert!(i8_scan_topm_avx2(&flat, &norms, Some(&[]), &query, 32, &mut heap));
+            assert!(heap.is_empty());
+            assert!(!i8_scan_topm_avx2(&flat, &norms, Some(&[2]), &query, 32, &mut heap));
+            assert!(!i8_scan_topm_avx2(&flat, &norms[..1], None, &query, 32, &mut heap));
+            assert!(!i8_scan_topm_avx2(&flat, &norms, None, &query[..127], 32, &mut heap));
+            assert!(!i8_scan_topm_avx2(&flat, &norms, None, &query, 0, &mut heap));
+            let mut minimum = query.clone();
+            minimum[5] = i8::MIN;
+            assert!(!i8_scan_topm_avx2(&flat, &norms, None, &minimum, 32, &mut heap));
+        }
+        let mut with_minimum = flat.clone();
+        with_minimum[200] = i8::MIN;
+        assert!(i8_row_norms_topm(&with_minimum).is_none());
+        assert!(i8_row_norms_topm(&flat[..100]).is_none());
+    }
+
+    #[test]
+    fn filter_position_lists_match_the_row_evaluator_and_stay_bounded() {
+        let mut cache = cache_from_vectors(patterned_vectors(41));
+        cache.columns.push(SnapshotColumn::Int((0..41).map(|pk| pk % 5 - 2).collect()));
+        cache.columns.push(SnapshotColumn::Strings(
+            (0..41).map(|pk| format!("s{}", pk % 3)).collect()));
+        let literals = [
+            (1usize, Literal::Str("even".to_string())),
+            (1, Literal::Str("f".to_string())),
+            (1, Literal::Str("odd".to_string())),
+            (3, Literal::Int(-2)),
+            (3, Literal::Int(0)),
+            (3, Literal::Int(7)),
+            (4, Literal::Str("s1".to_string())),
+            (0, Literal::Int(20)),
+        ];
+        for (col, lit) in literals {
+            for op in [CmpOp::Eq, CmpOp::Ne, CmpOp::Lt, CmpOp::Le, CmpOp::Gt, CmpOp::Ge] {
+                let filter = BoundFilter { prog: vec![BInstr::Cmp { col, op, lit: lit.clone() }] };
+                let expected: Vec<u32> = (0..cache.len())
+                    .filter(|&i| eval_snapshot_bound(&filter, &cache, i))
+                    .map(|i| i as u32)
+                    .collect();
+                assert_eq!(*cache.positions(&filter).unwrap(), expected);
+                // Second lookup is served from the cache with the same list.
+                assert_eq!(*cache.positions(&filter).unwrap(), expected);
+                let cached = cache.filtered_positions.borrow();
+                assert!(cached.len() <= FILTER_POSITION_ENTRIES);
+                assert!(cached.iter().map(|(_, p)| p.len()).sum::<usize>() <= 2 * cache.len());
+            }
+        }
+        let both = BoundFilter { prog: vec![
+            BInstr::Cmp { col: 1, op: CmpOp::Eq, lit: Literal::Str("even".to_string()) },
+            BInstr::Cmp { col: 3, op: CmpOp::Ge, lit: Literal::Int(0) },
+            BInstr::And,
+        ] };
+        let expected: Vec<u32> = (0..cache.len())
+            .filter(|&i| eval_snapshot_bound(&both, &cache, i))
+            .map(|i| i as u32)
+            .collect();
+        assert!(!expected.is_empty());
+        assert_eq!(*cache.positions(&both).unwrap(), expected);
+        for n in 0..(FILTER_POSITION_ENTRIES as i64 + 9) {
+            let filter = BoundFilter { prog: vec![BInstr::Cmp {
+                col: 0, op: CmpOp::Eq, lit: Literal::Int(n % 41)
+            }] };
+            assert_eq!(*cache.positions(&filter).unwrap(), vec![(n % 41) as u32]);
+            assert!(cache.filtered_positions.borrow().len() <= FILTER_POSITION_ENTRIES);
+        }
     }
 
     fn check_i8(

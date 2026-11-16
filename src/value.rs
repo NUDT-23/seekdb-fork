@@ -533,6 +533,231 @@ pub unsafe fn dist_sq_avx2_topm_i8(a: &[i8], b: &[i8]) -> i32 {
     lanes.iter().sum()
 }
 
+/// Exact squared norm of every 128-byte row of the int8 mirror. Returns None
+/// when a byte is -128: the block scan below needs every value in [-127,127].
+pub fn i8_row_norms_topm(flat: &[i8]) -> Option<Vec<i32>> {
+    if flat.len() % 128 != 0 {
+        return None;
+    }
+    let mut norms = Vec::with_capacity(flat.len() / 128);
+    for row in flat.chunks_exact(128) {
+        let mut sum = 0i32;
+        for &value in row {
+            if value == i8::MIN {
+                return None;
+            }
+            sum += (value as i32) * (value as i32);
+        }
+        norms.push(sum);
+    }
+    Some(norms)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn i8_offer_topm(heap: &mut std::collections::BinaryHeap<u64>, m: usize, key: u64) {
+    if heap.len() < m {
+        heap.push(key);
+    } else if let Some(mut worst) = heap.peek_mut() {
+        if key < *worst {
+            *worst = key;
+        }
+    }
+}
+
+/// Candidate pass over the whole int8 mirror, four rows per step. On success
+/// `heap` holds the `m` smallest keys `(distance << 32) | position` among the
+/// scanned rows (all rows, or the rows listed in `positions`).
+///
+/// The distance is the same integer that `dist_sq_avx2_topm_i8` returns,
+/// computed as |a|^2 + |q|^2 - 2*a.q. With every byte in [-127,127] each
+/// maddubs pair is at most 2*127*127 = 32258 (no i16 saturation), a row's dot
+/// product is within +-2,064,512 and the distance within [0, 8,258,048].
+///
+/// Returns false, leaving `heap` unspecified, when the arguments are not
+/// consistent with each other; the caller then uses another exact path.
+///
+/// # Safety
+/// The CPU must support AVX2. `norms` must come from `i8_row_norms_topm(flat)`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(unused_assignments)]
+pub unsafe fn i8_scan_topm_avx2(
+    flat: &[i8],
+    norms: &[i32],
+    positions: Option<&[u32]>,
+    query: &[i8],
+    m: usize,
+    heap: &mut std::collections::BinaryHeap<u64>,
+) -> bool {
+    use std::arch::x86_64::{
+        __m128i, __m256i, _mm256_abs_epi8, _mm256_add_epi32, _mm256_castsi256_si128,
+        _mm256_extracti128_si256, _mm256_hadd_epi32, _mm256_loadu_si256, _mm256_madd_epi16,
+        _mm256_maddubs_epi16, _mm256_set1_epi16, _mm256_sign_epi8, _mm_add_epi32,
+        _mm_castsi128_ps, _mm_cmpgt_epi32, _mm_loadu_si128, _mm_movemask_ps, _mm_set1_epi32,
+        _mm_set_epi32, _mm_storeu_si128, _mm_sub_epi32,
+    };
+    let rows = norms.len();
+    if m == 0
+        || query.len() != 128
+        || rows > u32::MAX as usize
+        || rows.checked_mul(128) != Some(flat.len())
+        || query.iter().any(|&value| value == i8::MIN)
+    {
+        return false;
+    }
+    heap.clear();
+    let base = flat.as_ptr();
+    let q0 = _mm256_loadu_si256(query.as_ptr() as *const __m256i);
+    let q1 = _mm256_loadu_si256(query.as_ptr().add(32) as *const __m256i);
+    let q2 = _mm256_loadu_si256(query.as_ptr().add(64) as *const __m256i);
+    let q3 = _mm256_loadu_si256(query.as_ptr().add(96) as *const __m256i);
+    let (a0, a1, a2, a3) = (
+        _mm256_abs_epi8(q0),
+        _mm256_abs_epi8(q1),
+        _mm256_abs_epi8(q2),
+        _mm256_abs_epi8(q3),
+    );
+    let ones = _mm256_set1_epi16(1);
+    let query_norm: i32 = query.iter().map(|&value| (value as i32) * (value as i32)).sum();
+    let query_norm4 = _mm_set1_epi32(query_norm);
+    // Rows above the current m-th smallest distance are skipped without
+    // touching the heap; equal distances still go through the key compare.
+    let mut threshold4 = _mm_set1_epi32(i32::MAX);
+
+    // 32 bytes of one row against one query block: |q| * sign(q)*a per byte,
+    // adjacent pairs summed to i16, then adjacent i16 pairs summed to i32.
+    macro_rules! block {
+        ($row:expr, $offset:expr, $q:expr, $abs:expr) => {
+            _mm256_madd_epi16(
+                _mm256_maddubs_epi16(
+                    $abs,
+                    _mm256_sign_epi8(
+                        _mm256_loadu_si256($row.add($offset) as *const __m256i),
+                        $q,
+                    ),
+                ),
+                ones,
+            )
+        };
+    }
+    // Squared distances of four rows as four i32 lanes.
+    macro_rules! distances4 {
+        ($r0:expr, $r1:expr, $r2:expr, $r3:expr, $norms4:expr) => {{
+            let (r0, r1, r2, r3): (*const i8, *const i8, *const i8, *const i8) =
+                ($r0, $r1, $r2, $r3);
+            let mut s0 = block!(r0, 0, q0, a0);
+            let mut s1 = block!(r1, 0, q0, a0);
+            let mut s2 = block!(r2, 0, q0, a0);
+            let mut s3 = block!(r3, 0, q0, a0);
+            s0 = _mm256_add_epi32(s0, block!(r0, 32, q1, a1));
+            s1 = _mm256_add_epi32(s1, block!(r1, 32, q1, a1));
+            s2 = _mm256_add_epi32(s2, block!(r2, 32, q1, a1));
+            s3 = _mm256_add_epi32(s3, block!(r3, 32, q1, a1));
+            s0 = _mm256_add_epi32(s0, block!(r0, 64, q2, a2));
+            s1 = _mm256_add_epi32(s1, block!(r1, 64, q2, a2));
+            s2 = _mm256_add_epi32(s2, block!(r2, 64, q2, a2));
+            s3 = _mm256_add_epi32(s3, block!(r3, 64, q2, a2));
+            s0 = _mm256_add_epi32(s0, block!(r0, 96, q3, a3));
+            s1 = _mm256_add_epi32(s1, block!(r1, 96, q3, a3));
+            s2 = _mm256_add_epi32(s2, block!(r2, 96, q3, a3));
+            s3 = _mm256_add_epi32(s3, block!(r3, 96, q3, a3));
+            // hadd works inside each 128-bit half: after the three hadds the
+            // low half holds the low-half sums of rows 0..3 and the high half
+            // their high-half sums.
+            let halves = _mm256_hadd_epi32(_mm256_hadd_epi32(s0, s1), _mm256_hadd_epi32(s2, s3));
+            let dots = _mm_add_epi32(
+                _mm256_castsi256_si128(halves),
+                _mm256_extracti128_si256(halves, 1),
+            );
+            _mm_sub_epi32(_mm_add_epi32($norms4, query_norm4), _mm_add_epi32(dots, dots))
+        }};
+    }
+    // `valid` has one bit per lane that stands for a real row.
+    macro_rules! consider {
+        ($distances:expr, $valid:expr, $p0:expr, $p1:expr, $p2:expr, $p3:expr) => {{
+            let distances: __m128i = $distances;
+            let above =
+                _mm_movemask_ps(_mm_castsi128_ps(_mm_cmpgt_epi32(distances, threshold4))) as u32;
+            let pending = !above & $valid;
+            if pending != 0 {
+                let mut lanes = [0i32; 4];
+                _mm_storeu_si128(lanes.as_mut_ptr() as *mut __m128i, distances);
+                let at: [usize; 4] = [$p0, $p1, $p2, $p3];
+                let mut lane = 0usize;
+                while lane < 4 {
+                    if pending & (1u32 << lane) != 0 {
+                        let key = ((lanes[lane] as u32 as u64) << 32) | at[lane] as u64;
+                        i8_offer_topm(heap, m, key);
+                    }
+                    lane += 1;
+                }
+                if heap.len() >= m {
+                    if let Some(worst) = heap.peek() {
+                        threshold4 = _mm_set1_epi32((*worst >> 32) as i32);
+                    }
+                }
+            }
+        }};
+    }
+
+    match positions {
+        None => {
+            let mut index = 0usize;
+            while index + 4 <= rows {
+                let row = base.add(index * 128);
+                let norms4 = _mm_loadu_si128(norms.as_ptr().add(index) as *const __m128i);
+                let distances =
+                    distances4!(row, row.add(128), row.add(256), row.add(384), norms4);
+                consider!(distances, 0xfu32, index, index + 1, index + 2, index + 3);
+                index += 4;
+            }
+            if index < rows {
+                // Tail of 1..=3 rows: unused lanes repeat the last row and are masked off.
+                let valid = (1u32 << (rows - index)) - 1;
+                let last = rows - 1;
+                let (p0, p1, p2, p3) =
+                    (index, (index + 1).min(last), (index + 2).min(last), (index + 3).min(last));
+                let norms4 = _mm_set_epi32(norms[p3], norms[p2], norms[p1], norms[p0]);
+                let distances = distances4!(
+                    base.add(p0 * 128),
+                    base.add(p1 * 128),
+                    base.add(p2 * 128),
+                    base.add(p3 * 128),
+                    norms4
+                );
+                consider!(distances, valid, p0, p1, p2, p3);
+            }
+        }
+        Some(list) => {
+            let count = list.len();
+            let mut index = 0usize;
+            while index < count {
+                let valid = if count - index >= 4 { 0xfu32 } else { (1u32 << (count - index)) - 1 };
+                let last = count - 1;
+                let p0 = list[index] as usize;
+                let p1 = list[(index + 1).min(last)] as usize;
+                let p2 = list[(index + 2).min(last)] as usize;
+                let p3 = list[(index + 3).min(last)] as usize;
+                if p0.max(p1).max(p2).max(p3) >= rows {
+                    return false;
+                }
+                let norms4 = _mm_set_epi32(norms[p3], norms[p2], norms[p1], norms[p0]);
+                let distances = distances4!(
+                    base.add(p0 * 128),
+                    base.add(p1 * 128),
+                    base.add(p2 * 128),
+                    base.add(p3 * 128),
+                    norms4
+                );
+                consider!(distances, valid, p0, p1, p2, p3);
+                index += 4;
+            }
+        }
+    }
+    true
+}
+
 /// Conservative original-distance lower bound from the exact integer grid.
 pub fn certified_query_i8_lower_bound(s: f64, scale: f64) -> f64 {
     if !s.is_finite() || s < 0.0 || !scale.is_finite() || scale <= 0.0 {
