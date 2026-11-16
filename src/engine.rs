@@ -90,6 +90,8 @@ struct ScanCache {
     /// Maximum of conservative per-row original-f32 norm upper bounds.
     f16_max_norm_upper: f64,
     filtered_positions: std::cell::RefCell<Vec<(Vec<BInstr>, Rc<Vec<u32>>)>>,
+    /// Serial-query scratch: int8 distance of every row of the last block scan.
+    i8_distances: std::cell::RefCell<Vec<i32>>,
 }
 
 /// Filter programs remembered per snapshot; the cached position lists are
@@ -754,6 +756,7 @@ impl Engine {
                         i8_flat: encoded, i8_scale: scale, i8_norms: norms,
                         f16_flat: Vec::new(), f16_max_norm_upper: 0.0,
                         filtered_positions: std::cell::RefCell::new(Vec::new()),
+                        i8_distances: std::cell::RefCell::new(Vec::new()),
                     });
                     self.store.evict_table_vectors(table_id);
                     return;
@@ -853,6 +856,7 @@ impl Engine {
                 f16_flat,
                 f16_max_norm_upper,
                 filtered_positions: std::cell::RefCell::new(Vec::new()),
+                i8_distances: std::cell::RefCell::new(Vec::new()),
             },
         );
         self.store.evict_table_vectors(table_id);
@@ -1326,7 +1330,7 @@ impl Engine {
                                 &encoded_query,
                                 limit,
                                 &mut topk,
-                            )
+                            ) != I8Outcome::Rejected
                         } else {
                             false
                         }
@@ -1660,14 +1664,17 @@ fn flat_scan_serial_f64(
 }
 
 /// Block candidate scan over the int8 mirror: appends (integer distance,
-/// position) of the QUERY_TOPM rows smallest by (distance, position). Returns
-/// false when the scan could not run; `out` is then left untouched.
+/// position) of the QUERY_TOPM rows smallest by (distance, position), and
+/// leaves the integer distance of every scanned row, in scan order, in
+/// `distances`. Returns false when the scan could not run; `out` is then left
+/// untouched.
 #[cfg(target_arch = "x86_64")]
 fn i8_block_candidates(
     cache: &ScanCache,
     listed: Option<&[u32]>,
     encoded_query: &[i8],
     out: &mut Vec<(i32, usize)>,
+    distances: &mut Vec<i32>,
 ) -> bool {
     let mut keys: BinaryHeap<u64> = BinaryHeap::with_capacity(QUERY_TOPM + 1);
     // Safety: the caller checked AVX2 and that i8_norms covers every row of
@@ -1680,6 +1687,7 @@ fn i8_block_candidates(
             encoded_query,
             QUERY_TOPM,
             &mut keys,
+            distances,
         )
     };
     if scanned {
@@ -1694,8 +1702,115 @@ fn i8_block_candidates(
     _listed: Option<&[u32]>,
     _encoded_query: &[i8],
     _out: &mut Vec<(i32, usize)>,
+    _distances: &mut Vec<i32>,
 ) -> bool {
     false
+}
+
+/// Most rows the band step may rescore: a quarter of the eligible rows, so
+/// the step stays cheaper than the full-scan fallbacks it replaces.
+fn i8_band_limit(eligible: usize) -> usize {
+    (eligible / 4).clamp(64, 4096)
+}
+
+/// The 32-candidate certificate failed after a block scan. `threshold` is the
+/// exact distance of the candidates' Kth row, so the global Kth distance is at
+/// most `threshold`. With `cut` an integer distance whose certified lower
+/// bound is above `threshold`, every row at or beyond `cut` on the integer
+/// grid is strictly worse than `threshold` in the exact kernel and cannot be
+/// in the result, ties included. The rows below `cut` are rescored exactly in
+/// primary-key order, which is the serial scan restricted to a superset of
+/// its own result. Returns false, leaving `topk` untouched, when no such cut
+/// exists or more than `i8_band_limit` rows lie below it.
+#[cfg(target_arch = "x86_64")]
+fn i8_band_rescore(
+    cache: &ScanCache,
+    listed: Option<&[u32]>,
+    qvec: &[f32],
+    limit: usize,
+    threshold: f64,
+    distances: &[i32],
+    topk: &mut BinaryHeap<SnapshotItem>,
+) -> bool {
+    let eligible = listed.map_or(cache.len(), |p| p.len());
+    if distances.len() != eligible || !threshold.is_finite() {
+        return false;
+    }
+    let scale = cache.i8_scale;
+    let scale_sq = scale * scale;
+    let excludes = |cut: i32| {
+        let lower = certified_query_i8_lower_bound((cut as f64) * scale_sq, scale);
+        lower.is_finite() && lower > threshold
+    };
+    // `high` only ever holds a cut for which `excludes` was evaluated true.
+    let mut high = crate::value::I8_DISTANCE_MAX;
+    if !excludes(high) {
+        return false;
+    }
+    let mut low = 0i32;
+    while low < high {
+        let middle = low + (high - low) / 2;
+        if excludes(middle) {
+            high = middle;
+        } else {
+            low = middle + 1;
+        }
+    }
+    let mut band: Vec<u32> = Vec::new();
+    // Safety: the block scan that filled `distances` already required AVX2.
+    if !unsafe {
+        crate::value::i8_band_below_avx2(distances, high, i8_band_limit(eligible), &mut band)
+    } {
+        return false;
+    }
+    let mut exact: BinaryHeap<SnapshotItem> = BinaryHeap::with_capacity(limit + 1);
+    let mut worst = f64::INFINITY;
+    for &index in band.iter() {
+        let position = listed.map_or(index as usize, |p| p[index as usize] as usize);
+        let Some(distance) = dist_sq_f64_abandon(cache.vector(position), qvec, worst) else {
+            continue;
+        };
+        let candidate = SnapshotItem { pk: cache.pks[position], position, distance };
+        if exact.len() < limit {
+            exact.push(candidate);
+            if exact.len() == limit {
+                worst = exact.peek().map_or(f64::INFINITY, |w| w.distance);
+            }
+        } else if exact.peek().map_or(false, |w| candidate < *w) {
+            exact.pop();
+            exact.push(candidate);
+            worst = exact.peek().map_or(f64::INFINITY, |w| w.distance);
+        }
+    }
+    if exact.len() < limit {
+        return false;
+    }
+    *topk = exact;
+    true
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn i8_band_rescore(
+    _cache: &ScanCache,
+    _listed: Option<&[u32]>,
+    _qvec: &[f32],
+    _limit: usize,
+    _threshold: f64,
+    _distances: &[i32],
+    _topk: &mut BinaryHeap<SnapshotItem>,
+) -> bool {
+    false
+}
+
+/// How the int8 pass answered a query.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum I8Outcome {
+    /// Nothing was published; the caller runs another exact path.
+    Rejected,
+    /// The 32 candidates were certified to contain the result.
+    Certified,
+    /// The certificate failed and the band below a certified cut was rescored.
+    Rescored,
 }
 
 /// Integer-grid candidate pass. The integer sum is exact; scale is applied
@@ -1707,31 +1822,32 @@ fn flat_scan_query_topm_i8(
     encoded_query: &[i8],
     limit: usize,
     topk: &mut BinaryHeap<SnapshotItem>,
-) -> bool {
+) -> I8Outcome {
     debug_assert_eq!(cache.dim, 128);
     debug_assert_eq!(cache.i8_flat.len(), cache.len() * cache.dim);
     debug_assert!(limit > 0 && limit < QUERY_TOPM);
     let dim = cache.dim;
     let scale_sq = cache.i8_scale * cache.i8_scale;
     if !scale_sq.is_finite() || scale_sq <= 0.0 {
-        return false;
+        return I8Outcome::Rejected;
     }
     let positions = filter.and_then(|f| cache.positions(f));
     // (integer distance, position) of the QUERY_TOPM eligible rows that are
     // smallest by (integer distance, primary key).
     let mut candidates: Vec<(i32, usize)> = Vec::with_capacity(QUERY_TOPM);
     let eligible;
-    if (filter.is_none() || positions.is_some())
+    let mut scan_distances = cache.i8_distances.borrow_mut();
+    let block_scan = (filter.is_none() || positions.is_some())
         && cache.i8_norms.len() == cache.len()
         && cache.i8_flat.len() == cache.len() * dim
-        && certified_query_i8_enabled()
-    {
+        && certified_query_i8_enabled();
+    if block_scan {
         // Snapshot positions ascend with the primary key, so ordering by
         // (distance, position) is ordering by (distance, primary key).
         debug_assert!(cache.pks.windows(2).all(|pair| pair[0] < pair[1]));
         let listed = positions.as_ref().map(|p| p.as_slice());
-        if !i8_block_candidates(cache, listed, encoded_query, &mut candidates) {
-            return false;
+        if !i8_block_candidates(cache, listed, encoded_query, &mut candidates, &mut scan_distances) {
+            return I8Outcome::Rejected;
         }
         eligible = listed.map_or(cache.len(), |p| p.len());
     } else {
@@ -1765,10 +1881,10 @@ fn flat_scan_query_topm_i8(
     for &(_, position) in candidates.iter() {
         let vector = cache.vector(position);
         let Some(distance) = dist_sq_f64_abandon(vector, qvec, f64::INFINITY) else {
-            return false;
+            return I8Outcome::Rejected;
         };
         if !distance.is_finite() {
-            return false;
+            return I8Outcome::Rejected;
         }
         let candidate = SnapshotItem {
             pk: cache.pks[position], position, distance,
@@ -1783,24 +1899,31 @@ fn flat_scan_query_topm_i8(
 
     if eligible <= QUERY_TOPM {
         *topk = exact;
-        return true;
+        return I8Outcome::Certified;
     }
     let Some(worst_approx) = candidates.iter().map(|candidate| candidate.0).max() else {
-        return false;
+        return I8Outcome::Rejected;
     };
     let Some(worst_exact) = exact.peek() else {
-        return false;
+        return I8Outcome::Rejected;
     };
     let lower = certified_query_i8_lower_bound((worst_approx as f64) * scale_sq, cache.i8_scale);
     let threshold = worst_exact.distance;
     if !lower.is_finite() || !threshold.is_finite() || lower <= threshold {
-        return false;
+        let listed = positions.as_ref().map(|p| p.as_slice());
+        if block_scan
+            && exact.len() == limit
+            && i8_band_rescore(cache, listed, qvec, limit, threshold, &scan_distances, topk)
+        {
+            return I8Outcome::Rescored;
+        }
+        return I8Outcome::Rejected;
     }
     // S>=S_M on the integer grid for every excluded row. The global scale
     // gives one monotone quantization bound; strict LB>T protects exact ties
     // and primary-key ordering before publishing the exact candidate heap.
     *topk = exact;
-    true
+    I8Outcome::Certified
 }
 
 /// Compressed candidate pass. Every exact distance still comes from the
@@ -2478,6 +2601,7 @@ mod query_topm_tests {
             f16_flat: Vec::new(),
             f16_max_norm_upper: 0.0,
             filtered_positions: std::cell::RefCell::new(Vec::new()),
+            i8_distances: std::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -2567,12 +2691,24 @@ mod query_topm_tests {
     ) -> Vec<(i32, i64)> {
         let positions = filter.as_ref().map(|f| cache.positions(f).unwrap());
         let mut out = Vec::new();
+        let mut distances = vec![-1i32; 3];
         assert!(i8_block_candidates(
             cache,
             positions.as_ref().map(|p| p.as_slice()),
             encoded_query,
-            &mut out
+            &mut out,
+            &mut distances
         ));
+        // The stored distances are the row-at-a-time distances in scan order.
+        let scanned: Vec<usize> = match positions.as_ref() {
+            Some(list) => list.iter().map(|&p| p as usize).collect(),
+            None => (0..cache.len()).collect(),
+        };
+        let rowwise: Vec<i32> = scanned.iter().map(|&position| unsafe {
+            crate::value::dist_sq_avx2_topm_i8(
+                &cache.i8_flat[position * 128..(position + 1) * 128], encoded_query)
+        }).collect();
+        assert_eq!(distances, rowwise);
         let mut out: Vec<(i32, i64)> =
             out.into_iter().map(|(distance, position)| (distance, cache.pks[position])).collect();
         out.sort_unstable();
@@ -2624,19 +2760,31 @@ mod query_topm_tests {
                             rowwise_i8_candidates(&cache, &filter, &encoded),
                             "n={n} shape={shape}"
                         );
-                        // End to end: block scan and row scan publish the same
-                        // certificate verdict and the same exact heap.
+                        // End to end: the row scan never rescores a band, the
+                        // block scan certifies exactly when the row scan does,
+                        // and whatever either publishes is the serial result.
+                        let expected = snapshot(expected_f64(&cache, &filter, query));
                         let mut blocks = BinaryHeap::new();
-                        let accepted = flat_scan_query_topm_i8(
+                        let outcome = flat_scan_query_topm_i8(
                             &cache, filter.as_ref(), query, &encoded, 10, &mut blocks);
                         let norms = std::mem::take(&mut cache.i8_norms);
                         let mut rowwise = BinaryHeap::new();
-                        let accepted_rowwise = flat_scan_query_topm_i8(
+                        let outcome_rowwise = flat_scan_query_topm_i8(
                             &cache, filter.as_ref(), query, &encoded, 10, &mut rowwise);
                         cache.i8_norms = norms;
-                        assert_eq!(accepted, accepted_rowwise, "n={n} shape={shape}");
-                        if accepted {
-                            assert_eq!(snapshot(blocks), snapshot(rowwise));
+                        assert_ne!(outcome_rowwise, I8Outcome::Rescored);
+                        assert_eq!(
+                            outcome == I8Outcome::Certified,
+                            outcome_rowwise == I8Outcome::Certified,
+                            "n={n} shape={shape}"
+                        );
+                        if outcome != I8Outcome::Rejected {
+                            assert_eq!(snapshot(blocks), expected, "n={n} shape={shape}");
+                        } else {
+                            assert!(blocks.is_empty());
+                        }
+                        if outcome_rowwise != I8Outcome::Rejected {
+                            assert_eq!(snapshot(rowwise), expected);
                         }
                     }
                 }
@@ -2655,21 +2803,47 @@ mod query_topm_tests {
         assert_eq!(norms, vec![128, 128]);
         let query = vec![1i8; 128];
         let mut heap = BinaryHeap::new();
+        let mut seen = Vec::new();
         unsafe {
             use crate::value::i8_scan_topm_avx2;
-            assert!(i8_scan_topm_avx2(&flat, &norms, None, &query, 32, &mut heap));
+            assert!(i8_scan_topm_avx2(&flat, &norms, None, &query, 32, &mut heap, &mut seen));
             assert_eq!(heap.clone().into_sorted_vec(), vec![0u64, 1]);
-            assert!(i8_scan_topm_avx2(&flat, &norms, Some(&[1]), &query, 32, &mut heap));
+            assert_eq!(seen, vec![0, 0]);
+            assert!(i8_scan_topm_avx2(&flat, &norms, Some(&[1]), &query, 32, &mut heap, &mut seen));
             assert_eq!(heap.clone().into_sorted_vec(), vec![1u64]);
-            assert!(i8_scan_topm_avx2(&flat, &norms, Some(&[]), &query, 32, &mut heap));
+            assert_eq!(seen, vec![0]);
+            assert!(i8_scan_topm_avx2(&flat, &norms, Some(&[]), &query, 32, &mut heap, &mut seen));
             assert!(heap.is_empty());
-            assert!(!i8_scan_topm_avx2(&flat, &norms, Some(&[2]), &query, 32, &mut heap));
-            assert!(!i8_scan_topm_avx2(&flat, &norms[..1], None, &query, 32, &mut heap));
-            assert!(!i8_scan_topm_avx2(&flat, &norms, None, &query[..127], 32, &mut heap));
-            assert!(!i8_scan_topm_avx2(&flat, &norms, None, &query, 0, &mut heap));
+            assert!(seen.is_empty());
+            assert!(!i8_scan_topm_avx2(&flat, &norms, Some(&[2]), &query, 32, &mut heap, &mut seen));
+            assert!(!i8_scan_topm_avx2(&flat, &norms[..1], None, &query, 32, &mut heap, &mut seen));
+            assert!(!i8_scan_topm_avx2(&flat, &norms, None, &query[..127], 32, &mut heap, &mut seen));
+            assert!(!i8_scan_topm_avx2(&flat, &norms, None, &query, 0, &mut heap, &mut seen));
             let mut minimum = query.clone();
             minimum[5] = i8::MIN;
-            assert!(!i8_scan_topm_avx2(&flat, &norms, None, &minimum, 32, &mut heap));
+            assert!(!i8_scan_topm_avx2(&flat, &norms, None, &minimum, 32, &mut heap, &mut seen));
+
+            // Band selection: strict cut, ascending indexes, cap, every length
+            // around the eight-lane step.
+            use crate::value::i8_band_below_avx2;
+            let mut band = vec![7u32];
+            for n in [0usize, 1, 7, 8, 9, 15, 16, 17, 40] {
+                let distances: Vec<i32> = (0..n).map(|i| ((i * 37) % 11) as i32).collect();
+                for cut in [0, 1, 5, 10, 11, i32::MAX] {
+                    let expected: Vec<u32> = (0..n)
+                        .filter(|&i| distances[i] < cut).map(|i| i as u32).collect();
+                    assert!(i8_band_below_avx2(&distances, cut, n, &mut band));
+                    assert_eq!(band, expected, "n={n} cut={cut}");
+                    assert_eq!(
+                        i8_band_below_avx2(&distances, cut, expected.len(), &mut band),
+                        true
+                    );
+                    if !expected.is_empty() {
+                        assert!(!i8_band_below_avx2(
+                            &distances, cut, expected.len() - 1, &mut band));
+                    }
+                }
+            }
         }
         let mut with_minimum = flat.clone();
         with_minimum[200] = i8::MIN;
@@ -2732,12 +2906,12 @@ mod query_topm_tests {
         cache: &ScanCache,
         filter: &Option<BoundFilter>,
         query: &[f32],
-        expect_accept: bool,
+        expect: I8Outcome,
     ) {
         let mut encoded_query = Vec::new();
         assert!(i8_encode_topm(query, cache.i8_scale, &mut encoded_query));
         let mut actual = BinaryHeap::new();
-        let accepted = flat_scan_query_topm_i8(
+        let outcome = flat_scan_query_topm_i8(
             cache,
             filter.as_ref(),
             query,
@@ -2745,8 +2919,9 @@ mod query_topm_tests {
             10,
             &mut actual,
         );
-        assert_eq!(accepted, expect_accept);
-        if !accepted {
+        assert_eq!(outcome, expect);
+        if outcome == I8Outcome::Rejected {
+            assert!(actual.is_empty());
             flat_scan_serial_f64(cache, filter.as_ref(), query, 10, &mut actual);
         }
         assert_eq!(snapshot(actual), snapshot(expected_f64(cache, filter, query)));
@@ -2899,34 +3074,127 @@ mod query_topm_tests {
         for n in [16, 32, 40, 80] {
             let mut cache = cache_from_vectors(patterned_vectors(n));
             assert!(attach_i8(&mut cache));
-            check_i8(&cache, &None, &query, true);
+            check_i8(&cache, &None, &query, I8Outcome::Certified);
         }
         let mut filtered = cache_from_vectors(patterned_vectors(80));
         assert!(attach_i8(&mut filtered));
-        check_i8(&filtered, &category_filter("even"), &query, true);
-        check_i8(&filtered, &category_filter("none"), &query, true);
+        check_i8(&filtered, &category_filter("even"), &query, I8Outcome::Certified);
+        check_i8(&filtered, &category_filter("none"), &query, I8Outcome::Certified);
 
         for n in [16, 32] {
             let mut cache = cache_from_vectors(vec![vec![1.0; 128]; n]);
             assert!(attach_i8(&mut cache));
-            check_i8(&cache, &None, &query, true);
+            check_i8(&cache, &None, &query, I8Outcome::Certified);
         }
+        // 40 identical rows: no certificate for 32 of them, but all 40 sit
+        // below the cut and within the band limit, so the tie is settled by
+        // primary key in the band.
         let mut tied = cache_from_vectors(vec![vec![1.0; 128]; 40]);
         assert!(attach_i8(&mut tied));
-        check_i8(&tied, &None, &query, false);
+        check_i8(&tied, &None, &query, I8Outcome::Rescored);
+        // 400 identical rows exceed the band limit of 100.
+        let mut tied_many = cache_from_vectors(vec![vec![1.0; 128]; 400]);
+        assert!(attach_i8(&mut tied_many));
+        check_i8(&tied_many, &None, &query, I8Outcome::Rejected);
+        check_i8(&tied_many, &category_filter("even"), &query, I8Outcome::Rejected);
+        // Without row norms the row-at-a-time pass keeps no distances.
+        tied.i8_norms.clear();
+        check_i8(&tied, &None, &query, I8Outcome::Rejected);
 
         let mut subnormal = cache_from_vectors(vec![vec![f32::from_bits(1); 128]; 40]);
         assert!(attach_i8(&mut subnormal));
-        check_i8(&subnormal, &None, &query, false);
+        check_i8(&subnormal, &None, &query, I8Outcome::Rejected);
 
         let mut extreme = cache_from_vectors(vec![vec![f32::MAX; 128]; 40]);
         assert!(attach_i8(&mut extreme));
-        check_i8(&extreme, &None, &query, false);
+        check_i8(&extreme, &None, &query, I8Outcome::Rescored);
 
         let mut zero = cache_from_vectors(vec![vec![0.0; 128]; 40]);
         assert!(!attach_i8(&mut zero));
         let mut oversized_query = Vec::new();
         assert!(!i8_encode_topm(&[f32::MAX; 128], 1.0 / 127.0, &mut oversized_query));
+    }
+
+    /// Data on which 32 candidates are often not certifiable: the band below
+    /// the certified cut must publish exactly the serial result, with and
+    /// without a filter, for every K below the candidate count.
+    #[test]
+    fn query_topm_i8_band_matches_the_serial_scan_on_several_distributions() {
+        if !certified_query_i8_enabled() {
+            eprintln!("int8 band test skipped: AVX2 unavailable");
+            return;
+        }
+        let mut state = 0x2545f491u32;
+        let mut uniform = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            ((state >> 8) as f32) * (1.0 / 16_777_216.0)
+        };
+        let mut rescored_total = 0usize;
+        for shape in 0..6 {
+            let n = 3000usize;
+            let centres: Vec<Vec<f32>> =
+                (0..12).map(|_| (0..128).map(|_| uniform() * 2.0 - 1.0).collect()).collect();
+            let mut bell = |spread: f32| {
+                (uniform() + uniform() + uniform() + uniform() - 2.0) * spread
+            };
+            let mut point = |row: usize, shape: usize| -> Vec<f32> {
+                match shape {
+                    // bell-shaped components with a few far outliers stretching the scale
+                    0 => (0..128).map(|_| bell(1.0)).collect(),
+                    // unit sphere
+                    1 => {
+                        let v: Vec<f32> = (0..128).map(|_| bell(1.0)).collect();
+                        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+                        v.iter().map(|x| x / norm).collect()
+                    }
+                    // tight clusters
+                    2 => centres[row % 12].iter().map(|c| c + bell(0.02)).collect(),
+                    // near-duplicates of one row
+                    3 => centres[0].iter().map(|c| c + bell(1e-4)).collect(),
+                    // two-decimal grid: many exact ties
+                    4 => (0..128).map(|_| (bell(1.0) * 4.0).round() / 4.0).collect(),
+                    // every fifth row repeats an earlier row exactly
+                    _ => if row % 5 == 4 { centres[row % 3].clone() }
+                         else { centres[row % 12].iter().map(|c| c + bell(0.05)).collect() },
+                }
+            };
+            let vectors: Vec<Vec<f32>> = (0..n).map(|row| point(row, shape)).collect();
+            let queries: Vec<Vec<f32>> = (0..24).map(|q| match q % 3 {
+                0 => point(q, shape),
+                1 => vectors[(q * 97) % n].clone(),
+                _ => centres[q % 12].clone(),
+            }).collect();
+            let mut cache = cache_from_vectors(vectors);
+            assert!(attach_i8(&mut cache));
+            let mut outcomes = [0usize; 3];
+            for query in &queries {
+                let mut encoded = Vec::new();
+                if !i8_encode_topm(query, cache.i8_scale, &mut encoded) {
+                    continue;
+                }
+                for filter in [None, category_filter("even"), category_filter("odd")] {
+                    for limit in [1usize, 10, 31] {
+                        let mut expected = BinaryHeap::new();
+                        flat_scan_serial_f64(&cache, filter.as_ref(), query, limit, &mut expected);
+                        let mut actual = BinaryHeap::new();
+                        let outcome = flat_scan_query_topm_i8(
+                            &cache, filter.as_ref(), query, &encoded, limit, &mut actual);
+                        outcomes[outcome as usize] += 1;
+                        if outcome == I8Outcome::Rejected {
+                            assert!(actual.is_empty());
+                        } else {
+                            assert_eq!(snapshot(actual), snapshot(expected),
+                                       "shape={shape} limit={limit} outcome={outcome:?}");
+                        }
+                    }
+                }
+            }
+            eprintln!("int8 band shape={shape} rejected/certified/rescored={outcomes:?}");
+            rescored_total += outcomes[I8Outcome::Rescored as usize];
+        }
+        assert!(rescored_total > 0);
     }
 
     #[test]
@@ -2949,7 +3217,8 @@ mod query_topm_tests {
                 let mut encoded = Vec::new();
                 assert!(i8_encode_topm(&[0.0; 128], cache.i8_scale, &mut encoded));
                 let mut actual = BinaryHeap::new();
-                if !flat_scan_query_topm_i8(&cache, filter.as_ref(), &[0.0; 128], &encoded, 10, &mut actual)
+                if flat_scan_query_topm_i8(&cache, filter.as_ref(), &[0.0; 128], &encoded, 10, &mut actual)
+                    == I8Outcome::Rejected
                     && !flat_scan_query_topm(&cache, filter.as_ref(), &[0.0; 128], 10, &mut actual) {
                     flat_scan_serial_f64(&cache, filter.as_ref(), &[0.0; 128], 10, &mut actual);
                 }

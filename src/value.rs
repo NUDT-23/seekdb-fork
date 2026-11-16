@@ -567,15 +567,17 @@ fn i8_offer_topm(heap: &mut std::collections::BinaryHeap<u64>, m: usize, key: u6
 
 /// Candidate pass over the whole int8 mirror, four rows per step. On success
 /// `heap` holds the `m` smallest keys `(distance << 32) | position` among the
-/// scanned rows (all rows, or the rows listed in `positions`).
+/// scanned rows (all rows, or the rows listed in `positions`), and
+/// `distances` holds the distance of every scanned row in scan order.
 ///
 /// The distance is the same integer that `dist_sq_avx2_topm_i8` returns,
 /// computed as |a|^2 + |q|^2 - 2*a.q. With every byte in [-127,127] each
 /// maddubs pair is at most 2*127*127 = 32258 (no i16 saturation), a row's dot
 /// product is within +-2,064,512 and the distance within [0, 8,258,048].
 ///
-/// Returns false, leaving `heap` unspecified, when the arguments are not
-/// consistent with each other; the caller then uses another exact path.
+/// Returns false, leaving `heap` and `distances` unspecified, when the
+/// arguments are not consistent with each other; the caller then uses
+/// another exact path.
 ///
 /// # Safety
 /// The CPU must support AVX2. `norms` must come from `i8_row_norms_topm(flat)`.
@@ -589,6 +591,7 @@ pub unsafe fn i8_scan_topm_avx2(
     query: &[i8],
     m: usize,
     heap: &mut std::collections::BinaryHeap<u64>,
+    distances: &mut Vec<i32>,
 ) -> bool {
     use std::arch::x86_64::{
         __m128i, __m256i, _mm256_abs_epi8, _mm256_add_epi32, _mm256_castsi256_si128,
@@ -607,6 +610,12 @@ pub unsafe fn i8_scan_topm_avx2(
         return false;
     }
     heap.clear();
+    // Every step stores four lanes, so the last step of a count that is not a
+    // multiple of four writes up to three lanes past the count.
+    let scanned = positions.map_or(rows, |list| list.len());
+    distances.clear();
+    distances.reserve(scanned + 4);
+    let stored = distances.as_mut_ptr();
     let base = flat.as_ptr();
     let q0 = _mm256_loadu_si256(query.as_ptr() as *const __m256i);
     let q1 = _mm256_loadu_si256(query.as_ptr().add(32) as *const __m256i);
@@ -707,9 +716,10 @@ pub unsafe fn i8_scan_topm_avx2(
             while index + 4 <= rows {
                 let row = base.add(index * 128);
                 let norms4 = _mm_loadu_si128(norms.as_ptr().add(index) as *const __m128i);
-                let distances =
+                let found =
                     distances4!(row, row.add(128), row.add(256), row.add(384), norms4);
-                consider!(distances, 0xfu32, index, index + 1, index + 2, index + 3);
+                _mm_storeu_si128(stored.add(index) as *mut __m128i, found);
+                consider!(found, 0xfu32, index, index + 1, index + 2, index + 3);
                 index += 4;
             }
             if index < rows {
@@ -719,14 +729,15 @@ pub unsafe fn i8_scan_topm_avx2(
                 let (p0, p1, p2, p3) =
                     (index, (index + 1).min(last), (index + 2).min(last), (index + 3).min(last));
                 let norms4 = _mm_set_epi32(norms[p3], norms[p2], norms[p1], norms[p0]);
-                let distances = distances4!(
+                let found = distances4!(
                     base.add(p0 * 128),
                     base.add(p1 * 128),
                     base.add(p2 * 128),
                     base.add(p3 * 128),
                     norms4
                 );
-                consider!(distances, valid, p0, p1, p2, p3);
+                _mm_storeu_si128(stored.add(index) as *mut __m128i, found);
+                consider!(found, valid, p0, p1, p2, p3);
             }
         }
         Some(list) => {
@@ -743,19 +754,72 @@ pub unsafe fn i8_scan_topm_avx2(
                     return false;
                 }
                 let norms4 = _mm_set_epi32(norms[p3], norms[p2], norms[p1], norms[p0]);
-                let distances = distances4!(
+                let found = distances4!(
                     base.add(p0 * 128),
                     base.add(p1 * 128),
                     base.add(p2 * 128),
                     base.add(p3 * 128),
                     norms4
                 );
-                consider!(distances, valid, p0, p1, p2, p3);
+                _mm_storeu_si128(stored.add(index) as *mut __m128i, found);
+                consider!(found, valid, p0, p1, p2, p3);
                 index += 4;
             }
         }
     }
+    // Lanes 0..scanned were all written above.
+    distances.set_len(scanned);
     true
+}
+
+/// Largest distance the int8 scan can report: 128 components that each
+/// differ by 254.
+pub const I8_DISTANCE_MAX: i32 = 128 * 254 * 254;
+
+/// Appends to `out`, ascending, the index of every entry of `distances` that
+/// is below `cut`. Returns false, leaving `out` unspecified, as soon as more
+/// than `max` entries qualify.
+///
+/// # Safety
+/// The CPU must support AVX2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn i8_band_below_avx2(
+    distances: &[i32],
+    cut: i32,
+    max: usize,
+    out: &mut Vec<u32>,
+) -> bool {
+    use std::arch::x86_64::{
+        __m256i, _mm256_castsi256_ps, _mm256_cmpgt_epi32, _mm256_loadu_si256, _mm256_movemask_ps,
+        _mm256_set1_epi32,
+    };
+    if distances.len() > u32::MAX as usize {
+        return false;
+    }
+    out.clear();
+    let cut8 = _mm256_set1_epi32(cut);
+    let mut index = 0usize;
+    while index + 8 <= distances.len() {
+        let lanes = _mm256_loadu_si256(distances.as_ptr().add(index) as *const __m256i);
+        let mut below =
+            _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(cut8, lanes))) as u32;
+        while below != 0 {
+            out.push((index + below.trailing_zeros() as usize) as u32);
+            below &= below - 1;
+        }
+        if out.len() > max {
+            return false;
+        }
+        index += 8;
+    }
+    while index < distances.len() {
+        if distances[index] < cut {
+            out.push(index as u32);
+        }
+        index += 1;
+    }
+    out.len() <= max
 }
 
 /// Conservative original-distance lower bound from the exact integer grid.
